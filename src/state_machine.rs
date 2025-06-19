@@ -3,12 +3,10 @@ use {
     derive_more::From,
     rustc_hash::{FxHashMap, FxHashSet},
     serde::{Deserialize, Serialize},
-    solana_sdk::{
-        clock::{DEFAULT_TICKS_PER_SLOT, Slot},
-        commitment_config::CommitmentLevel,
-        hash::Hash,
-        signature::Signature,
-    },
+    solana_clock::{Slot, DEFAULT_TICKS_PER_SLOT},
+    solana_signature::Signature,
+    solana_hash::Hash,
+    solana_commitment_config::CommitmentLevel,
     std::{
         collections::VecDeque,
         time::{Duration, Instant},
@@ -221,7 +219,6 @@ type Revision = usize;
 ///
 /// Is to the developer to implement the IO part of the state machine by implementing your own "driver".
 ///
-#[derive(Default)]
 pub struct BlockstoreSM {
     /// Holds block under construction, not yet frozen
     block_buffer_map: FxHashMap<Slot, Block>,
@@ -374,6 +371,12 @@ pub struct OldestBufferedBlockInfo {
     pub age: Duration,
     pub parent_slot: Option<Slot>,
     pub pending_slot_status: usize,
+}
+
+impl Default for BlockstoreSM {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl BlockstoreSM {
@@ -840,14 +843,8 @@ pub fn module_path_for_test() -> &'static str {
 mod tests {
     use {
         crate::state_machine::{
-            BlockData, BlockstoreOutputEvent, EntryInfo, SlotCommitmentStatusUpdate, SlotLifecycle,
-            SlotLifecycleUpdate, iter_to_commitment,
-        },
-        solana_sdk::{
-            clock::{DEFAULT_TICKS_PER_SLOT, Slot},
-            commitment_config::CommitmentLevel,
-            signature::Signature,
-        },
+            iter_to_commitment, BlockData, BlockstoreOutputEvent, EntryInfo, SlotCommitmentStatusUpdate, SlotLifecycle, SlotLifecycleUpdate
+        }, solana_clock::DEFAULT_TICKS_PER_SLOT, solana_commitment_config::CommitmentLevel, solana_hash::Hash, solana_signature::Signature
     };
 
     fn generate_entries(
@@ -866,7 +863,7 @@ mod tests {
                 slot,
                 entry_index: i,
                 starting_txn_index: start_txn_index,
-                entry_hash: solana_sdk::hash::Hash::new_unique(),
+                entry_hash: Hash::new_unique(),
                 executed_txn_count: tx_per_entry,
             };
             entries.push(entry);
@@ -880,7 +877,7 @@ mod tests {
                     slot,
                     entry_index: i + DEFAULT_TICKS_PER_SLOT as usize,
                     starting_txn_index: start_txn_index + tx_per_entry,
-                    entry_hash: solana_sdk::hash::Hash::new_unique(),
+                    entry_hash: Hash::new_unique(),
                     executed_txn_count: 0, // Tick entry has no transactions
                 });
                 tick_entry_remain -= 1;
@@ -892,7 +889,7 @@ mod tests {
                 slot,
                 entry_index: num_data_entries + DEFAULT_TICKS_PER_SLOT as usize,
                 starting_txn_index: num_data_entries * tx_per_entry,
-                entry_hash: solana_sdk::hash::Hash::new_unique(),
+                entry_hash: Hash::new_unique(),
                 executed_txn_count: 0, // Tick entry has no transactions
             });
         }

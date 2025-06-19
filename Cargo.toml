@@ -9,21 +9,39 @@ default = [
 ]
 yellowstone-grpc = [
     "dep:yellowstone-grpc-client",
+    "dep:yellowstone-grpc-proto",
+    "dep:tokio",
+    "tonic",
+]
+tonic = [
+    "dep:tonic",
 ]
 
 [dependencies]
 bytesize = "2"
 bytesize-serde = "0.2"
 derive_more = { version = "2", features = ["from", "into"] }
-rustc-hash = "2.1.1"
+rustc-hash = "2"
 serde = "1"
-solana-sdk = "2"
+# solana-sdk = "=2.2.1"
+solana-clock = "=2.2.1"
+solana-commitment-config = "=2.2.1"
+solana-pubkey = "=2.2.1"
+solana-signature = "=2.2.1"
+solana-hash = "=2.2.1"
 thiserror = "2"
 tracing = "~0.1.41"
 tracing-subscriber = "~0.3.19"
 yellowstone-grpc-client = { version = "6", optional = true }
-
+yellowstone-grpc-proto = { version = "6", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread"]}
+tonic = { version = "0.12", optional = true }
+futures-util = "0.3.31"
 
 [dev-dependencies]
 tracing = { version = "0.1.41" }
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
+
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"
