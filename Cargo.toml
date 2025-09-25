@@ -11,7 +11,7 @@ edition = "2024"
 homepage = "https://triton.one"
 repository = "https://github.com/rpcpool/yellowstone-block-machine"
 license = "AGPL-3.0"
-keywords = ["solana", "rpc", "block", "machine", "yellowstone"]
+keywords = ["solana", "rpc", "block", "sans-io", "yellowstone", "geyser"]
 publish = false
 
 [workspace.dependencies]

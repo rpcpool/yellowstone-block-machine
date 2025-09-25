@@ -2,6 +2,14 @@
 name = "yellowstone-block-machine"
 version = "0.1.0"
 edition = "2024"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["solana", "rpc", "block", "sans-io", "yellowstone", "geyser"]
+description = "State machine for reconstructing Solana blocks from Geyser events"
+readme = "README.md"
+publish = true
 
 [features]
 dragonsmouth = [

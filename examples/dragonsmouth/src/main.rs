@@ -3,16 +3,12 @@ use {
     common_macros::hash_map,
     std::path::PathBuf,
     tokio::sync::mpsc,
-    tracing_subscriber::{
-        EnvFilter,
-        layer::SubscriberExt,
-        util::{SubscriberInitExt, TryInitError},
-    },
+    tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt},
     yellowstone_block_machine::dragonsmouth::{
         BlockMachineError, BlockMachineOutput, GeyserGrpcExt,
     },
     yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcBuilder},
-    yellowstone_grpc_proto::geyser::SubscribeRequest,
+    yellowstone_grpc_proto::geyser::{CommitmentLevel, SubscribeRequest},
 };
 
 pub fn init_tracing() {
@@ -61,7 +57,10 @@ async fn process_block<W>(
                 BlockMachineOutput::Block(block) => {
                     let n = block.len();
                     let slot = block.slot;
-                    writeln!(out, "Block {slot} len: {n}").expect("write");
+                    let account_cnt = block.account_len();
+                    let txn_cnt = block.txn_len();
+                    let entry_cnt = block.entry_len();
+                    writeln!(out, "Block {slot} len: {n}, {txn_cnt} tx, {account_cnt} accounts, {entry_cnt} entries").expect("write");
                     i += 1;
                 }
                 BlockMachineOutput::SlotCommitmentUpdate(slot_commitment_status_update) => {
@@ -114,6 +113,13 @@ async fn main() {
         accounts: hash_map! {
             "test".to_string() => Default::default(),
         },
+        transactions: hash_map! {
+            "test".to_string() => Default::default(),
+        },
+        entry: hash_map! {
+            "test".to_string() => Default::default(),
+        },
+        commitment: Some(CommitmentLevel::Confirmed as i32),
         ..Default::default()
     };
 

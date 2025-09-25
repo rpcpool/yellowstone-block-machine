@@ -1,6 +1,6 @@
 use {
     crate::state_machine::{
-        BlockSM, BlockStateMachineOuput, BlockSummary, DeadBlockDetected, EntryInfo, ForkDetected,
+        BlocksStateMachine, BlockStateMachineOuput, BlockSummary, DeadBlockDetected, EntryInfo, ForkDetected,
         SlotCommitmentStatusUpdate, SlotLifecycle, SlotLifecycleUpdate,
     },
     derive_more::From,
@@ -9,7 +9,11 @@ use {
     solana_clock::Slot,
     solana_commitment_config::CommitmentLevel,
     solana_hash::Hash,
-    std::{cmp::Ordering, collections::HashMap, marker::PhantomData, sync::Arc},
+    std::{
+        cmp::Ordering,
+        collections::{HashMap, VecDeque},
+        sync::Arc,
+    },
     tokio::sync::mpsc,
     tokio_stream::wrappers::ReceiverStream,
     tokio_util::sync::PollSender,
@@ -18,9 +22,8 @@ use {
     yellowstone_grpc_proto::geyser::{
         CommitmentLevel as ProtoCommitmentLevel, SlotStatus, SubscribeRequest,
         SubscribeRequestFilterAccounts, SubscribeRequestFilterSlots,
-        SubscribeRequestFilterTransactions, SubscribeUpdate, SubscribeUpdateAccount,
-        SubscribeUpdateBlockMeta, SubscribeUpdateEntry, SubscribeUpdateSlot,
-        SubscribeUpdateTransaction, subscribe_update::UpdateOneof,
+        SubscribeRequestFilterTransactions, SubscribeUpdate, SubscribeUpdateBlockMeta,
+        SubscribeUpdateEntry, SubscribeUpdateSlot, subscribe_update::UpdateOneof,
     },
 };
 
@@ -67,123 +70,24 @@ pub struct Block {
     pub events: Vec<Arc<SubscribeUpdate>>,
     account_idx_map: Vec<usize>,
     transaction_idx_map: Vec<usize>,
-    #[allow(dead_code)]
     entry_idx_map: Vec<usize>,
 }
 
 impl Block {
-    pub fn tx_len(&self) -> usize {
+    pub fn txn_len(&self) -> usize {
         self.transaction_idx_map.len()
     }
 
-    pub fn accoutns_len(&self) -> usize {
+    pub fn account_len(&self) -> usize {
         self.account_idx_map.len()
+    }
+
+    pub fn entry_len(&self) -> usize {
+        self.entry_idx_map.len()
     }
 
     pub fn len(&self) -> usize {
         self.events.len()
-    }
-
-    ///
-    /// Returns a projection that allows iterating over account updates in this block.
-    ///
-    pub fn project_accounts(&self) -> Projection<SubscribeUpdateAccount> {
-        Projection {
-            events: &self.events,
-            index_vec: &self.account_idx_map,
-            dest_type: PhantomData,
-        }
-    }
-
-    ///
-    /// Returns a projection that allows iterating over entry updates in this block.
-    ///
-    pub fn project_transactions(&self) -> Projection<SubscribeUpdateTransaction> {
-        Projection {
-            events: &self.events,
-            index_vec: &self.transaction_idx_map,
-            dest_type: PhantomData,
-        }
-    }
-}
-
-///
-/// An iterator that yields references to elements of type `T` from a vector of `SubscribeUpdate`
-/// based on a provided index vector.
-pub struct ProjectionIterator<'a, T> {
-    events: &'a Vec<Arc<SubscribeUpdate>>,
-    index_vec: &'a [usize],
-    dest_type: PhantomData<T>,
-    curr: usize,
-}
-
-macro_rules! impl_projection_for {
-    ($src:path, $dest:ty) => {
-        impl<'a> Iterator for ProjectionIterator<'a, $dest> {
-            type Item = &'a $dest;
-
-            fn next(&mut self) -> Option<Self::Item> {
-                if self.curr < self.index_vec.len() {
-                    let i = self.index_vec[self.curr];
-                    self.curr += 1;
-                    let update_oneof = &self.events[i].update_oneof.as_ref().expect("update_oneof");
-
-                    if let $src(event) = update_oneof {
-                        Some(event)
-                    } else {
-                        panic!("unexpected type at {i}, expected $type");
-                    }
-                } else {
-                    None
-                }
-            }
-        }
-
-        impl<'a> Projection<'a, $dest> {
-            pub fn iter(&'a self) -> ProjectionIterator<'a, $dest> {
-                ProjectionIterator {
-                    events: self.events,
-                    index_vec: self.index_vec.as_ref(),
-                    dest_type: PhantomData,
-                    curr: 0,
-                }
-            }
-        }
-
-        impl<'a> IntoIterator for Projection<'a, $dest> {
-            type Item = &'a $dest;
-            type IntoIter = ProjectionIterator<'a, $dest>;
-
-            fn into_iter(self) -> Self::IntoIter {
-                ProjectionIterator {
-                    events: self.events,
-                    index_vec: self.index_vec,
-                    dest_type: PhantomData,
-                    curr: 0,
-                }
-            }
-        }
-    };
-}
-
-impl_projection_for!(UpdateOneof::Transaction, SubscribeUpdateTransaction);
-impl_projection_for!(UpdateOneof::Account, SubscribeUpdateAccount);
-impl_projection_for!(UpdateOneof::BlockMeta, SubscribeUpdateBlockMeta);
-impl_projection_for!(UpdateOneof::Entry, SubscribeUpdateEntry);
-
-pub struct Projection<'a, T> {
-    events: &'a Vec<Arc<SubscribeUpdate>>,
-    index_vec: &'a [usize],
-    dest_type: PhantomData<T>,
-}
-
-impl<'a, T> Clone for Projection<'a, T> {
-    fn clone(&self) -> Self {
-        Self {
-            events: self.events,
-            index_vec: self.index_vec,
-            dest_type: PhantomData,
-        }
     }
 }
 
@@ -223,6 +127,16 @@ where
             ProtoCommitmentLevel::try_from(subscribe_request.commitment.unwrap_or(0))
                 .expect("Invalid commitment level in subscribe request");
 
+        assert!(
+            subscribe_request.blocks.is_empty(),
+            "custom `blocks` filter is not compatible with block machine"
+        );
+
+        assert!(
+            subscribe_request.slots.is_empty(),
+            "custom `slots` filter is not compatible with block machine"
+        );
+
         let commitment_level = match proto_commitment_level {
             ProtoCommitmentLevel::Processed => CommitmentLevel::Processed,
             ProtoCommitmentLevel::Confirmed => CommitmentLevel::Confirmed,
@@ -251,7 +165,7 @@ where
             .await?;
 
         let source = source.boxed();
-        let sm = BlockSM::default();
+        let sm = BlocksStateMachine::default();
 
         let machine = DragonsmouthBlockMachine {
             minimum_commitment_level: commitment_level,
@@ -318,7 +232,7 @@ pub enum BlockMachineOutput {
 struct DragonsmouthBlockMachine {
     minimum_commitment_level: CommitmentLevel,
     block_storage: InMemoryBlockStore,
-    sm: BlockSM,
+    sm: BlocksStateMachine,
 }
 
 impl From<SubscribeUpdateEntry> for EntryInfo {
@@ -439,7 +353,16 @@ impl DragonsmouthBlockMachine {
                 self.handle_block_meta(subscribe_update_block_meta);
             }
             UpdateOneof::Entry(subscribe_update_entry) => {
-                self.handle_block_entry(subscribe_update_entry);
+                let slot = subscribe_update_entry.slot;
+                self.handle_block_entry(subscribe_update_entry.clone());
+                if filters.iter().any(|f| f.as_str() != RESERVED_FILTER_NAME) {
+                    let subscribe_update = SubscribeUpdate {
+                        filters,
+                        created_at,
+                        update_oneof: Some(UpdateOneof::Entry(subscribe_update_entry)),
+                    };
+                    self.block_storage.insert_block_data(slot, subscribe_update);
+                }
             }
             _ => {
                 tracing::trace!("Unsupported update type received: {:?}", update_oneof);
@@ -447,11 +370,10 @@ impl DragonsmouthBlockMachine {
         }
     }
 
-    fn handle_blockstore_output(
-        &mut self,
-        ev: BlockStateMachineOuput,
-        out: &mut Vec<BlockMachineOutput>,
-    ) {
+    fn handle_blockstore_output<Ext>(&mut self, ev: BlockStateMachineOuput, out: &mut Ext)
+    where
+        Ext: Extend<BlockMachineOutput>,
+    {
         match ev {
             BlockStateMachineOuput::FrozenBlock(info) => {
                 self.block_storage.mark_block_as_frozen(info.slot);
@@ -461,7 +383,7 @@ impl DragonsmouthBlockMachine {
                 if ord == Ordering::Greater || ord == Ordering::Equal {
                     let block = self.block_storage.remove_slot(st.slot);
                     if let Some(block_replay) = block {
-                        out.push(block_replay.into());
+                        out.extend([block_replay.into()]);
                     } else {
                         tracing::trace!("No block replay found for slot {}", st.slot);
                     }
@@ -470,19 +392,22 @@ impl DragonsmouthBlockMachine {
                         parent_slot: st.parent_slot,
                         commitment: st.commitment,
                     };
-                    out.push(commitment_update.into());
+                    out.extend([commitment_update.into()]);
                 }
             }
             BlockStateMachineOuput::ForksDetected(slot) => {
-                out.push(BlockMachineOutput::ForkDetected(slot));
+                out.extend([BlockMachineOutput::ForkDetected(slot)]);
             }
             BlockStateMachineOuput::DeadSlotDetected(info) => {
-                out.push(BlockMachineOutput::DeadBlockDetect(info));
+                out.extend([BlockMachineOutput::DeadBlockDetect(info)]);
             }
         }
     }
 
-    fn drain_unprocess_bm_output(&mut self, out: &mut Vec<BlockMachineOutput>) {
+    fn drain_unprocess_bm_output<Ext>(&mut self, out: &mut Ext)
+    where
+        Ext: Extend<BlockMachineOutput>,
+    {
         while let Some(ev) = self.sm.pop_next_unprocess_blockstore_update() {
             self.handle_blockstore_output(ev, out);
         }
@@ -515,10 +440,10 @@ where
     SnkErr: std::error::Error + Send,
 {
     pub async fn run(mut self) -> Result<(), DragonsmouthDriverError<SnkErr>> {
-        let mut batch = Vec::with_capacity(10);
+        let mut batch = VecDeque::with_capacity(10);
         loop {
             if !batch.is_empty() {
-                while let Some(item) = batch.pop() {
+                while let Some(item) = batch.pop_front() {
                     self.sink
                         .send(Ok(item))
                         .await
@@ -550,7 +475,7 @@ where
             self.machine.drain_unprocess_bm_output(&mut batch);
         }
         self.machine.drain_unprocess_bm_output(&mut batch);
-        while let Some(item) = batch.pop() {
+        while let Some(item) = batch.pop_front() {
             let Ok(_) = self.sink.send(Ok(item)).await else {
                 break;
             };

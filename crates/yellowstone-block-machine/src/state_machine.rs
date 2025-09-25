@@ -66,6 +66,9 @@ pub struct EntryInfo {
     pub executed_txn_count: u64,
 }
 
+///
+/// Block under construction
+///
 #[derive(Debug)]
 pub struct Block {
     pub slot: Slot,
@@ -219,7 +222,7 @@ type Revision = usize;
 ///
 /// Is to the developer to implement the IO part of the state machine by implementing your own "driver".
 ///
-pub struct BlockSM {
+pub struct BlocksStateMachine {
     /// Holds block under construction, not yet frozen
     block_buffer_map: FxHashMap<Slot, Block>,
 
@@ -389,7 +392,7 @@ pub struct OldestBufferedBlockInfo {
     pub pending_slot_status: usize,
 }
 
-impl Default for BlockSM {
+impl Default for BlocksStateMachine {
     fn default() -> Self {
         Self::new()
     }
@@ -401,7 +404,7 @@ pub struct LongShortForksMutationTracer<'a> {
     short: &'a mut FxHashSet<Slot>,
 }
 
-impl<'a> ForksMutationTracer for LongShortForksMutationTracer<'a> {
+impl ForksMutationTracer for LongShortForksMutationTracer<'_> {
     fn insert(&mut self, slot: Slot) {
         // We only insert into short if slot not already present in long.
         if self.long.insert(slot) {
@@ -410,7 +413,7 @@ impl<'a> ForksMutationTracer for LongShortForksMutationTracer<'a> {
     }
 }
 
-impl BlockSM {
+impl BlocksStateMachine {
     ///
     /// Creates a new blockstore instance
     ///
@@ -604,7 +607,7 @@ impl BlockSM {
                 }
             }
             _ => {
-                if self.block_buffer_map.get(&slot).is_some() {
+                if self.block_buffer_map.contains_key(&slot) {
                     self.pending_slot_status_update
                         .entry(slot_status.slot)
                         .or_default()
@@ -740,6 +743,11 @@ impl BlockSM {
         self.flush_pending_slot_status_update(slot);
     }
 
+    ///
+    /// Main entry point to process blockstore event and progress the state-machine.
+    /// 
+    /// Registers the event into the state machine and process any side effect that may arise from it.
+    /// 
     pub fn process_event(&mut self, event: BlockstoreInputEvent) {
         match event {
             BlockstoreInputEvent::SlotCommitmentStatus(slot_status) => {
@@ -941,7 +949,7 @@ mod tests {
 
     #[test]
     pub fn it_should_handle_all_lifecycle_transition_and_produce_frozen_block() {
-        let mut blockstore = super::BlockSM::default();
+        let mut blockstore = super::BlocksStateMachine::default();
 
         let first_shred_recv = SlotLifecycleUpdate {
             slot: 1,
@@ -996,7 +1004,7 @@ mod tests {
 
     #[test]
     pub fn it_should_mark_slot_as_dead_if_not_received_first_shred() {
-        let mut blockstore = super::BlockSM::default();
+        let mut blockstore = super::BlocksStateMachine::default();
 
         let completed_block = SlotLifecycleUpdate {
             slot: 1,
@@ -1016,7 +1024,7 @@ mod tests {
 
     #[test]
     pub fn blockstore_gc_should_work_even_when_empty() {
-        let mut blockstore = super::BlockSM::default();
+        let mut blockstore = super::BlocksStateMachine::default();
         let actual = blockstore.gc();
         assert_eq!(actual.slot_purge_count, 0);
         assert_eq!(actual.slot_blocked_count, 0);
@@ -1024,7 +1032,7 @@ mod tests {
 
     #[test]
     pub fn blockstore_should_correct_missing_processed_slot_status() {
-        let mut blockstore = super::BlockSM::default();
+        let mut blockstore = super::BlocksStateMachine::default();
         let slot_confirmed = SlotCommitmentStatusUpdate {
             parent_slot: None,
             slot: 1,
@@ -1092,7 +1100,7 @@ mod tests {
     pub fn it_should_detect_retroactively_rooted_slots() {
         // Retroactively rooted slots are slots that were not rooted at the time of the slot status update,
         // but were later rooted by a descendant slot status update.
-        let mut blockstore = super::BlockSM::default();
+        let mut blockstore = super::BlocksStateMachine::default();
 
         let slot1_processed = SlotCommitmentStatusUpdate {
             parent_slot: None,
