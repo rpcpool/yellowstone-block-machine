@@ -1,0 +1,23 @@
+[package]
+name = "dragonsmouth"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+description = "Example application using yellowstone-block-machine to connect to a Solana RPC node via gRPC and process blocks"
+
+
+[dependencies]
+clap = { workspace = true, features = ["derive"] }
+common_macros = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tonic = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_yaml = { workspace = true }
+yellowstone-block-machine = { workspace = true, features = ["dragonsmouth"] }
+yellowstone-grpc-client = { workspace = true }
+yellowstone-grpc-proto = { workspace = true }

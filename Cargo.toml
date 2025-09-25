@@ -1,47 +1,41 @@
-[package]
-name = "yellowstone-block-machine"
-version = "0.1.0"
+[workspace]
+members = [
+    "crates/yellowstone-block-machine",
+    "examples/dragonsmouth",
+]
+resolver = "2"
+
+[workspace.package]
+authors = ["Triton One"]
 edition = "2024"
+homepage = "https://triton.one"
+repository = "https://github.com/rpcpool/yellowstone-block-machine"
+license = "AGPL-3.0"
+keywords = ["solana", "rpc", "block", "machine", "yellowstone"]
+publish = false
 
-[features]
-default = [
-    "yellowstone-grpc",
-]
-yellowstone-grpc = [
-    "dep:yellowstone-grpc-client",
-    "dep:yellowstone-grpc-proto",
-    "dep:tokio",
-    "tonic",
-]
-tonic = [
-    "dep:tonic",
-]
-
-[dependencies]
+[workspace.dependencies]
 bytesize = "2"
-bytesize-serde = "0.2"
-derive_more = { version = "2", features = ["from", "into"] }
+bytesize-serde = "^0.2"
+clap = "4"
+common_macros = "^0.1.1"
+derive_more = "2"
+futures-util = "^0.3.31"
 rustc-hash = "2"
 serde = "1"
-# solana-sdk = "=2.2.1"
-solana-clock = "=2.2.1"
-solana-commitment-config = "=2.2.1"
-solana-pubkey = "=2.2.1"
-solana-signature = "=2.2.1"
-solana-hash = "=2.2.1"
+serde_yaml = "^0.9.34"
+solana-clock = "2"
+solana-commitment-config = "2"
+solana-pubkey = "2"
+solana-signature = "2"
+solana-hash = "2"
 thiserror = "2"
-tracing = "~0.1.41"
-tracing-subscriber = "~0.3.19"
-yellowstone-grpc-client = { version = "6", optional = true }
-yellowstone-grpc-proto = { version = "6", optional = true }
-tokio = { version = "1", optional = true, features = ["rt-multi-thread"]}
-tonic = { version = "0.12", optional = true }
-futures-util = "0.3.31"
-
-[dev-dependencies]
-tracing = { version = "0.1.41" }
-tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
-
-
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = "0.6"
+tokio = "1"
+tokio-stream = "^0.1.17"
+tokio-util = "^0.7.16"
+tonic = "^0.14.1"
+tracing = "^0.1.41"
+tracing-subscriber = "^0.3.19"
+yellowstone-grpc-client = { version = "9" }
+yellowstone-grpc-proto = { version = "9" }
+yellowstone-block-machine = { path = "crates/yellowstone-block-machine" }

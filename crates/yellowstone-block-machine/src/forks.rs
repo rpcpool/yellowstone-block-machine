@@ -1,8 +1,8 @@
 use {
-    rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet},
-    solana_sdk::clock::Slot,
+    rustc_hash::{FxHashMap, FxHashSet},
+    solana_clock::Slot,
     std::{
-        collections::{BTreeSet, VecDeque},
+        collections::{BTreeSet, HashSet, VecDeque},
         hash::Hash,
     },
 };
@@ -14,9 +14,9 @@ use {
 ///
 #[derive(Default, Debug, Clone)]
 pub struct OrderedSet<K> {
-    versioned_keys: HashMap<K, u64>,
+    versioned_keys: FxHashMap<K, u64>,
     order: VecDeque<(K, u64)>,
-    deleted: HashSet<u64>,
+    deleted: FxHashSet<u64>,
     version: u64,
     len: usize,
 }
@@ -203,11 +203,11 @@ where
 /// Unlike the ForkBanks in Solana runtmie, this struct is more of a utility to detect forks in a blockchain incrementally.
 /// It retroactively detects forks in a blockchain.
 pub struct Forks {
-    parent_children_map: HashMap<Slot /*parent */, BTreeSet<Slot> /*children */>,
+    parent_children_map: FxHashMap<Slot /*parent */, BTreeSet<Slot> /*children */>,
     rooted_slots: BTreeSet<Slot>,
     // Map from child to parent
-    reverse_parent_children_map: HashMap<Slot /*child */, Slot /* parent */>,
-    forked_slots: HashSet<Slot>,
+    reverse_parent_children_map: FxHashMap<Slot /*child */, Slot /* parent */>,
+    forked_slots: FxHashSet<Slot>,
     // Maximum number of rooted slots to keep track of.
     max_rooted_depth_capacity: usize,
 }
@@ -227,8 +227,8 @@ pub enum ForksCapacityStatus {
 
 pub struct ForksIterator<'forks> {
     forks: &'forks Forks,
-    to_visit: HashSet<Slot>,
-    visited: HashSet<Slot>,
+    to_visit: FxHashSet<Slot>,
+    visited: FxHashSet<Slot>,
     queue: VecDeque<Slot>,
 }
 
@@ -262,6 +262,50 @@ impl Iterator for ForksIterator<'_> {
     }
 }
 
+///
+/// Trait for tracing forks update during mutations of the Forks structure.
+///
+pub trait ForksMutationTracer {
+    fn insert(&mut self, slot: Slot);
+
+    fn extend(&mut self, slots: impl IntoIterator<Item = Slot>) {
+        for slot in slots {
+            self.insert(slot);
+        }
+    }
+}
+
+impl ForksMutationTracer for FxHashSet<Slot> {
+    fn insert(&mut self, slot: Slot) {
+        self.insert(slot);
+    }
+
+    fn extend(&mut self, slots: impl IntoIterator<Item = Slot>) {
+        Extend::extend(self, slots);
+    }
+}
+
+impl ForksMutationTracer for HashSet<Slot> {
+    fn insert(&mut self, slot: Slot) {
+        self.insert(slot);
+    }
+
+    fn extend(&mut self, slots: impl IntoIterator<Item = Slot>) {
+        Extend::extend(self, slots);
+    }
+}
+
+///
+/// No-op implementation of ForksMutationTrace.
+///
+pub struct NoTrace;
+
+impl ForksMutationTracer for NoTrace {
+    fn insert(&mut self, _slot: Slot) {
+        // Do nothing
+    }
+}
+
 impl Forks {
     pub fn with_max_capacity(capacity: usize) -> Self {
         assert!(capacity > 0);
@@ -288,7 +332,7 @@ impl Forks {
 
     ///
     /// Remove the old rooted slot and all forks derived from it.
-    fn pop_oldest_rooted_slot(&mut self, forks_removed: &mut HashSet<Slot>) {
+    fn pop_oldest_rooted_slot(&mut self, forks_removed: &mut FxHashSet<Slot>) {
         if let Some(root) = self.rooted_slots.pop_first() {
             let child = self.parent_children_map.remove(&root).unwrap_or_default();
             let mut queue = VecDeque::from_iter(child);
@@ -313,13 +357,13 @@ impl Forks {
         }
     }
 
-    pub fn truncate_excess_rooted_slots(&mut self, forks_removed: &mut HashSet<Slot>) {
+    pub fn truncate_excess_rooted_slots(&mut self, forks_removed: &mut FxHashSet<Slot>) {
         while self.capacity_status() == ForksCapacityStatus::AboveCapacity {
             self.pop_oldest_rooted_slot(forks_removed);
         }
     }
 
-    fn get_all_nodes(&self) -> HashSet<Slot> {
+    fn get_all_nodes(&self) -> FxHashSet<Slot> {
         self.parent_children_map.keys().copied().collect()
     }
 
@@ -336,10 +380,10 @@ impl Forks {
         }
     }
     #[allow(clippy::collapsible_else_if)]
-    fn mark_children_as_forks(&mut self, slot: Slot) -> HashSet<Slot> {
+    fn mark_children_as_forks(&mut self, slot: Slot) -> FxHashSet<Slot> {
         let mut queue = VecDeque::from([slot]);
-        let mut newly_forked_slots = HashSet::default();
-        let mut visited = HashSet::default();
+        let mut newly_forked_slots = FxHashSet::default();
+        let mut visited = FxHashSet::default();
         while !queue.is_empty() {
             let slot2 = queue.pop_front().unwrap();
             if !visited.insert(slot2) {
@@ -366,12 +410,15 @@ impl Forks {
         self.rooted_slots.contains(slot)
     }
 
-    pub fn make_slot_rooted_with_rooted_trace(
+    pub fn make_slot_rooted_with_rooted_trace<T1, T2>(
         &mut self,
         slot: Slot,
-        newly_forked_slot_out: &mut HashSet<Slot>,
-        indirectly_rooted_slots: &mut HashSet<Slot>,
-    ) {
+        newly_forked_slot_out: &mut T1,
+        indirectly_rooted_slots: &mut T2,
+    ) where
+        T1: ForksMutationTracer,
+        T2: ForksMutationTracer,
+    {
         if self.rooted_slots.contains(&slot) {
             return;
         }
@@ -405,22 +452,25 @@ impl Forks {
         }
     }
 
-    pub fn make_slot_rooted(&mut self, slot: Slot, newly_forked_slot_out: &mut HashSet<Slot>) {
-        self.make_slot_rooted_with_rooted_trace(
-            slot,
-            newly_forked_slot_out,
-            &mut Default::default(),
-        );
+    pub fn make_slot_rooted<T>(&mut self, slot: Slot, newly_forked_slot_out: &mut T)
+    where
+        T: ForksMutationTracer,
+    {
+        self.make_slot_rooted_with_rooted_trace(slot, newly_forked_slot_out, &mut NoTrace);
     }
 
     #[allow(clippy::collapsible_if)]
-    pub fn add_slot_with_parent_with_rooted_trace(
+    pub fn add_slot_with_parent_with_rooted_trace<T1, T2>(
         &mut self,
         slot: Slot,
         parent: Slot,
-        newly_forked_slot_out: &mut HashSet<Slot>,
-        indireclty_rooted: &mut HashSet<Slot>,
-    ) -> bool {
+        newly_forked_slot_out: &mut T1,
+        indireclty_rooted: &mut T2,
+    ) -> bool
+    where
+        T1: ForksMutationTracer,
+        T2: ForksMutationTracer,
+    {
         if self
             .parent_children_map
             .entry(parent)
@@ -481,17 +531,20 @@ impl Forks {
         true
     }
 
-    pub fn add_slot_with_parent(
+    pub fn add_slot_with_parent<T>(
         &mut self,
         slot: Slot,
         parent: Slot,
-        newly_forked_slot_out: &mut HashSet<Slot>,
-    ) -> bool {
+        newly_forked_slot_out: &mut T,
+    ) -> bool
+    where
+        T: ForksMutationTracer,
+    {
         self.add_slot_with_parent_with_rooted_trace(
             slot,
             parent,
             newly_forked_slot_out,
-            &mut Default::default(),
+            &mut NoTrace,
         )
     }
 
@@ -663,12 +716,12 @@ mod orderset_tests {
 
 #[cfg(test)]
 mod forks_tests {
-    use {crate::forks::Forks, rustc_hash::FxHashSet as HashSet};
+    use {crate::forks::Forks, rustc_hash::FxHashSet};
 
     #[test]
     fn adding_slot_with_parent_twice_should_shortcut() {
         let mut fd = Forks::default();
-        let mut forked_detected = HashSet::default();
+        let mut forked_detected = FxHashSet::default();
         assert!(fd.add_slot_with_parent(2, 1, &mut forked_detected));
         assert!(!fd.add_slot_with_parent(2, 1, &mut forked_detected));
         assert!(forked_detected.is_empty());
@@ -681,7 +734,7 @@ mod forks_tests {
         // make 4 rooted
         // expected rooted: 1, 2, 3, 4
         let mut fd = Forks::default();
-        let mut forked_detected = HashSet::default();
+        let mut forked_detected = FxHashSet::default();
         fd.add_slot_with_parent(2, 1, &mut forked_detected);
         fd.make_slot_rooted(1, &mut forked_detected);
         fd.add_slot_with_parent(3, 2, &mut forked_detected);
@@ -689,7 +742,7 @@ mod forks_tests {
 
         assert!(fd.rooted_slots.contains(&1));
         assert!(fd.rooted_slots.len() == 1);
-        let mut indirectly_rooted = HashSet::default();
+        let mut indirectly_rooted = FxHashSet::default();
         fd.make_slot_rooted_with_rooted_trace(4, &mut forked_detected, &mut indirectly_rooted);
         assert_eq!(indirectly_rooted.len(), 2);
         assert!(indirectly_rooted.contains(&2));
@@ -707,7 +760,7 @@ mod forks_tests {
         // test case 0 (no sibblings)
         // 1 -> 2
         let mut fd = Forks::default();
-        let mut forked_detected = HashSet::default();
+        let mut forked_detected = FxHashSet::default();
         fd.add_slot_with_parent(2, 1, &mut forked_detected);
         fd.make_slot_rooted(2, &mut forked_detected);
         assert!(fd.forked_slots.is_empty());
@@ -721,7 +774,7 @@ mod forks_tests {
         // expected rooted 2, 1
         // expected forks 3
         let mut fd = Forks::default();
-        let mut forked_detected = HashSet::default();
+        let mut forked_detected = FxHashSet::default();
         fd.add_slot_with_parent(2, 1, &mut forked_detected);
         fd.add_slot_with_parent(3, 1, &mut forked_detected);
         fd.make_slot_rooted(2, &mut forked_detected);
@@ -737,7 +790,7 @@ mod forks_tests {
         // expected rooted: 1, 2
         // expected forks: 4
         let mut fd = Forks::default();
-        let mut forked_detected = HashSet::default();
+        let mut forked_detected = FxHashSet::default();
         fd.add_slot_with_parent(2, 1, &mut forked_detected);
         fd.add_slot_with_parent(3, 2, &mut forked_detected);
         fd.add_slot_with_parent(4, 1, &mut forked_detected);
@@ -755,7 +808,7 @@ mod forks_tests {
         // expected rooted: 1, 4
         // expected forks: 2, 3
         let mut fd = Forks::default();
-        let mut forked_detected = HashSet::default();
+        let mut forked_detected = FxHashSet::default();
         fd.add_slot_with_parent(2, 1, &mut forked_detected);
         fd.add_slot_with_parent(3, 2, &mut forked_detected);
         fd.add_slot_with_parent(4, 1, &mut forked_detected);
@@ -778,7 +831,7 @@ mod forks_tests {
         // expected forks : 3, 4
 
         let mut fd = Forks::default();
-        let mut forked_detected = HashSet::default();
+        let mut forked_detected = FxHashSet::default();
         fd.add_slot_with_parent(2, 1, &mut forked_detected);
         fd.make_slot_rooted(1, &mut forked_detected);
 
@@ -804,7 +857,7 @@ mod forks_tests {
         // 1 (rooted) -> 2 -> 5 -> ???
         // 2 -> 3 -> 4
         let mut fd = Forks::default();
-        let mut forked_detected = HashSet::default();
+        let mut forked_detected = FxHashSet::default();
 
         fd.add_slot_with_parent(2, 1, &mut forked_detected);
         fd.make_slot_rooted(1, &mut forked_detected);
@@ -819,7 +872,7 @@ mod forks_tests {
 
         // Then we define another rooted segment
         // 9 -> 10
-        let mut retroactively_rooted_set = Default::default();
+        let mut retroactively_rooted_set = FxHashSet::default();
         fd.add_slot_with_parent(10, 9, &mut forked_detected);
         fd.make_slot_rooted_with_rooted_trace(
             10,
@@ -836,7 +889,7 @@ mod forks_tests {
         // then we connect both segment on 5 -> 9
         // this should retroactively make 3,4 forks
         // and make 2 and 5 rooted too
-        let mut retroactively_rooted_set = Default::default();
+        let mut retroactively_rooted_set = FxHashSet::default();
         fd.add_slot_with_parent_with_rooted_trace(
             9,
             5,
@@ -862,7 +915,7 @@ mod forks_tests {
         // expected rooted 2, 1
         // expected forks 3
         let mut fd = Forks::default();
-        let mut forked_detected = HashSet::default();
+        let mut forked_detected = FxHashSet::default();
         fd.add_slot_with_parent(2, 1, &mut forked_detected);
         fd.add_slot_with_parent(3, 1, &mut forked_detected);
         fd.make_slot_rooted(2, &mut forked_detected);
@@ -883,7 +936,7 @@ mod forks_tests {
         assert!(fd.is_rooted_slot(&1));
         assert!(forked_detected.contains(&4));
 
-        let all_slots = fd.visit_slots().collect::<HashSet<_>>();
+        let all_slots = fd.visit_slots().collect::<FxHashSet<_>>();
         assert_eq!(all_slots.len(), 4);
     }
 
@@ -902,13 +955,13 @@ mod forks_tests {
         // 4 -> 5
         // (missing 2 ~~> 4 path)
         let mut fd = Forks::default();
-        let mut forked_detected = HashSet::default();
+        let mut forked_detected = FxHashSet::default();
         fd.add_slot_with_parent(1, 2, &mut forked_detected);
         assert!(forked_detected.is_empty());
         fd.add_slot_with_parent(4, 5, &mut forked_detected);
         assert!(forked_detected.is_empty());
 
-        let slots = fd.visit_slots().collect::<HashSet<_>>();
+        let slots = fd.visit_slots().collect::<FxHashSet<_>>();
         assert_eq!(fd.get_all_nodes().len(), 4);
         assert_eq!(slots.len(), 4);
         assert!(slots.contains(&1));
@@ -934,7 +987,7 @@ mod forks_tests {
 
         let mut fd = Forks::with_max_capacity(1);
 
-        let mut forked_detected = HashSet::default();
+        let mut forked_detected = FxHashSet::default();
         fd.add_slot_with_parent(2, 1, &mut forked_detected);
         fd.add_slot_with_parent(3, 2, &mut forked_detected);
         fd.add_slot_with_parent(4, 3, &mut forked_detected);
@@ -964,23 +1017,23 @@ mod forks_tests {
 
         fd.make_slot_rooted(2, &mut forked_detected);
 
-        let expected_forks_detected = HashSet::from_iter([11, 12, 13]);
+        let expected_forks_detected = FxHashSet::from_iter([11, 12, 13]);
         assert_eq!(forked_detected, expected_forks_detected);
 
         forked_detected.clear();
 
         fd.make_slot_rooted(4, &mut forked_detected);
-        let expected_forks_detected = HashSet::from_iter([14, 15, 16, 17, 18, 19, 20]);
+        let expected_forks_detected = FxHashSet::from_iter([14, 15, 16, 17, 18, 19, 20]);
         assert_eq!(forked_detected, expected_forks_detected);
 
-        let mut forks_removed = HashSet::default();
+        let mut forks_removed = FxHashSet::default();
 
         fd.pop_oldest_rooted_slot(&mut forks_removed);
 
-        let expected_deleted_forks = HashSet::from_iter([11, 12, 13]);
+        let expected_deleted_forks = FxHashSet::from_iter([11, 12, 13]);
         assert_eq!(forks_removed, expected_deleted_forks);
 
-        let all_slots = fd.visit_slots().collect::<HashSet<_>>();
+        let all_slots = fd.visit_slots().collect::<FxHashSet<_>>();
         assert_eq!(all_slots.len(), 16);
 
         assert_eq!(fd.oldest_rooted_slot(), Some(2));

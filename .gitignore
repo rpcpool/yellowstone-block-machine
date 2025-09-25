@@ -1,1 +1,11 @@
-/target
+target
+.vscode
+.local
+.idea
+.DS_Store
+*.log
+*.tmp
+*.swp
+*.swo
+*.bak
+*.old
