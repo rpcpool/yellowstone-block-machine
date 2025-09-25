@@ -17,6 +17,7 @@ tonic = [
 ]
 
 [dependencies]
+bs58 = { workspace = true }
 bytesize = { workspace = true }
 bytesize-serde = { workspace = true }
 derive_more = { workspace = true, features = ["from", "into", "display"] }
@@ -32,12 +33,11 @@ thiserror = { workspace = true }
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread"]}
 tokio-stream = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
-tonic = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true, features = ["tls-ring", "tls-native-roots"]}
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 yellowstone-grpc-client = { workspace = true, optional = true }
 yellowstone-grpc-proto = { workspace = true, optional = true }
-clap = "4.5.48"
 
 
 [dev-dependencies]

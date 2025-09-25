@@ -686,9 +686,9 @@ impl BlockSM {
             Ok(frozen_block) => frozen_block,
             Err(e) => {
                 tracing::error!(
-                    "Failed to freeze block for slot {}: {:?}",
+                    "Failed to freeze block for slot {}, {:?}",
                     e.get_block().slot,
-                    e
+                    e.to_string(),
                 );
                 self.push_to_dlq(DeadletterEvent::UnprocessableBlock(e));
                 return;

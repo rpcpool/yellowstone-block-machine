@@ -9,9 +9,9 @@ use {
     solana_clock::Slot,
     solana_commitment_config::CommitmentLevel,
     solana_hash::Hash,
-    std::{cmp::Ordering, collections::HashMap, marker::PhantomData, ops::Sub, sync::Arc},
+    std::{cmp::Ordering, collections::HashMap, marker::PhantomData, sync::Arc},
     tokio::sync::mpsc,
-    tokio_stream::wrappers::{ReceiverStream, UnboundedReceiverStream},
+    tokio_stream::wrappers::ReceiverStream,
     tokio_util::sync::PollSender,
     tonic::async_trait,
     yellowstone_grpc_client::{GeyserGrpcClient, GeyserGrpcClientError, Interceptor},
@@ -67,6 +67,7 @@ pub struct Block {
     pub events: Vec<Arc<SubscribeUpdate>>,
     account_idx_map: Vec<usize>,
     transaction_idx_map: Vec<usize>,
+    #[allow(dead_code)]
     entry_idx_map: Vec<usize>,
 }
 
@@ -390,11 +391,14 @@ impl DragonsmouthBlockMachine {
     }
 
     fn handle_block_meta(&mut self, block_meta: SubscribeUpdateBlockMeta) {
+        let bh = bs58::decode(block_meta.blockhash)
+            .into_vec()
+            .expect("blockhash format");
         let block_summary = BlockSummary {
             slot: block_meta.slot,
             entry_count: block_meta.entries_count,
             executed_transaction_count: block_meta.executed_transaction_count,
-            blockhash: Hash::new_from_array([0; 32]), // TODO
+            blockhash: Hash::new_from_array(bh.try_into().expect("blockhash length")),
         };
         self.sm.process_event(block_summary.into());
         // Currently not used in block reconstruction

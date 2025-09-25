@@ -1,17 +1,32 @@
 use {
     clap::Parser,
     common_macros::hash_map,
-    std::{collections::HashMap, path::PathBuf},
+    std::path::PathBuf,
     tokio::sync::mpsc,
+    tracing_subscriber::{
+        EnvFilter,
+        layer::SubscriberExt,
+        util::{SubscriberInitExt, TryInitError},
+    },
     yellowstone_block_machine::dragonsmouth::{
         BlockMachineError, BlockMachineOutput, GeyserGrpcExt,
     },
     yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcBuilder},
-    yellowstone_grpc_proto::geyser::{
-        CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
-        SubscribeRequestFilterSlots,
-    },
+    yellowstone_grpc_proto::geyser::SubscribeRequest,
 };
+
+pub fn init_tracing() {
+    let io_layer = tracing_subscriber::fmt::layer()
+        .with_ansi(true)
+        .with_line_number(true);
+
+    let level_layer = EnvFilter::builder().from_env_lossy();
+    tracing_subscriber::registry()
+        .with(io_layer)
+        .with(level_layer)
+        .try_init()
+        .expect("tracing init");
+}
 
 #[derive(Debug, clap::Parser)]
 #[clap(
@@ -20,6 +35,7 @@ use {
     about = "Yellowstone Block Machine with Dragonsmouth Extension Example"
 )]
 struct Args {
+    #[clap(long)]
     config: PathBuf,
     #[clap(long, default_value_t = 10)]
     samples: usize,
@@ -76,6 +92,7 @@ async fn process_block<W>(
 
 #[tokio::main]
 async fn main() {
+    init_tracing();
     let args = Args::parse();
     let config: Config =
         serde_yaml::from_reader(std::fs::File::open(args.config).unwrap()).expect("open config");
@@ -87,8 +104,7 @@ async fn main() {
         .expect("x_token")
         .tls_config(ClientTlsConfig::new().with_native_roots())
         .expect("tls_config")
-        .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-        .send_compressed(tonic::codec::CompressionEncoding::Gzip)
+        .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
         .connect()
         .await
         .expect("Failed to connect to geyser");

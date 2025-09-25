@@ -15,6 +15,7 @@ keywords = ["solana", "rpc", "block", "machine", "yellowstone"]
 publish = false
 
 [workspace.dependencies]
+bs58 = "^0.5.0"
 bytesize = "2"
 bytesize-serde = "^0.2"
 clap = "4"
