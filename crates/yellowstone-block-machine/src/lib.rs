@@ -395,7 +395,7 @@
 //! - `dragonsmouth`: Enables the dragonsmouth subscription of geyser events as the blockmachine input source.
 //!
 //!
-#[cfg(feature = "dragonsmouth")]
+#[cfg(feature = "dragonsmouth-thin")]
 pub mod dragonsmouth;
 pub mod forks;
 pub mod state_machine;

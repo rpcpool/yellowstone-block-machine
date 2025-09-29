@@ -13,12 +13,15 @@ publish = true
 
 [features]
 dragonsmouth = [
+    "dragonsmouth-thin",
     "dep:yellowstone-grpc-client",
-    "dep:yellowstone-grpc-proto",
     "dep:tokio",
     "dep:tokio-stream",
     "dep:tokio-util",
     "tonic",
+]
+dragonsmouth-thin = [
+    "dep:yellowstone-grpc-proto",
 ]
 tonic = [
     "dep:tonic",
