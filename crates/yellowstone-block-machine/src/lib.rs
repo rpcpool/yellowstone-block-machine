@@ -1,33 +1,33 @@
 //! Yellowstone Block Machine
-//! 
+//!
 //! This crate provides a block machine implementation that processes Solana Geyser events such that block reconstruction
 //! is done right!
-//! 
+//!
 //! The block machine processes Geyser events and produces blocks that contain all transactions and account states
 //! that were part of the block when it was originally produced by the Solana node.
-//! 
+//!
 //! The block machine also detects forks and dead blocks, and provides slot commitment updates.
-//! 
+//!
 //! The block machine can be used as a library or as a standalone application (dragonsmouth).
-//! 
+//!
 //! # Challenge rebuilding blocks from Geyser events
-//! 
+//!
 //! Trying to rebuild a block from Geyser events can be challenging due to the multiple rules and edge cases
 //! surrounding slot lifecycle events and commitment level updates.
-//! 
-//! The bootstrapping problem: typically you receive geyser event via Dragonsmouth's gRPC interface. 
+//!
+//! The bootstrapping problem: typically you receive geyser event via Dragonsmouth's gRPC interface.
 //! However, the first couple of events you receive may be in the middle of a slot, or even at the end of a slot.
 //! You would have to discard these events since you don't know if you missed any events at the beginning of the slot.
-//! 
+//!
 //! To make sure you have received all events for a slot, you must make sure your program detected
 //! either SlotStatus::FIRST_SHRED_RECEIVED or SlotStatus::BANK_CREATED for the slot, otherwise
 //! you may have missed some events at the beginning of the slot.
-//! 
+//!
 //! To better understand the slot lifecycle, the following section provides a detailed overview of the various
 //! slot status events and their significance.
-//! 
+//!
 //! # Intra-slot Update
-//! 
+//!
 //! ```ignore
 //! enum SlotStatus {
 //!   ...
@@ -37,66 +37,67 @@
 //!   SLOT_DEAD = 6;
 //! }
 //! ```
-//! 
-//! 
+//!
+//!
 //! - SLOT_FIRST_SHRED_RECEIVED: The remote RPC node you're connected to has received the first shred of a given slot. This does not indicate it has been replayed yet. This event occurs during the retransmit stage in the TVU.
 //! - SLOT_CREATED_BANK: A bank for the given slot has been created on the remote RPC node you're connected to. Within a validator, a Bank acts as an isolated execution environment during the replay stage (which follows the retransmit stage). Due to the decentralized nature of blockchains, forks are inevitable, meaning a slot can have multiple descendants.
-//! To handle this, validators must be capable of replaying multiple slots that share the same ancestor without their execution interfering with one another. Each slot is assigned its own Bank instance, and these Banks form a fork graph, where each edge represents a parent-child relationship between two banks.
-//! Banks serve as self-contained execution contexts, maintaining replay results and essential metadata about the slot and its lineage. Importantly, a Bank is instantiated once per slot.
+//!   To handle this, validators must be capable of replaying multiple slots that share the same ancestor without their execution interfering with one another. Each slot is assigned its own Bank instance, and these Banks form a fork graph, where each edge represents a parent-child relationship between two banks.
+//!   Banks serve as self-contained execution contexts, maintaining replay results and essential metadata about the slot and its lineage. Importantly, a Bank is instantiated once per slot.
 //! - SLOT_COMPLETED: All the shreds for the given slot have been received by the RPC node you're connected to. However, this does not necessarily mean that the slot has been fully replayed yet.
 //! - SLOT_DEAD: Dead slots are slots that have been rejected by the validator for various reasons, such as invalid transaction signatures in the leader's shreds, incorrect entry hashes during Proof of History (PoH) verification, or an unexpected number of entries in the slot. When a slot is marked as dead, it is discarded by the network as a whole and effectively skipped. This can occur at any point during the replay process, even after the slot has been marked as 'completed'.
+//!
 //! Here's a "simplfied" overview of the expected lifecycle of a slot:\
 //!                                                                                                                                             
-//!                                                                                                                                             
-//!                                                                                                                                             
-//!                                           TIME ->                                                                                           
-//!       ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────►   
-//!       ┌───────────────────────────────────────────────────────┐                                                                             
-//!       │ Slot download                                         │                                                                             
-//!       │ ┌───────────┐┌──────┐         ┌───────┐┌───────────┐  │                                                                             
-//!       │ │FIRST_SHRED││SHRED2│  ...    │SHRED N││ COMPLETED │  │                                                                             
-//!       │ │ RECEIVED  │└──────┘         └───────┘└───────────┘  │                                                                             
-//!       │ └───────────                                          │                                                                             
-//!       └──────────────┌───────────────────────────────────────────────────────────────────────────────┐                                      
-//!                      │ REPLAY STAGE                                                                  │                                      
-//!                      │┌─────────────┐ ┌──────────────┐ ┌───┌───┐┌──────┐    ┌──────────┐ ┌─────────┐ │                                      
-//!                      ││BANK_CREATED │ │ACCOUNT UPDATE│ │TX1│TX2││ENTRY1│... │BLOCK_META│ │PROCESSED│ │                                      
-//!                      │└─────────────┘ └──────────────┘ └───└───┘└──────┘    └──────────┘ └─────────┘ │                                      
-//!                      │                                                                               │                                      
-//!                      └───────────────────────────────────────────────────────────────────────────────┘                                      
-//!                                                                                             ┌──────────────────────────────────┐    
-//!                                                                                             │ CONSENSUS                        │    
-//!                                                                                             │ ┌──────────┐      ┌───────────┐  │    
-//!                                                                                             │ │CONFIRMED │      │FINALIZED  │  │    
-//!                                                                                             │ └──────────┘      └───────────┘  │    
-//!                                                                                             │                                  │    
-//!                                                                                             └──────────────────────────────────┘    
-//!                                                                                                                                             
-//! 
-//! 
-//! 
+//!                                                                                                                                       
+//!                                                                                                                                       
+//!                                     TIME ->                                                                                           
+//! ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────►   
+//! ┌───────────────────────────────────────────────────────┐                                                                             
+//! │ Slot download                                         │                                                                             
+//! │ ┌───────────┐┌──────┐         ┌───────┐┌───────────┐  │                                                                             
+//! │ │FIRST_SHRED││SHRED2│  ...    │SHRED N││ COMPLETED │  │                                                                             
+//! │ │ RECEIVED  │└──────┘         └───────┘└───────────┘  │                                                                             
+//! │ └───────────                                          │                                                                             
+//! └──────────────┌───────────────────────────────────────────────────────────────────────────────┐                                      
+//!                │ REPLAY STAGE                                                                  │                                      
+//!                │┌─────────────┐ ┌──────────────┐ ┌───┌───┐┌──────┐    ┌──────────┐ ┌─────────┐ │                                      
+//!                ││BANK_CREATED │ │ACCOUNT UPDATE│ │TX1│TX2││ENTRY1│... │BLOCK_META│ │PROCESSED│ │                                      
+//!                │└─────────────┘ └──────────────┘ └───└───┘└──────┘    └──────────┘ └─────────┘ │                                      
+//!                │                                                                               │                                      
+//!                └───────────────────────────────────────────────────────────────────────────────┘                                      
+//!                                                                                       ┌──────────────────────────────────┐    
+//!                                                                                       │ CONSENSUS                        │    
+//!                                                                                       │ ┌──────────┐      ┌───────────┐  │    
+//!                                                                                       │ │CONFIRMED │      │FINALIZED  │  │    
+//!                                                                                       │ └──────────┘      └───────────┘  │    
+//!                                                                                       │                                  │    
+//!                                                                                       └──────────────────────────────────┘    
+//!                                                                                                                                       
+//!
+//!
+//!
 //! ## IMPORTANT QUIRKS
-//! 
+//!
 //! - Sometimes, BANK_CREATED is received before FIRST_SHRED_RECEIVED. This is because of internal Agave logic which sends
-//! FIRST_SHRED_RECEIVED on a queue and BANK_CREATED directly via a callback.
+//!   FIRST_SHRED_RECEIVED on a queue and BANK_CREATED directly via a callback.
 //! - DEAD slots can be received at any time, even after COMPLETED.
 //! - COMPLETED can be received after BlockMeta and any Commitment Level status update.
 //! - A slot can receive PROCESSED or CONFIRMED before BlockMeta.
-//! 
-//! 
+//!
+//!
 //! # Dragonsmouth Integration Examples
-//! 
+//!
 //! The easiest way to use the block machine is via the dragonsmouth module, which provides
 //! integration with the dragonsmouth gRPC interface.
-//! 
-//! 
+//!
+//!
 //! ```ignore
 //! #[derive(Debug, Clone, serde::Deserialize)]
 //! struct Config {
 //!     endpoint: String,
 //!     x_token: Option<String>,
 //! }
-//! 
+//!
 //! async fn process_block<W>(
 //!     mut block_recv: mpsc::Receiver<Result<BlockMachineOutput, BlockMachineError>>,
 //!     sample: usize,
@@ -142,7 +143,7 @@
 //!         }
 //!     }
 //! }
-//! 
+//!
 //! #[tokio::main]
 //! async fn main() {
 //!     init_tracing();
@@ -161,7 +162,7 @@
 //!         .connect()
 //!         .await
 //!         .expect("Failed to connect to geyser");
-//! 
+//!
 //!     // This request listen for all account updates and transaction updates
 //!     let request = SubscribeRequest {
 //!         accounts: hash_map! {
@@ -176,7 +177,7 @@
 //!         commitment: Some(CommitmentLevel::Confirmed as i32),
 //!         ..Default::default()
 //!     };
-//! 
+//!
 //!     let block_machine_rx = geyser
 //!         .subscribe_block(request)
 //!         .await
@@ -186,23 +187,23 @@
 //! ```
 //!
 //! # How to build your custom block machine integration
-//! 
+//!
 //! You can build your own block machine integration by building a driver that feeds [`yellowstone_block_machine::state_machine::BlockSM`] instance.
-//! 
+//!
 //! You must feed the state machine with every:
 //! 1. Block entries
 //! 2. Block meta summary (FINAL message to make the block freeze)
 //! 3. Slot lifecycle events (SLOT_FIRST_SHRED_RECEIVED, SLOT_COMPLETED, SLOT_CREATED_BANK, SLOT_DEAD)
 //! 4. Commitment level updates (PROCESSED, CONFIRMED, FINALIZED)
-//! 
-//! 
+//!
+//!
 //! ```ignore
 //! struct DragonsmouthBlockMachine {
 //!     minimum_commitment_level: CommitmentLevel,
 //!     block_storage: InMemoryBlockStore,
 //!     sm: BlockSM,
 //! }
-//! 
+//!
 //! impl From<SubscribeUpdateEntry> for EntryInfo {
 //!     fn from(value: SubscribeUpdateEntry) -> Self {
 //!         Self {
@@ -214,7 +215,7 @@
 //!         }
 //!     }
 //! }
-//! 
+//!
 //! fn compare_commitment(cl1: CommitmentLevel, cl2: CommitmentLevel) -> Ordering {
 //!     match (cl1, cl2) {
 //!         (CommitmentLevel::Processed, CommitmentLevel::Processed) => Ordering::Equal,
@@ -227,13 +228,13 @@
 //!         (CommitmentLevel::Confirmed, CommitmentLevel::Finalized) => Ordering::Less,
 //!     }
 //! }
-//! 
+//!
 //! impl DragonsmouthBlockMachine {
 //!     fn handle_block_entry(&mut self, entry: SubscribeUpdateEntry) {
 //!         let entry_info: EntryInfo = entry.into();
 //!         self.sm.process_event(entry_info.into());
 //!     }
-//! 
+//!
 //!     fn handle_slot_update(&mut self, slot_update: &SubscribeUpdateSlot) {
 //!         let slot_status = slot_update.status();
 //!         const LIFE_CYCLE_STATUS: [SlotStatus; 4] = [
@@ -242,7 +243,7 @@
 //!             SlotStatus::SlotCreatedBank,
 //!             SlotStatus::SlotDead,
 //!         ];
-//! 
+//!
 //!         if LIFE_CYCLE_STATUS.contains(&slot_status) {
 //!             let lifecycle_update = SlotLifecycleUpdate {
 //!                 slot: slot_update.slot,
@@ -267,11 +268,11 @@
 //!                     _ => unreachable!(),
 //!                 },
 //!             };
-//! 
+//!
 //!             self.sm.process_event(commitment_level_update.into());
 //!         }
 //!     }
-//! 
+//!
 //!     fn handle_block_meta(&mut self, block_meta: SubscribeUpdateBlockMeta) {
 //!         let bh = bs58::decode(block_meta.blockhash)
 //!             .into_vec()
@@ -378,7 +379,7 @@
 //!             }
 //!         }
 //!     }
-//! 
+//!
 //!     fn drain_unprocess_bm_output<Ext>(&mut self, out: &mut Ext)
 //!     where
 //!         Ext: Extend<BlockMachineOutput>,
@@ -389,10 +390,10 @@
 //!     }
 //! }
 //! ```
-//! 
+//!
 //! # Feature flags
 //! - `dragonsmouth`: Enables the dragonsmouth subscription of geyser events as the blockmachine input source.
-//! 
+//!
 //!
 #[cfg(feature = "dragonsmouth")]
 pub mod dragonsmouth;

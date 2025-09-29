@@ -93,33 +93,11 @@ pub const AVG_TPB: usize = 2000;
 #[derive(Debug, thiserror::Error)]
 pub enum FreezeError {
     #[error("entry count mismatch, expected {expected}, got {got}")]
-    InvalidTickCount {
-        expected: u64,
-        got: u64,
-        invalid_block: Block,
-    },
+    InvalidTickCount { expected: u64, got: u64 },
     #[error("entry count mismatch, expected {expected}, got {got}")]
-    InvalidEntryCount {
-        expected: u64,
-        got: u64,
-        invalid_block: Block,
-    },
+    InvalidEntryCount { expected: u64, got: u64 },
     #[error("blockhash mismatch, expected {expected}, got {got}")]
-    InvalidBlockhash {
-        expected: Hash,
-        got: Hash,
-        invalid_block: Block,
-    },
-}
-
-impl FreezeError {
-    fn get_block(&self) -> &Block {
-        match self {
-            FreezeError::InvalidTickCount { invalid_block, .. } => invalid_block,
-            FreezeError::InvalidEntryCount { invalid_block, .. } => invalid_block,
-            FreezeError::InvalidBlockhash { invalid_block, .. } => invalid_block,
-        }
-    }
+    InvalidBlockhash { expected: Hash, got: Hash },
 }
 
 ///
@@ -157,7 +135,6 @@ impl Block {
             return Err(FreezeError::InvalidEntryCount {
                 expected: summary.entry_count,
                 got: self.entry_cnt,
-                invalid_block: self,
             });
         }
 
@@ -165,7 +142,6 @@ impl Block {
             return Err(FreezeError::InvalidTickCount {
                 expected: DEFAULT_TICKS_PER_SLOT,
                 got: self.tick_entry_cnt,
-                invalid_block: self,
             });
         }
 
@@ -182,7 +158,6 @@ impl Block {
             return Err(FreezeError::InvalidBlockhash {
                 expected: summary.blockhash,
                 got: blockhash,
-                invalid_block: self,
             });
         }
 
@@ -252,7 +227,7 @@ pub struct BlocksStateMachine {
     min_history_revision_in_queue: Option<usize>,
 
     /// Update queue for blockstore events.
-    blockstore_update_queue: VecDeque<(usize, BlockStateMachineOuput)>,
+    blockstore_update_queue: VecDeque<(usize, BlockStateMachineOutput)>,
 
     /// Maintain forks history of the blockchain.    
     forks: Forks,
@@ -311,14 +286,14 @@ pub struct DeadBlockDetected {
 }
 
 #[derive(Debug)]
-pub enum BlockStateMachineOuput {
+pub enum BlockStateMachineOutput {
     FrozenBlock(FrozenBlock),
     SlotStatus(SlotCommitmentStatusUpdate),
     ForksDetected(ForkDetected),
     DeadSlotDetected(DeadBlockDetected),
 }
 
-impl BlockStateMachineOuput {
+impl BlockStateMachineOutput {
     pub fn slot(&self) -> Slot {
         match self {
             Self::DeadSlotDetected(blk) => blk.slot,
@@ -454,7 +429,7 @@ impl BlocksStateMachine {
         temp
     }
 
-    fn push_new_update(&mut self, update: BlockStateMachineOuput) -> Revision {
+    fn push_new_update(&mut self, update: BlockStateMachineOutput) -> Revision {
         let new_revision = self.next_history_revision();
         let slot = update.slot();
         let max_revision = self
@@ -582,7 +557,7 @@ impl BlocksStateMachine {
                 // if we change data source that may not guarantee the order of slot status update.
                 for slot_status2 in slot_status_to_push {
                     let revision =
-                        self.push_new_update(BlockStateMachineOuput::SlotStatus(slot_status2));
+                        self.push_new_update(BlockStateMachineOutput::SlotStatus(slot_status2));
                     tracing::debug!(
                         "Slot status update for slot {} at revision {}",
                         slot,
@@ -624,7 +599,7 @@ impl BlocksStateMachine {
     ///
     fn mark_block_as_dead(&mut self, slot: Slot) {
         self.remove_slot_references_in_state(slot);
-        self.push_new_update(BlockStateMachineOuput::DeadSlotDetected(
+        self.push_new_update(BlockStateMachineOutput::DeadSlotDetected(
             DeadBlockDetected { slot },
         ));
     }
@@ -671,16 +646,16 @@ impl BlocksStateMachine {
         let forks_detected = std::mem::take(&mut self.forks_detected_in_current_tick);
         for slot in forks_detected {
             tracing::trace!("Forks detected for slot {}", slot);
-            self.push_new_update(BlockStateMachineOuput::ForksDetected(ForkDetected { slot }));
+            self.push_new_update(BlockStateMachineOutput::ForksDetected(ForkDetected {
+                slot,
+            }));
         }
     }
 
     fn handle_block_summary(&mut self, block_summary: BlockSummary) {
-        let Some(block) = self.block_buffer_map.remove(&block_summary.slot) else {
-            tracing::debug!(
-                "Block summary for slot {} but no block data found",
-                block_summary.slot
-            );
+        let slot = block_summary.slot;
+        let Some(block) = self.block_buffer_map.remove(&slot) else {
+            tracing::debug!("Block summary for slot {slot} but no block data found",);
             self.push_to_dlq(DeadletterEvent::SkippedBlock(block_summary.into()));
             return;
         };
@@ -689,15 +664,14 @@ impl BlocksStateMachine {
             Ok(frozen_block) => frozen_block,
             Err(e) => {
                 tracing::error!(
-                    "Failed to freeze block for slot {}, {:?}",
-                    e.get_block().slot,
+                    "Failed to freeze block for slot {slot}, {:?}",
                     e.to_string(),
                 );
                 self.push_to_dlq(DeadletterEvent::UnprocessableBlock(e));
                 return;
             }
         };
-        let slot = frozen_block.slot;
+        assert_eq!(slot, frozen_block.slot);
 
         // Block is now frozen which mean every transaction and account update is now in the block
         if !self.completed_blocks.contains(&slot) {
@@ -711,7 +685,7 @@ impl BlocksStateMachine {
         }
         tracing::debug!("Block frozen for slot {}", slot);
         self.frozen_block_index.entry(slot).or_default();
-        self.push_new_update(BlockStateMachineOuput::FrozenBlock(frozen_block));
+        self.push_new_update(BlockStateMachineOutput::FrozenBlock(frozen_block));
 
         if let Some(max_pending_commitment_level) = self
             .pending_slot_status_update
@@ -745,9 +719,9 @@ impl BlocksStateMachine {
 
     ///
     /// Main entry point to process blockstore event and progress the state-machine.
-    /// 
+    ///
     /// Registers the event into the state machine and process any side effect that may arise from it.
-    /// 
+    ///
     pub fn process_event(&mut self, event: BlockstoreInputEvent) {
         match event {
             BlockstoreInputEvent::SlotCommitmentStatus(slot_status) => {
@@ -871,7 +845,7 @@ impl BlocksStateMachine {
     ///
     /// Pops the next unprocessed blockstore update from the queue.
     ///
-    pub fn pop_next_unprocess_blockstore_update(&mut self) -> Option<BlockStateMachineOuput> {
+    pub fn pop_next_unprocess_blockstore_update(&mut self) -> Option<BlockStateMachineOutput> {
         let (revision, data) = self.blockstore_update_queue.pop_front()?;
         self.min_history_revision_in_queue = Some(revision + 1);
         // Check if we need to schedule deregister process.
@@ -898,7 +872,7 @@ pub fn module_path_for_test() -> &'static str {
 mod tests {
     use {
         crate::state_machine::{
-            BlockStateMachineOuput, BlockSummary, EntryInfo, SlotCommitmentStatusUpdate,
+            BlockStateMachineOutput, BlockSummary, EntryInfo, SlotCommitmentStatusUpdate,
             SlotLifecycle, SlotLifecycleUpdate, iter_to_commitment,
         },
         solana_clock::{DEFAULT_TICKS_PER_SLOT, Slot},
@@ -991,12 +965,12 @@ mod tests {
         let actual = blockstore.pop_next_unprocess_blockstore_update();
         assert!(matches!(
             actual,
-            Some(super::BlockStateMachineOuput::FrozenBlock(_))
+            Some(super::BlockStateMachineOutput::FrozenBlock(_))
         ));
         let actual = blockstore.pop_next_unprocess_blockstore_update();
         assert!(matches!(
             actual,
-            Some(super::BlockStateMachineOuput::SlotStatus(_))
+            Some(super::BlockStateMachineOutput::SlotStatus(_))
         ));
         let actual = blockstore.pop_next_unprocess_blockstore_update();
         assert!(actual.is_none());
@@ -1071,12 +1045,12 @@ mod tests {
         blockstore.process_event(summary.into());
 
         let actual = blockstore.pop_next_unprocess_blockstore_update().unwrap();
-        let BlockStateMachineOuput::FrozenBlock(frozen_block) = actual else {
+        let BlockStateMachineOutput::FrozenBlock(frozen_block) = actual else {
             panic!("Expected frozen block");
         };
         assert_eq!(frozen_block.slot, 1);
 
-        let BlockStateMachineOuput::SlotStatus(status) =
+        let BlockStateMachineOutput::SlotStatus(status) =
             blockstore.pop_next_unprocess_blockstore_update().unwrap()
         else {
             panic!("Expected slot status update");
@@ -1086,7 +1060,7 @@ mod tests {
         assert_eq!(status.commitment, CommitmentLevel::Processed);
 
         let actual = blockstore.pop_next_unprocess_blockstore_update().unwrap();
-        let BlockStateMachineOuput::SlotStatus(status) = actual else {
+        let BlockStateMachineOutput::SlotStatus(status) = actual else {
             panic!("Expected slot status update");
         };
         assert_eq!(status.slot, 1);
@@ -1170,12 +1144,12 @@ mod tests {
         blockstore.process_event(slot1_processed.into());
 
         let actual = blockstore.pop_next_unprocess_blockstore_update().unwrap();
-        let BlockStateMachineOuput::FrozenBlock(frozen_block) = actual else {
+        let BlockStateMachineOutput::FrozenBlock(frozen_block) = actual else {
             panic!("Expected frozen block");
         };
         assert_eq!(frozen_block.slot, 1);
 
-        let BlockStateMachineOuput::SlotStatus(status) =
+        let BlockStateMachineOutput::SlotStatus(status) =
             blockstore.pop_next_unprocess_blockstore_update().unwrap()
         else {
             panic!("Expected slot status update");
@@ -1194,14 +1168,14 @@ mod tests {
         blockstore.process_event(slot2_finalized.into());
 
         let actual = blockstore.pop_next_unprocess_blockstore_update().unwrap();
-        let BlockStateMachineOuput::FrozenBlock(frozen_block) = actual else {
+        let BlockStateMachineOutput::FrozenBlock(frozen_block) = actual else {
             panic!("Expected frozen block");
         };
         assert_eq!(frozen_block.slot, 2);
 
         for expected_cl in iter_to_commitment(&CommitmentLevel::Finalized) {
             let actual = blockstore.pop_next_unprocess_blockstore_update().unwrap();
-            let BlockStateMachineOuput::SlotStatus(status) = actual else {
+            let BlockStateMachineOutput::SlotStatus(status) = actual else {
                 panic!("Expected slot status update");
             };
             assert_eq!(status.slot, 2);
@@ -1210,7 +1184,7 @@ mod tests {
         // Now we should have a retroactively rooted slot for slot 1
         for expected_cl in [CommitmentLevel::Confirmed, CommitmentLevel::Finalized] {
             let actual = blockstore.pop_next_unprocess_blockstore_update().unwrap();
-            let BlockStateMachineOuput::SlotStatus(status) = actual else {
+            let BlockStateMachineOutput::SlotStatus(status) = actual else {
                 panic!("Expected slot status update");
             };
             assert_eq!(status.slot, 1);

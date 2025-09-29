@@ -4,7 +4,7 @@ use {
     std::path::PathBuf,
     tokio::sync::mpsc,
     tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt},
-    yellowstone_block_machine::dragonsmouth::{
+    yellowstone_block_machine::dragonsmouth::client_ext::{
         BlockMachineError, BlockMachineOutput, GeyserGrpcExt,
     },
     yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcBuilder},
@@ -54,7 +54,7 @@ async fn process_block<W>(
     while let Some(result) = block_recv.recv().await {
         match result {
             Ok(output) => match output {
-                BlockMachineOutput::Block(block) => {
+                BlockMachineOutput::FrozenBlock(block) => {
                     let n = block.len();
                     let slot = block.slot;
                     let account_cnt = block.account_len();
