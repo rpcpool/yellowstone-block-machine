@@ -382,8 +382,9 @@ where
                         Some(result) => {
                             match result {
                                 Ok(ev) => {
-                                    self.machine.handle_new_geyser_event(&ev);
-                                    self.insert_into_storage(ev);
+                                    if self.machine.handle_new_geyser_event(&ev).is_ok() {
+                                        self.insert_into_storage(ev);
+                                    }   
                                 },
                                 Err(e) => {
                                     tracing::error!("Geyser stream error: {}", e);

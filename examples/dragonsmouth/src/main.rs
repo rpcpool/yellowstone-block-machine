@@ -103,6 +103,7 @@ async fn main() {
         .expect("x_token")
         .tls_config(ClientTlsConfig::new().with_native_roots())
         .expect("tls_config")
+        .max_decoding_message_size(50 * 1024 * 1024) // 50MB
         .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
         .connect()
         .await

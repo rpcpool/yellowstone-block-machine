@@ -1,13 +1,12 @@
 use {
     crate::state_machine::{
         BlockStateMachineOutput, BlockSummary, BlocksStateMachine, EntryInfo,
-        SlotCommitmentStatusUpdate, SlotLifecycle, SlotLifecycleUpdate,
+        SlotCommitmentStatusUpdate, SlotLifecycle, SlotLifecycleUpdate, UntrackedSlot,
     },
     solana_commitment_config::CommitmentLevel,
     solana_hash::Hash,
     yellowstone_grpc_proto::geyser::{
-        SlotStatus, SubscribeUpdate, SubscribeUpdateBlockMeta, SubscribeUpdateEntry,
-        SubscribeUpdateSlot, subscribe_update::UpdateOneof,
+        subscribe_update::UpdateOneof, SlotStatus, SubscribeUpdate, SubscribeUpdateBlockMeta, SubscribeUpdateEntry, SubscribeUpdateSlot
     },
 };
 
@@ -36,12 +35,12 @@ impl From<SubscribeUpdateEntry> for EntryInfo {
 }
 
 impl BlocksStateMachineWrapper {
-    pub fn handle_block_entry(&mut self, entry: &SubscribeUpdateEntry) {
+    pub fn handle_block_entry(&mut self, entry: &SubscribeUpdateEntry) -> Result<(), UntrackedSlot> {
         let entry_info: EntryInfo = entry.clone().into();
-        self.sm.process_event(entry_info.into());
+        self.sm.process_replay_event(entry_info.into())
     }
 
-    pub fn handle_slot_update(&mut self, slot_update: &SubscribeUpdateSlot) {
+    pub fn handle_slot_update(&mut self, slot_update: &SubscribeUpdateSlot) -> Result<(), UntrackedSlot> {
         let slot_status = slot_update.status();
         const LIFE_CYCLE_STATUS: [SlotStatus; 4] = [
             SlotStatus::SlotFirstShredReceived,
@@ -62,7 +61,7 @@ impl BlocksStateMachineWrapper {
                     _ => unreachable!(),
                 },
             };
-            self.sm.process_event(lifecycle_update.into());
+            self.sm.process_replay_event(lifecycle_update.into())?;
         } else {
             let commitment_level_update = SlotCommitmentStatusUpdate {
                 parent_slot: slot_update.parent,
@@ -75,11 +74,12 @@ impl BlocksStateMachineWrapper {
                 },
             };
 
-            self.sm.process_event(commitment_level_update.into());
+            self.sm.process_consensus_event(commitment_level_update.into());
         }
+        Ok(())
     }
 
-    pub fn handle_block_meta(&mut self, block_meta: &SubscribeUpdateBlockMeta) {
+    pub fn handle_block_meta(&mut self, block_meta: &SubscribeUpdateBlockMeta) -> Result<(), UntrackedSlot> {
         let bh = bs58::decode(block_meta.blockhash.as_str())
             .into_vec()
             .expect("blockhash format");
@@ -89,33 +89,34 @@ impl BlocksStateMachineWrapper {
             executed_transaction_count: block_meta.executed_transaction_count,
             blockhash: Hash::new_from_array(bh.try_into().expect("blockhash length")),
         };
-        self.sm.process_event(block_summary.into());
+        self.sm.process_replay_event(block_summary.into())
         // Currently not used in block reconstruction
     }
 
-    pub fn handle_new_geyser_event(&mut self, event: &SubscribeUpdate) {
+    pub fn handle_new_geyser_event(&mut self, event: &SubscribeUpdate) -> Result<(), UntrackedSlot> {
         let SubscribeUpdate {
             filters: _,
             created_at: _,
             update_oneof,
         } = event;
         let Some(update_oneof) = update_oneof else {
-            return;
+            return Ok(());
         };
         match update_oneof {
             UpdateOneof::Slot(subscribe_update_slot) => {
-                self.handle_slot_update(subscribe_update_slot);
+                self.handle_slot_update(subscribe_update_slot)?;
             }
             UpdateOneof::BlockMeta(subscribe_update_block_meta) => {
-                self.handle_block_meta(subscribe_update_block_meta);
+                self.handle_block_meta(subscribe_update_block_meta)?;
             }
             UpdateOneof::Entry(subscribe_update_entry) => {
-                self.handle_block_entry(subscribe_update_entry);
+                self.handle_block_entry(subscribe_update_entry)?;
             }
             _ => {
                 tracing::trace!("Unsupported update type received: {:?}", update_oneof);
             }
         }
+        Ok(())
     }
 
     pub fn drain_unprocess_output<Ext, O>(&mut self, out: &mut Ext)
