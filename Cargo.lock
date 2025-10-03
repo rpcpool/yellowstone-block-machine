@@ -4456,7 +4456,7 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 
 [[package]]
 name = "yellowstone-block-machine"
-version = "0.1.0-rc2"
+version = "0.1.0-rc3"
 dependencies = [
  "bs58",
  "bytesize 2.1.0",
@@ -4483,9 +4483,9 @@ dependencies = [
 
 [[package]]
 name = "yellowstone-grpc-client"
-version = "9.0.1"
+version = "9.1.0-rc1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3126fa42381d48e82426bc0fa678f3a997066894ca676419fd08d73bce07f8d1"
+checksum = "54a6112e98edc05e306a0b3f29618567712878c31cb3c502636177b6d13759a0"
 dependencies = [
  "bytes",
  "futures",
@@ -4497,12 +4497,13 @@ dependencies = [
 
 [[package]]
 name = "yellowstone-grpc-proto"
-version = "9.0.1"
+version = "10.0.0-rc1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fbb5ed0d7182fc1d6ac9770b4e31940d936b77992c081f0b6dea95e7582b2c08"
+checksum = "7ef6151b8af2e90e10fb4ac9237560d80e39ec05a721ea00a773672b6cc9e236"
 dependencies = [
  "anyhow",
  "bincode",
+ "bytes",
  "prost",
  "prost-types",
  "protobuf-src",

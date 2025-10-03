@@ -1,6 +1,6 @@
 [package]
 name = "yellowstone-block-machine"
-version = "0.1.0-rc2"
+version = "0.1.0-rc3"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -22,6 +22,7 @@ dragonsmouth = [
 ]
 dragonsmouth-thin = [
     "dep:yellowstone-grpc-proto",
+    "yellowstone-grpc-client/account-data-as-bytes",
 ]
 tonic = [
     "dep:tonic",
