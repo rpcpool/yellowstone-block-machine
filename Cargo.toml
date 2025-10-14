@@ -38,6 +38,6 @@ tokio-util = "0.7.16"
 tonic = "0.14.0"
 tracing = "0.1.0"
 tracing-subscriber = "0.3.0"
-yellowstone-grpc-client = { version = "9.1.0-rc1" }
+yellowstone-grpc-client = { version = "9.1.0-rc2" }
 yellowstone-grpc-proto = { version = "9.1.0-rc1" }
 yellowstone-block-machine = { path = "crates/yellowstone-block-machine" }
