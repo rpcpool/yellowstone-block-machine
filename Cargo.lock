@@ -749,7 +749,7 @@ dependencies = [
  "tracing-subscriber",
  "yellowstone-block-machine",
  "yellowstone-grpc-client",
- "yellowstone-grpc-proto",
+ "yellowstone-grpc-proto 9.1.0-rc1",
 ]
 
 [[package]]
@@ -4456,7 +4456,7 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 
 [[package]]
 name = "yellowstone-block-machine"
-version = "0.1.0-rc3"
+version = "0.1.0-rc4"
 dependencies = [
  "bs58",
  "bytesize 2.1.0",
@@ -4478,7 +4478,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "yellowstone-grpc-client",
- "yellowstone-grpc-proto",
+ "yellowstone-grpc-proto 9.1.0-rc1",
 ]
 
 [[package]]
@@ -4492,18 +4492,17 @@ dependencies = [
  "thiserror 1.0.69",
  "tonic",
  "tonic-health",
- "yellowstone-grpc-proto",
+ "yellowstone-grpc-proto 10.0.0-rc1",
 ]
 
 [[package]]
 name = "yellowstone-grpc-proto"
-version = "10.0.0-rc1"
+version = "9.1.0-rc1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ef6151b8af2e90e10fb4ac9237560d80e39ec05a721ea00a773672b6cc9e236"
+checksum = "43cf2a3bf918d0e235494a37adc8bc5962e17366118dd8cb533143f0b7a45cad"
 dependencies = [
  "anyhow",
  "bincode",
- "bytes",
  "prost",
  "prost-types",
  "protobuf-src",
@@ -4518,6 +4517,23 @@ dependencies = [
  "solana-transaction-context",
  "solana-transaction-error",
  "solana-transaction-status",
+ "tonic",
+ "tonic-build",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
+name = "yellowstone-grpc-proto"
+version = "10.0.0-rc1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ef6151b8af2e90e10fb4ac9237560d80e39ec05a721ea00a773672b6cc9e236"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "prost",
+ "prost-types",
+ "protobuf-src",
  "tonic",
  "tonic-build",
  "tonic-prost",
