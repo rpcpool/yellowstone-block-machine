@@ -464,9 +464,9 @@ dependencies = [
 
 [[package]]
 name = "cfg-if"
-version = "1.0.3"
+version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fd1289c04a9ea8cb22300a459a72a385d7c73d3259e2ed7dcb2af674838cfa9"
+checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
 name = "cfg_aliases"
@@ -1885,9 +1885,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-native-certs"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7fcff2dd52b58a8d98a70243663a0d234c4e2b79235637849d15913394a247d3"
+checksum = "9980d917ebb0c0536119ba501e90834767bffc3d60641457fd84a1f3fd337923"
 dependencies = [
  "openssl-probe",
  "rustls-pki-types",
@@ -4394,7 +4394,7 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 
 [[package]]
 name = "yellowstone-block-machine"
-version = "0.1.0-rc5"
+version = "0.1.0-rc6"
 dependencies = [
  "bs58",
  "bytesize 2.1.0",
@@ -4421,9 +4421,9 @@ dependencies = [
 
 [[package]]
 name = "yellowstone-grpc-client"
-version = "9.1.0-rc2"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e577acf94fd1791dff31f84973d217ecfda236c0dc0e65bf0d2fe0a7163dfe97"
+checksum = "38a9ba079420757406d603cd5f27b8c6f6e94c415c30a43b19ef4a0c4a5ff0d1"
 dependencies = [
  "bytes",
  "futures",
@@ -4435,9 +4435,9 @@ dependencies = [
 
 [[package]]
 name = "yellowstone-grpc-proto"
-version = "9.1.0-rc1"
+version = "9.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43cf2a3bf918d0e235494a37adc8bc5962e17366118dd8cb533143f0b7a45cad"
+checksum = "dbba21b6046eff1c9be2366a70d7264763b10004306e874b54409503a39e5f1e"
 dependencies = [
  "anyhow",
  "bincode",
