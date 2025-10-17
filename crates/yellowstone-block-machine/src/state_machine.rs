@@ -388,8 +388,8 @@ impl ForksMutationTracer for LongShortForksMutationTracer<'_> {
 /// Occurred when a replay event is rejected by the state machine because it relates to a slot that cannot be tracked by the state machine.
 /// 
 #[derive(Debug, thiserror::Error)]
-#[error("replay event rejected: {0:?}")]
-pub struct UntrackedSlot(BlockReplayEvent);
+#[error("replay event rejected")]
+pub struct UntrackedSlot;
 
 impl BlocksStateMachine {
     ///
@@ -496,7 +496,7 @@ impl BlocksStateMachine {
                     }
                 } else {
                     tracing::trace!("Slot {} is not in the block buffer map, skipping", slot);
-                    return Err(UntrackedSlot(BlockReplayEvent::SlotLifecycleStatus(slot_lifecycle_status)));
+                    return Err(UntrackedSlot);
                 }
             }
             SlotLifecycle::Dead => {
@@ -621,7 +621,7 @@ impl BlocksStateMachine {
         let Some(buffer) = self.block_buffer_map.get_mut(&slot) else {
             // If the block container has not been created yet, it means we never received FIRST_SHRED.
             // Therefore we cannot insert the block data.
-            return Err(UntrackedSlot(BlockReplayEvent::Entry(data)));
+            return Err(UntrackedSlot);
         };
         buffer.insert_entry(data);
         Ok(())
@@ -664,7 +664,7 @@ impl BlocksStateMachine {
         let slot = block_summary.slot;
         let Some(block) = self.block_buffer_map.remove(&slot) else {
             tracing::debug!("Block summary for slot {slot} but no block data found",);
-            return Err(UntrackedSlot(BlockReplayEvent::BlockSummary(block_summary)));
+            return Err(UntrackedSlot);
         };
 
         let frozen_block = match block.freeze(&block_summary) {

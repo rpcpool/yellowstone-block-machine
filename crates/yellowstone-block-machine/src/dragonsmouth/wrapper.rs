@@ -34,6 +34,7 @@ impl From<SubscribeUpdateEntry> for EntryInfo {
     }
 }
 
+
 impl BlocksStateMachineWrapper {
     pub fn handle_block_entry(&mut self, entry: &SubscribeUpdateEntry) -> Result<(), UntrackedSlot> {
         let entry_info: EntryInfo = entry.clone().into();
@@ -112,8 +113,29 @@ impl BlocksStateMachineWrapper {
             UpdateOneof::Entry(subscribe_update_entry) => {
                 self.handle_block_entry(subscribe_update_entry)?;
             }
+            UpdateOneof::Transaction(tx) => {
+                let slot = tx.slot;
+                if !self.sm.is_slot_tracked(slot) {
+                    return Err(UntrackedSlot);
+                }
+                // Transactions are not currently used in block reconstruction
+            }
+            UpdateOneof::Account(account) => {
+                let slot = account.slot;
+                if !self.sm.is_slot_tracked(slot) {
+                    return Err(UntrackedSlot);
+                }
+                // Accounts are not currently used in block reconstruction
+            }
+            UpdateOneof::TransactionStatus(tx) => {
+                let slot = tx.slot;
+                if !self.sm.is_slot_tracked(slot) {
+                    return Err(UntrackedSlot);
+                }
+                // Transaction statuses are not currently used in block reconstruction
+            }
             _ => {
-                tracing::trace!("Unsupported update type received: {:?}", update_oneof);
+                // Other event types are not currently used in block reconstruction
             }
         }
         Ok(())
