@@ -454,6 +454,11 @@ impl BlocksStateMachine {
         }
     }
 
+    pub fn is_slot_tracked(&self, slot: Slot) -> bool {
+        self.frozen_block_index.contains_key(&slot)
+            || self.block_buffer_map.contains_key(&slot)
+    }
+
     fn handle_slot_lifecyle_status(&mut self, slot_lifecycle_status: SlotLifecycleUpdate) -> Result<(), UntrackedSlot> {
         let slot = slot_lifecycle_status.slot;
 
