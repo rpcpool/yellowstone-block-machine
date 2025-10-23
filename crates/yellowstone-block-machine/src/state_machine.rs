@@ -102,18 +102,6 @@ pub const AVG_BLOCK_LEN: usize = 4000;
 // Avg transaction per block ~ 2000;
 pub const AVG_TPB: usize = 2000;
 
-#[derive(Debug, thiserror::Error)]
-pub enum FreezeError {
-    #[error("entry count mismatch, expected {expected}, got {got}")]
-    InvalidEntryCount { slot: Slot, expected: u64, got: u64 },
-    #[error("blockhash mismatch, expected {expected}, got {got}")]
-    InvalidBlockhash {
-        slot: Slot,
-        expected: Hash,
-        got: Hash,
-    },
-}
-
 ///
 ///
 /// State machine for buffering blockstore events based on linger and other buffering limits.
@@ -144,13 +132,13 @@ impl Block {
             .map(|entry| entry.entry_hash)
     }
 
-    fn freeze(self, summary: &BlockSummary) -> Result<FrozenBlock, FreezeError> {
+    fn freeze(self, summary: &BlockSummary) -> FrozenBlock {
         let fb = FrozenBlock {
             slot: self.slot,
             entries: self.entries.values().cloned().collect(),
             blockhash: summary.blockhash,
         };
-        Ok(fb)
+        fb
     }
 
     fn can_be_optimistic_frozen(&self) -> bool {
@@ -263,11 +251,8 @@ pub struct BlocksStateMachine {
     need_optimistic_freeze: FxHashSet<Slot>,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum DeadletterEvent {
-    #[error(transparent)]
-    FreezeError(#[from] FreezeError),
-    #[error("incomplete slot {0} -- missing data")]
     Incomplete(Slot),
 }
 
@@ -668,17 +653,7 @@ impl BlocksStateMachine {
             return Err(UntrackedSlot);
         };
 
-        let frozen_block = match block.freeze(&block_summary) {
-            Ok(frozen_block) => frozen_block,
-            Err(e) => {
-                tracing::error!(
-                    "Failed to freeze block for slot {slot}, {:?}",
-                    e.to_string(),
-                );
-                self.push_to_dlq(DeadletterEvent::FreezeError(e));
-                return Ok(());
-            }
-        };
+        let frozen_block = block.freeze(&block_summary);
         assert_eq!(slot, frozen_block.slot);
 
         if let Some(parent) = self.forks.get_parent(&slot) {
