@@ -105,11 +105,13 @@ pub const AVG_TPB: usize = 2000;
 #[derive(Debug, thiserror::Error)]
 pub enum FreezeError {
     #[error("entry count mismatch, expected {expected}, got {got}")]
-    InvalidTickCount { expected: u64, got: u64 },
-    #[error("entry count mismatch, expected {expected}, got {got}")]
-    InvalidEntryCount { expected: u64, got: u64 },
+    InvalidEntryCount { slot: Slot, expected: u64, got: u64 },
     #[error("blockhash mismatch, expected {expected}, got {got}")]
-    InvalidBlockhash { expected: Hash, got: Hash },
+    InvalidBlockhash {
+        slot: Slot,
+        expected: Hash,
+        got: Hash,
+    },
 }
 
 ///
@@ -145,6 +147,7 @@ impl Block {
     fn freeze(self, summary: &BlockSummary) -> Result<FrozenBlock, FreezeError> {
         if self.entry_cnt != summary.entry_count {
             return Err(FreezeError::InvalidEntryCount {
+                slot: self.slot,
                 expected: summary.entry_count,
                 got: self.entry_cnt,
             });
@@ -156,6 +159,7 @@ impl Block {
 
         if blockhash != summary.blockhash {
             return Err(FreezeError::InvalidBlockhash {
+                slot: self.slot,
                 expected: summary.blockhash,
                 got: blockhash,
             });
@@ -259,7 +263,6 @@ pub struct BlocksStateMachine {
 
 #[derive(Debug)]
 pub enum DeadletterEvent {
-    AlreadyFrozen(BlockReplayEvent),
     UnprocessableBlock(FreezeError),
 }
 
@@ -605,10 +608,6 @@ impl BlocksStateMachine {
 
     fn handle_block_entry_insert(&mut self, data: EntryInfo) -> Result<(), UntrackedSlot> {
         let slot = data.slot;
-        if self.frozen_block_index.contains_key(&slot) {
-            self.push_to_dlq(DeadletterEvent::AlreadyFrozen(data.into()));
-            return Ok(());
-        }
         let Some(buffer) = self.block_buffer_map.get_mut(&slot) else {
             // If the block container has not been created yet, it means we never received FIRST_SHRED.
             // Therefore we cannot insert the block data.

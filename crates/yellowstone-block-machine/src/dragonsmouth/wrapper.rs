@@ -1,6 +1,6 @@
 use {
     crate::state_machine::{
-        BlockStateMachineOutput, BlockSummary, BlocksStateMachine, EntryInfo,
+        BlockStateMachineOutput, BlockSummary, BlocksStateMachine, DeadletterEvent, EntryInfo,
         SlotCommitmentStatusUpdate, SlotLifecycle, SlotLifecycleUpdate, UntrackedSlot,
     },
     solana_commitment_config::CommitmentLevel,
@@ -102,6 +102,10 @@ impl BlocksStateMachineWrapper {
         };
         self.sm.process_replay_event(block_summary.into())
         // Currently not used in block reconstruction
+    }
+
+    pub fn pop_next_dlq(&mut self) -> Option<DeadletterEvent> {
+        self.sm.pop_next_dlq()
     }
 
     pub fn handle_new_geyser_event(
