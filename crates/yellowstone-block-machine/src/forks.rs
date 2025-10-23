@@ -452,6 +452,16 @@ impl Forks {
         }
     }
 
+    pub fn mark_slot_as_forked<T>(&mut self, slot: Slot, forks_detected: &mut T) 
+        where T: ForksMutationTracer,
+    {
+        self.parent_children_map.entry(slot).or_default();
+        if self.forked_slots.insert(slot) {
+            forks_detected.insert(slot);
+        }
+        forks_detected.extend(self.mark_children_as_forks(slot))
+    }
+
     pub fn make_slot_rooted<T>(&mut self, slot: Slot, newly_forked_slot_out: &mut T)
     where
         T: ForksMutationTracer,
@@ -1037,5 +1047,119 @@ mod forks_tests {
         assert_eq!(all_slots.len(), 16);
 
         assert_eq!(fd.oldest_rooted_slot(), Some(2));
+    }
+
+    #[test]
+    fn forking_treeroot_should_make_whole_tree_forked() {
+        // test case
+        //
+        //          14 -> 15 -> 16 -> 17 -> 18 -> 19 -> 20
+        //           ^
+        //           |
+        // 1 -> 2 -> 3 -> 4  -> 5 -> 6 -> 7 -> 8 -> 9 -> 10
+        // |
+        // v
+        // 11 -> 12 -> 13
+        //
+        // Forking 1 should mark all slots as forks
+
+        let mut fd = Forks::with_max_capacity(1);
+
+        let mut forked_detected = FxHashSet::default();
+        fd.add_slot_with_parent(2, 1, &mut forked_detected);
+        fd.add_slot_with_parent(3, 2, &mut forked_detected);
+        fd.add_slot_with_parent(4, 3, &mut forked_detected);
+        fd.add_slot_with_parent(5, 4, &mut forked_detected);
+        fd.add_slot_with_parent(6, 5, &mut forked_detected);
+        fd.add_slot_with_parent(7, 6, &mut forked_detected);
+        fd.add_slot_with_parent(8, 7, &mut forked_detected);
+        fd.add_slot_with_parent(9, 8, &mut forked_detected);
+        fd.add_slot_with_parent(10, 9, &mut forked_detected);
+
+        // 1 -> 11 -> 12 -> 13 
+        fd.add_slot_with_parent(11, 1, &mut forked_detected);
+        fd.add_slot_with_parent(12, 11, &mut forked_detected);
+        fd.add_slot_with_parent(13, 12, &mut forked_detected);
+
+        // 3 -> 14 -> 15 -> 16 -> 17 -> 18 -> 19 -> 20 
+        fd.add_slot_with_parent(14, 3, &mut forked_detected);
+        fd.add_slot_with_parent(15, 14, &mut forked_detected);
+        fd.add_slot_with_parent(16, 15, &mut forked_detected);
+        fd.add_slot_with_parent(17, 16, &mut forked_detected);
+        fd.add_slot_with_parent(18, 17, &mut forked_detected);
+        fd.add_slot_with_parent(19, 18, &mut forked_detected);
+        fd.add_slot_with_parent(20, 19, &mut forked_detected);
+
+        assert!(forked_detected.is_empty());
+
+         // Forking the tree root
+        fd.mark_slot_as_forked(1, &mut forked_detected);
+        let expected_forks_detected = FxHashSet::from_iter([
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+        ]);
+        assert_eq!(forked_detected, expected_forks_detected);
+        
+        // It should be idempotent
+        forked_detected.clear();
+        fd.mark_slot_as_forked(1, &mut forked_detected);
+        assert!(forked_detected.is_empty());
+    }
+
+
+    #[test]
+    fn test_forking_subree() {
+        // test case
+        //          
+        //          14 -> 15 -> 16 -> 17 -> 18 -> 19 -> 20
+        //           ^
+        //           |
+        // 1 -> 2 -> 3 (mark as fork) -> 4  -> 5 -> 6 -> 7 -> 8 -> 9 -> 10
+        // |
+        // v
+        // 11 -> 12 -> 13
+        //
+        // Forking 3 should mark all its descendants as forks
+        //
+
+        let mut fd = Forks::with_max_capacity(1);
+
+        let mut forked_detected = FxHashSet::default();
+        fd.add_slot_with_parent(2, 1, &mut forked_detected);
+        fd.add_slot_with_parent(3, 2, &mut forked_detected);
+        fd.add_slot_with_parent(4, 3, &mut forked_detected);
+        fd.add_slot_with_parent(5, 4, &mut forked_detected);
+        fd.add_slot_with_parent(6, 5, &mut forked_detected);
+        fd.add_slot_with_parent(7, 6, &mut forked_detected);
+        fd.add_slot_with_parent(8, 7, &mut forked_detected);
+        fd.add_slot_with_parent(9, 8, &mut forked_detected);
+        fd.add_slot_with_parent(10, 9, &mut forked_detected);
+
+        // 1 -> 11 -> 12 -> 13 
+        fd.add_slot_with_parent(11, 1, &mut forked_detected);
+        fd.add_slot_with_parent(12, 11, &mut forked_detected);
+        fd.add_slot_with_parent(13, 12, &mut forked_detected);
+
+        // 3 -> 14 -> 15 -> 16 -> 17 -> 18 -> 19 -> 20 
+        fd.add_slot_with_parent(14, 3, &mut forked_detected);
+        fd.add_slot_with_parent(15, 14, &mut forked_detected);
+        fd.add_slot_with_parent(16, 15, &mut forked_detected);
+        fd.add_slot_with_parent(17, 16, &mut forked_detected);
+        fd.add_slot_with_parent(18, 17, &mut forked_detected);
+        fd.add_slot_with_parent(19, 18, &mut forked_detected);
+        fd.add_slot_with_parent(20, 19, &mut forked_detected);
+
+        assert!(forked_detected.is_empty());
+
+         // Forking the tree root
+        fd.mark_slot_as_forked(3, &mut forked_detected);
+        let expected_forks_detected = FxHashSet::from_iter([
+            3, 4, 5, 6, 7, 8, 9, 10, 14, 15, 16, 17, 18, 19, 20,
+        ]);
+        assert_eq!(forked_detected, expected_forks_detected);
+        
+        // It should be idempotent
+        forked_detected.clear();
+        fd.mark_slot_as_forked(3, &mut forked_detected);
+        assert!(forked_detected.is_empty());
     }
 }

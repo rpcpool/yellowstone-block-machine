@@ -70,19 +70,31 @@ impl BlocksStateMachineWrapper {
             };
             self.sm.process_replay_event(lifecycle_update.into())?;
         } else {
-            let commitment_level_update = SlotCommitmentStatusUpdate {
-                parent_slot: slot_update.parent,
-                slot: slot_update.slot,
-                commitment: match slot_status {
-                    SlotStatus::SlotProcessed => CommitmentLevel::Processed,
-                    SlotStatus::SlotConfirmed => CommitmentLevel::Confirmed,
-                    SlotStatus::SlotFinalized => CommitmentLevel::Finalized,
-                    _ => unreachable!(),
-                },
-            };
 
-            self.sm
-                .process_consensus_event(commitment_level_update.into());
+            if slot_update.dead_error.is_some() {
+                // Downgrade to lifecycle update
+                let lifecycle_update = SlotLifecycleUpdate {
+                    slot: slot_update.slot,
+                    parent_slot: slot_update.parent,
+                    stage: SlotLifecycle::Dead,
+                };
+                self.sm.process_replay_event(lifecycle_update.into())?;
+            } else {
+
+                let commitment_level_update = SlotCommitmentStatusUpdate {
+                    parent_slot: slot_update.parent,
+                    slot: slot_update.slot,
+                    commitment: match slot_status {
+                        SlotStatus::SlotProcessed => CommitmentLevel::Processed,
+                        SlotStatus::SlotConfirmed => CommitmentLevel::Confirmed,
+                        SlotStatus::SlotFinalized => CommitmentLevel::Finalized,
+                        _ => unreachable!(),
+                    },
+                };
+
+                self.sm
+                    .process_consensus_event(commitment_level_update.into());
+            }
         }
         Ok(())
     }

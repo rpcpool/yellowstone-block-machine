@@ -138,41 +138,29 @@ impl Block {
         Self::new_with_clock(slot, Instant::now())
     }
 
-    fn last_entry_hash(&self) -> Option<Hash> {
-        self.entries
-            .get(&(self.entry_cnt - 1))
-            .map(|e| e.entry_hash)
-    }
+    // fn last_entry_hash(&self) -> Option<Hash> {
+    //     self.entries
+    //         .get(&(self.entry_cnt - 1))
+    //         .map(|entry| entry.entry_hash)
+
+    // }
 
     fn freeze(self, summary: &BlockSummary) -> Result<FrozenBlock, FreezeError> {
-        if self.entry_cnt != summary.entry_count {
-            return Err(FreezeError::InvalidEntryCount {
-                slot: self.slot,
-                expected: summary.entry_count,
-                got: self.entry_cnt,
-            });
-        }
-
-        let blockhash = self
-            .last_entry_hash()
-            .expect("Block must have at least one entry");
-
-        if blockhash != summary.blockhash {
-            return Err(FreezeError::InvalidBlockhash {
-                slot: self.slot,
-                expected: summary.blockhash,
-                got: blockhash,
-            });
-        }
-
         let fb = FrozenBlock {
             slot: self.slot,
             entries: self.entries.values().cloned().collect(),
-            blockhash,
+            blockhash: summary.blockhash,
         };
-
         Ok(fb)
     }
+
+    // fn optimistic_freeze(self) -> FrozenBlock {
+    //     FrozenBlock {
+    //         slot: self.slot,
+    //         entries: self.entries.values().cloned().collect(),
+    //         blockhash: self.last_entry_hash().expect("last entry hash"),
+    //     }
+    // }
 
     fn insert_entry(&mut self, block_entry: EntryInfo) {
         let entry_idx = block_entry.entry_index;
@@ -507,14 +495,14 @@ impl BlocksStateMachine {
         let slot = slot_status.slot;
 
         if let Some(parent) = slot_status.parent_slot {
-            let mut multiset = LongShortForksMutationTracer {
+            let mut multitrace = LongShortForksMutationTracer {
                 long: &mut self.forks_history,
                 short: &mut self.forks_detected_in_current_tick,
             };
             self.forks.add_slot_with_parent_with_rooted_trace(
                 slot,
                 parent,
-                &mut multiset,
+                &mut multitrace,
                 &mut self.retroactively_rooted_slots,
             );
         } else {
@@ -600,10 +588,13 @@ impl BlocksStateMachine {
     /// Mark a block as dead.
     ///
     fn mark_block_as_dead(&mut self, slot: Slot) {
+        let mut multitrace = LongShortForksMutationTracer {
+            long: &mut self.forks_history,
+            short: &mut self.forks_detected_in_current_tick,
+        };
+        self.forks.mark_slot_as_forked(slot, &mut multitrace);
         self.remove_slot_references_in_state(slot);
-        self.push_new_update(BlockStateMachineOutput::DeadSlotDetected(
-            DeadBlockDetected { slot },
-        ));
+
     }
 
     fn handle_block_entry_insert(&mut self, data: EntryInfo) -> Result<(), UntrackedSlot> {
@@ -643,7 +634,7 @@ impl BlocksStateMachine {
         }
         let forks_detected = std::mem::take(&mut self.forks_detected_in_current_tick);
         for slot in forks_detected {
-            tracing::trace!("Forks detected for slot {}", slot);
+            tracing::warn!("Forks detected for slot {}", slot);
             self.push_new_update(BlockStateMachineOutput::ForksDetected(ForkDetected {
                 slot,
             }));
