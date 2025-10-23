@@ -70,7 +70,6 @@ impl BlocksStateMachineWrapper {
             };
             self.sm.process_replay_event(lifecycle_update.into())?;
         } else {
-
             if slot_update.dead_error.is_some() {
                 // Downgrade to lifecycle update
                 let lifecycle_update = SlotLifecycleUpdate {
@@ -80,7 +79,6 @@ impl BlocksStateMachineWrapper {
                 };
                 self.sm.process_replay_event(lifecycle_update.into())?;
             } else {
-
                 let commitment_level_update = SlotCommitmentStatusUpdate {
                     parent_slot: slot_update.parent,
                     slot: slot_update.slot,

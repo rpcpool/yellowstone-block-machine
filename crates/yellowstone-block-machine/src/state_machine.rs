@@ -138,12 +138,11 @@ impl Block {
         Self::new_with_clock(slot, Instant::now())
     }
 
-    // fn last_entry_hash(&self) -> Option<Hash> {
-    //     self.entries
-    //         .get(&(self.entry_cnt - 1))
-    //         .map(|entry| entry.entry_hash)
-
-    // }
+    fn last_entry_hash(&self) -> Option<Hash> {
+        self.entries
+            .get(&(self.entry_cnt - 1))
+            .map(|entry| entry.entry_hash)
+    }
 
     fn freeze(self, summary: &BlockSummary) -> Result<FrozenBlock, FreezeError> {
         let fb = FrozenBlock {
@@ -154,13 +153,22 @@ impl Block {
         Ok(fb)
     }
 
-    // fn optimistic_freeze(self) -> FrozenBlock {
-    //     FrozenBlock {
-    //         slot: self.slot,
-    //         entries: self.entries.values().cloned().collect(),
-    //         blockhash: self.last_entry_hash().expect("last entry hash"),
-    //     }
-    // }
+    fn can_be_optimistic_frozen(&self) -> bool {
+        if self.entry_cnt == 0 {
+            return false;
+        }
+
+        (0..self.entry_cnt).all(|idx| self.entries.contains_key(&idx))
+    }
+
+    fn forge_optimistic_block_summary(&self) -> BlockSummary {
+        BlockSummary {
+            slot: self.slot,
+            entry_count: self.entry_cnt,
+            executed_transaction_count: self.entries.values().map(|e| e.executed_txn_count).sum(),
+            blockhash: self.last_entry_hash().expect("last entry hash"),
+        }
+    }
 
     fn insert_entry(&mut self, block_entry: EntryInfo) {
         let entry_idx = block_entry.entry_index;
@@ -247,11 +255,20 @@ pub struct BlocksStateMachine {
     /// Buffers slots that were retroactively rooted by a slot status update.
     ///
     retroactively_rooted_slots: FxHashSet<Slot>,
+
+    ///
+    /// Keep track of slots that need optimistic freeze because their child slot was frozen before them.
+    /// When this happen, it probably means that either agave has a bug or the geyser plugin is buggy.
+    ///
+    need_optimistic_freeze: FxHashSet<Slot>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum DeadletterEvent {
-    UnprocessableBlock(FreezeError),
+    #[error(transparent)]
+    FreezeError(#[from] FreezeError),
+    #[error("incomplete slot {0} -- missing data")]
+    Incomplete(Slot),
 }
 
 ///
@@ -394,6 +411,7 @@ impl BlocksStateMachine {
             dead_blocks_queue: Default::default(),
             retroactively_rooted_slots: Default::default(),
             forks_detected_in_current_tick: Default::default(),
+            need_optimistic_freeze: Default::default(),
         }
     }
 
@@ -521,7 +539,7 @@ impl BlocksStateMachine {
         if !self.completed_blocks.contains(&slot) && self.block_buffer_map.contains_key(&slot) {
             // If we receive a slot status before the block is completed then we should not process it.
             // This mean should never happen, but in case it does we should not panic.
-            tracing::error!(
+            tracing::warn!(
                 "Received slot status for slot {} before the block is completed",
                 slot
             );
@@ -594,7 +612,6 @@ impl BlocksStateMachine {
         };
         self.forks.mark_slot_as_forked(slot, &mut multitrace);
         self.remove_slot_references_in_state(slot);
-
     }
 
     fn handle_block_entry_insert(&mut self, data: EntryInfo) -> Result<(), UntrackedSlot> {
@@ -641,6 +658,9 @@ impl BlocksStateMachine {
         }
     }
 
+    ///
+    /// Freeze block when we receive block summary.
+    ///
     fn handle_block_summary(&mut self, block_summary: BlockSummary) -> Result<(), UntrackedSlot> {
         let slot = block_summary.slot;
         let Some(block) = self.block_buffer_map.remove(&slot) else {
@@ -655,11 +675,23 @@ impl BlocksStateMachine {
                     "Failed to freeze block for slot {slot}, {:?}",
                     e.to_string(),
                 );
-                self.push_to_dlq(DeadletterEvent::UnprocessableBlock(e));
+                self.push_to_dlq(DeadletterEvent::FreezeError(e));
                 return Ok(());
             }
         };
         assert_eq!(slot, frozen_block.slot);
+
+        if let Some(parent) = self.forks.get_parent(&slot) {
+            if self.block_buffer_map.contains_key(&parent) {
+                tracing::warn!(
+                    "Freezing block for slot {} whose parent slot {} is still in the block buffer map",
+                    slot,
+                    parent
+                );
+                // This should never happen, but in case it does we will try to optimistically freeze the parent block.
+                self.need_optimistic_freeze.insert(parent);
+            }
+        }
 
         // Block is now frozen which mean every transaction and account update is now in the block
         if !self.completed_blocks.contains(&slot) {
@@ -667,10 +699,11 @@ impl BlocksStateMachine {
             // This might be a code in either gRPC or Agave.
             // Completed block should event should be sent when all shred are received.
             // This should any Slot Status update.
-            tracing::error!("Block {} is frozen but not completed", slot);
+            tracing::warn!("Block {} is frozen but not completed", slot);
             // Artifially mark the block as completed.
             self.completed_blocks.insert(slot);
         }
+
         tracing::debug!("Block frozen for slot {}", slot);
         self.frozen_block_index.entry(slot).or_default();
         self.push_new_update(BlockStateMachineOutput::FrozenBlock(frozen_block));
@@ -731,7 +764,37 @@ impl BlocksStateMachine {
 
         self.process_retroactively_rooted_slots();
         self.flush_forks_detected_in_current_tick();
+        self.execute_optimistic_freeze_for_needed_slots();
         Ok(())
+    }
+
+    fn execute_optimistic_freeze_for_needed_slots(&mut self) {
+        if self.need_optimistic_freeze.is_empty() {
+            return;
+        }
+        let slots_to_freeze = std::mem::take(&mut self.need_optimistic_freeze);
+        for slot in slots_to_freeze {
+            // Check if we can freeze the block : we must have some entry to compute the block hash.
+            if let Some(block) = self.block_buffer_map.get(&slot) {
+                if block.can_be_optimistic_frozen() {
+                    let forged_block_summary = block.forge_optimistic_block_summary();
+                    tracing::warn!(
+                        "Recoverd block summary for slot {}: {:?}",
+                        slot,
+                        forged_block_summary
+                    );
+                    self.handle_block_summary(forged_block_summary)
+                        .expect("untracked");
+                } else {
+                    tracing::error!(
+                        "Cannot optimistically freeze slot {} because it has no entries",
+                        slot
+                    );
+                    self.remove_slot_references_in_state(slot);
+                    self.push_to_dlq(DeadletterEvent::Incomplete(slot));
+                }
+            }
+        }
     }
 
     pub fn process_consensus_event(&mut self, event: ConsensusUpdate) {
