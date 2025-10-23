@@ -3,11 +3,12 @@ use {
     derive_more::From,
     rustc_hash::{FxHashMap, FxHashSet},
     serde::{Deserialize, Serialize},
-    solana_clock::{Slot, DEFAULT_TICKS_PER_SLOT},
+    solana_clock::Slot,
     solana_commitment_config::CommitmentLevel,
     solana_hash::Hash,
     std::{
-        collections::VecDeque, time::{Duration, Instant}
+        collections::VecDeque,
+        time::{Duration, Instant},
     },
 };
 
@@ -148,18 +149,6 @@ impl Block {
                 got: self.entry_cnt,
             });
         }
-
-        if self.tick_entry_cnt != DEFAULT_TICKS_PER_SLOT {
-            return Err(FreezeError::InvalidTickCount {
-                expected: DEFAULT_TICKS_PER_SLOT,
-                got: self.tick_entry_cnt,
-            });
-        }
-
-        // Last entry must be a tick entry (entry with no transactions)
-        let entry = self.entries.get(&(self.entry_cnt - 1)).unwrap();
-
-        assert!(entry.executed_txn_count == 0);
 
         let blockhash = self
             .last_entry_hash()
@@ -386,7 +375,7 @@ impl ForksMutationTracer for LongShortForksMutationTracer<'_> {
 
 ///
 /// Occurred when a replay event is rejected by the state machine because it relates to a slot that cannot be tracked by the state machine.
-/// 
+///
 #[derive(Debug, thiserror::Error)]
 #[error("replay event rejected")]
 pub struct UntrackedSlot;
@@ -455,11 +444,13 @@ impl BlocksStateMachine {
     }
 
     pub fn is_slot_tracked(&self, slot: Slot) -> bool {
-        self.frozen_block_index.contains_key(&slot)
-            || self.block_buffer_map.contains_key(&slot)
+        self.frozen_block_index.contains_key(&slot) || self.block_buffer_map.contains_key(&slot)
     }
 
-    fn handle_slot_lifecyle_status(&mut self, slot_lifecycle_status: SlotLifecycleUpdate) -> Result<(), UntrackedSlot> {
+    fn handle_slot_lifecyle_status(
+        &mut self,
+        slot_lifecycle_status: SlotLifecycleUpdate,
+    ) -> Result<(), UntrackedSlot> {
         let slot = slot_lifecycle_status.slot;
 
         if let Some(parent) = slot_lifecycle_status.parent_slot {
@@ -675,7 +666,7 @@ impl BlocksStateMachine {
                     e.to_string(),
                 );
                 self.push_to_dlq(DeadletterEvent::UnprocessableBlock(e));
-                return Ok(())
+                return Ok(());
             }
         };
         assert_eq!(slot, frozen_block.slot);
@@ -969,8 +960,12 @@ mod tests {
         };
 
         // Whatever the order of insertion it should to notify the sealed block before slot status
-        blockstore.process_replay_event(first_shred_recv.into()).unwrap();
-        blockstore.process_replay_event(completed_block.into()).unwrap();
+        blockstore
+            .process_replay_event(first_shred_recv.into())
+            .unwrap();
+        blockstore
+            .process_replay_event(completed_block.into())
+            .unwrap();
         for e in entries {
             blockstore.process_replay_event(e.into()).unwrap();
         }
@@ -1002,7 +997,11 @@ mod tests {
         };
 
         // Send completed block without first shred received
-        assert!(blockstore.process_replay_event(completed_block.into()).is_err());
+        assert!(
+            blockstore
+                .process_replay_event(completed_block.into())
+                .is_err()
+        );
     }
 
     #[test]
@@ -1045,8 +1044,12 @@ mod tests {
         };
 
         // Whatever the order of insertion it should to notify the sealed block before slot status
-        blockstore.process_replay_event(first_shred_recv.into()).unwrap();
-        blockstore.process_replay_event(completed_block.into()).unwrap();
+        blockstore
+            .process_replay_event(first_shred_recv.into())
+            .unwrap();
+        blockstore
+            .process_replay_event(completed_block.into())
+            .unwrap();
         for e in entries {
             blockstore.process_replay_event(e.into()).unwrap();
         }
@@ -1143,12 +1146,18 @@ mod tests {
         };
 
         // Whatever the order of insertion it should to notify the sealed block before slot status
-        blockstore.process_replay_event(slot1_first_shred_recv.into()).unwrap();
-        blockstore.process_replay_event(slot1_completed_block.into()).unwrap();
+        blockstore
+            .process_replay_event(slot1_first_shred_recv.into())
+            .unwrap();
+        blockstore
+            .process_replay_event(slot1_completed_block.into())
+            .unwrap();
         for e in slot1_entries {
             blockstore.process_replay_event(e.into()).unwrap();
         }
-        blockstore.process_replay_event(slot1_summary.into()).unwrap();
+        blockstore
+            .process_replay_event(slot1_summary.into())
+            .unwrap();
         // We only insert the slot status update for Confirmed, missing Processed
         blockstore.process_consensus_event(slot1_processed.into());
 
@@ -1168,12 +1177,18 @@ mod tests {
         assert_eq!(status.commitment, CommitmentLevel::Processed);
 
         // Now we insert the second slot, which will retroactively root the first slot
-        blockstore.process_replay_event(slot2_first_shred_recv.into()).unwrap();
-        blockstore.process_replay_event(slot2_completed_block.into()).unwrap();
+        blockstore
+            .process_replay_event(slot2_first_shred_recv.into())
+            .unwrap();
+        blockstore
+            .process_replay_event(slot2_completed_block.into())
+            .unwrap();
         for e in slot2_entries {
             blockstore.process_replay_event(e.into()).unwrap();
         }
-        blockstore.process_replay_event(slot2_summary.into()).unwrap();
+        blockstore
+            .process_replay_event(slot2_summary.into())
+            .unwrap();
         blockstore.process_consensus_event(slot2_finalized.into());
 
         let actual = blockstore.pop_next_unprocess_blockstore_update().unwrap();

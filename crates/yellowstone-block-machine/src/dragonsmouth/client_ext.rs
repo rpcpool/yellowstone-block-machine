@@ -384,7 +384,7 @@ where
                                 Ok(ev) => {
                                     if self.machine.handle_new_geyser_event(&ev).is_ok() {
                                         self.insert_into_storage(ev);
-                                    }   
+                                    }
                                 },
                                 Err(e) => {
                                     tracing::error!("Geyser stream error: {}", e);

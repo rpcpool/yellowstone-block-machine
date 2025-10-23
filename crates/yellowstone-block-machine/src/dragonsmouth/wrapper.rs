@@ -6,7 +6,8 @@ use {
     solana_commitment_config::CommitmentLevel,
     solana_hash::Hash,
     yellowstone_grpc_proto::geyser::{
-        subscribe_update::UpdateOneof, SlotStatus, SubscribeUpdate, SubscribeUpdateBlockMeta, SubscribeUpdateEntry, SubscribeUpdateSlot
+        SlotStatus, SubscribeUpdate, SubscribeUpdateBlockMeta, SubscribeUpdateEntry,
+        SubscribeUpdateSlot, subscribe_update::UpdateOneof,
     },
 };
 
@@ -34,14 +35,19 @@ impl From<SubscribeUpdateEntry> for EntryInfo {
     }
 }
 
-
 impl BlocksStateMachineWrapper {
-    pub fn handle_block_entry(&mut self, entry: &SubscribeUpdateEntry) -> Result<(), UntrackedSlot> {
+    pub fn handle_block_entry(
+        &mut self,
+        entry: &SubscribeUpdateEntry,
+    ) -> Result<(), UntrackedSlot> {
         let entry_info: EntryInfo = entry.clone().into();
         self.sm.process_replay_event(entry_info.into())
     }
 
-    pub fn handle_slot_update(&mut self, slot_update: &SubscribeUpdateSlot) -> Result<(), UntrackedSlot> {
+    pub fn handle_slot_update(
+        &mut self,
+        slot_update: &SubscribeUpdateSlot,
+    ) -> Result<(), UntrackedSlot> {
         let slot_status = slot_update.status();
         const LIFE_CYCLE_STATUS: [SlotStatus; 4] = [
             SlotStatus::SlotFirstShredReceived,
@@ -75,12 +81,16 @@ impl BlocksStateMachineWrapper {
                 },
             };
 
-            self.sm.process_consensus_event(commitment_level_update.into());
+            self.sm
+                .process_consensus_event(commitment_level_update.into());
         }
         Ok(())
     }
 
-    pub fn handle_block_meta(&mut self, block_meta: &SubscribeUpdateBlockMeta) -> Result<(), UntrackedSlot> {
+    pub fn handle_block_meta(
+        &mut self,
+        block_meta: &SubscribeUpdateBlockMeta,
+    ) -> Result<(), UntrackedSlot> {
         let bh = bs58::decode(block_meta.blockhash.as_str())
             .into_vec()
             .expect("blockhash format");
@@ -94,7 +104,10 @@ impl BlocksStateMachineWrapper {
         // Currently not used in block reconstruction
     }
 
-    pub fn handle_new_geyser_event(&mut self, event: &SubscribeUpdate) -> Result<(), UntrackedSlot> {
+    pub fn handle_new_geyser_event(
+        &mut self,
+        event: &SubscribeUpdate,
+    ) -> Result<(), UntrackedSlot> {
         let SubscribeUpdate {
             filters: _,
             created_at: _,
