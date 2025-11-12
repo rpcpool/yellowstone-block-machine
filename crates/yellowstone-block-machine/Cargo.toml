@@ -1,6 +1,6 @@
 [package]
 name = "yellowstone-block-machine"
-version = "1.1.0-rc13"
+version = "0.1.0-rc13"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
