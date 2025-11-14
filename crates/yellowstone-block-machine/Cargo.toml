@@ -1,6 +1,6 @@
 [package]
 name = "yellowstone-block-machine"
-version = "0.1.0-rc13"
+version = "0.1.0-rc14"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -40,7 +40,7 @@ solana-clock = { workspace = true }
 solana-commitment-config = { workspace = true }
 solana-pubkey = { workspace = true }
 solana-signature = { workspace = true, features = ["rand"] }
-solana-hash = { workspace = true, features = ["serde"]}
+solana-hash = { workspace = true, features = ["serde", "bytemuck"]}
 thiserror = { workspace = true }
 tokio = { workspace = true, optional = true, features = ["rt-multi-thread"]}
 tokio-stream = { workspace = true, optional = true }

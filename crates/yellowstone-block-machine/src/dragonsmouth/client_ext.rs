@@ -145,6 +145,8 @@ pub enum BlockMachineOutput {
     ForkDetected(ForkDetected),
     ///
     /// A notification that a dead block has been detected.
+    /// Note: All Dead blocks are Forks, but not all Forks are Dead blocks.
+    /// Dead blocks mostly come from corrupted entries early in the replay process of a slot.
     ///
     DeadBlockDetect(DeadBlockDetected),
 }
