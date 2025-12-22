@@ -43,6 +43,7 @@ pub struct BlockstorePublisherConfig {
 pub struct BlockSummary {
     pub slot: Slot,
     pub entry_count: u64,
+    pub parent_slot: Slot,
     pub executed_transaction_count: u64,
     pub blockhash: Hash,
 }
@@ -149,9 +150,10 @@ impl Block {
         (0..self.entry_cnt).all(|idx| self.entries.contains_key(&idx))
     }
 
-    fn forge_optimistic_block_summary(&self) -> BlockSummary {
+    fn forge_optimistic_block_summary(&self, parent_slot: Slot) -> BlockSummary {
         BlockSummary {
             slot: self.slot,
+            parent_slot,
             entry_count: self.entry_cnt,
             executed_transaction_count: self.entries.values().map(|e| e.executed_txn_count).sum(),
             blockhash: self.last_entry_hash().expect("last entry hash"),
@@ -752,8 +754,10 @@ impl BlocksStateMachine {
         for slot in slots_to_freeze {
             // Check if we can freeze the block : we must have some entry to compute the block hash.
             if let Some(block) = self.block_buffer_map.get(&slot) {
-                if block.can_be_optimistic_frozen() {
-                    let forged_block_summary = block.forge_optimistic_block_summary();
+                let parent_slot = self.forks.get_parent(&slot);
+                if block.can_be_optimistic_frozen() && parent_slot.is_some() {
+                    let parent_slot = parent_slot.unwrap();
+                    let forged_block_summary = block.forge_optimistic_block_summary(parent_slot);
                     tracing::warn!(
                         "Recoverd block summary for slot {}: {:?}",
                         slot,
@@ -983,6 +987,7 @@ mod tests {
         let last_entry_hash = entries.last().unwrap().entry_hash;
         let summary = BlockSummary {
             slot: 1,
+            parent_slot: 0,
             entry_count: NUM_DATA_ENTRIES + DEFAULT_TICKS_PER_SLOT,
             executed_transaction_count: NUM_DATA_ENTRIES * 10,
             blockhash: last_entry_hash,
@@ -1067,6 +1072,7 @@ mod tests {
         let last_entry_hash = entries.last().unwrap().entry_hash;
         let summary = BlockSummary {
             slot: 1,
+            parent_slot: 0,
             entry_count: NUM_DATA_ENTRIES + DEFAULT_TICKS_PER_SLOT,
             executed_transaction_count: NUM_DATA_ENTRIES * 10,
             blockhash: last_entry_hash,
@@ -1162,6 +1168,7 @@ mod tests {
 
         let slot1_summary = BlockSummary {
             slot: 1,
+            parent_slot: 0,
             entry_count: NUM_DATA_ENTRIES + DEFAULT_TICKS_PER_SLOT,
             executed_transaction_count: NUM_DATA_ENTRIES * 10,
             blockhash: last_entry_hash1,
@@ -1169,6 +1176,7 @@ mod tests {
 
         let slot2_summary = BlockSummary {
             slot: 2,
+            parent_slot: 1,
             entry_count: NUM_DATA_ENTRIES + DEFAULT_TICKS_PER_SLOT,
             executed_transaction_count: NUM_DATA_ENTRIES * 10,
             blockhash: last_entry_hash2,

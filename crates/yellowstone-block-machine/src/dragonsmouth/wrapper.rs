@@ -110,6 +110,7 @@ impl BlocksStateMachineWrapper {
         let block_summary = BlockSummary {
             slot: block_meta.slot,
             entry_count: block_meta.entries_count,
+            parent_slot: block_meta.parent_slot,
             executed_transaction_count: block_meta.executed_transaction_count,
             blockhash: Hash::new_from_array(bh.try_into().expect("blockhash length")),
         };
