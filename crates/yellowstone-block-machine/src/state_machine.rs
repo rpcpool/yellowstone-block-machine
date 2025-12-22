@@ -94,6 +94,7 @@ pub struct Block {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
 pub struct FrozenBlock {
     pub slot: Slot,
+    pub parent_slot: Slot,
     pub entries: Vec<EntryInfo>,
     pub blockhash: Hash,
 }
@@ -138,6 +139,7 @@ impl Block {
             slot: self.slot,
             entries: self.entries.values().cloned().collect(),
             blockhash: summary.blockhash,
+            parent_slot: summary.parent_slot,
         };
         fb
     }
@@ -434,7 +436,12 @@ impl BlocksStateMachine {
     /// Pending slot update are pending because the slot is not yet in the frozen block index.
     fn flush_pending_slot_status_update(&mut self, slot: Slot) {
         if let Some(updates) = self.pending_slot_status_update.remove(&slot) {
-            for slot_status in updates {
+            for mut slot_status in updates {
+                if slot_status.parent_slot.is_none() {
+                    if let Some(parent) = self.forks.get_parent(&slot_status.slot) {
+                        slot_status.parent_slot = Some(parent);
+                    }
+                }
                 self.handle_slot_commitment_status_update(slot_status);
             }
         }

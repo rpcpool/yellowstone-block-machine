@@ -23,7 +23,7 @@ pub const RESERVED_FILTER_NAME: &str = "_block-machine";
 ///
 #[derive(Debug, Default)]
 pub struct BlocksStateMachineWrapper {
-    sm: BlocksStateMachine,
+    pub sm: BlocksStateMachine,
 }
 
 impl From<SubscribeUpdateEntry> for EntryInfo {
@@ -47,6 +47,7 @@ impl BlocksStateMachineWrapper {
         self.sm.process_replay_event(entry_info.into())
     }
 
+    #[allow(clippy::collapsible_else_if)]
     pub fn handle_slot_update(
         &mut self,
         slot_update: &SubscribeUpdateSlot,
