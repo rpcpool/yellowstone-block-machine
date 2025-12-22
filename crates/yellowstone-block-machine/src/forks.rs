@@ -202,6 +202,7 @@ where
 /// Forks is a utility to detect forks in a blockchain.
 /// Unlike the ForkBanks in Solana runtmie, this struct is more of a utility to detect forks in a blockchain incrementally.
 /// It retroactively detects forks in a blockchain.
+#[derive(Debug)]
 pub struct Forks {
     parent_children_map: FxHashMap<Slot /*parent */, BTreeSet<Slot> /*children */>,
     rooted_slots: BTreeSet<Slot>,
@@ -286,6 +287,34 @@ impl ForksMutationTracer for FxHashSet<Slot> {
 }
 
 impl ForksMutationTracer for HashSet<Slot> {
+    fn insert(&mut self, slot: Slot) {
+        self.insert(slot);
+    }
+
+    fn extend(&mut self, slots: impl IntoIterator<Item = Slot>) {
+        Extend::extend(self, slots);
+    }
+}
+
+impl ForksMutationTracer for Vec<Slot> {
+    fn insert(&mut self, slot: Slot) {
+        if self.contains(&slot) {
+            return;
+        }
+        self.push(slot);
+    }
+
+    fn extend(&mut self, slots: impl IntoIterator<Item = Slot>) {
+        for slot in slots {
+            if self.contains(&slot) {
+                continue;
+            }
+            self.push(slot);
+        }
+    }
+}
+
+impl ForksMutationTracer for BTreeSet<Slot> {
     fn insert(&mut self, slot: Slot) {
         self.insert(slot);
     }

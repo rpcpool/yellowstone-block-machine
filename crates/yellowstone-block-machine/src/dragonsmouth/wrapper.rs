@@ -1,7 +1,10 @@
 use {
-    crate::state_machine::{
-        BlockStateMachineOutput, BlockSummary, BlocksStateMachine, DeadletterEvent, EntryInfo,
-        SlotCommitmentStatusUpdate, SlotLifecycle, SlotLifecycleUpdate, UntrackedSlot,
+    crate::{
+        forks::Forks,
+        state_machine::{
+            BlockStateMachineOutput, BlockSummary, BlocksStateMachine, DeadletterEvent, EntryInfo,
+            SlotCommitmentStatusUpdate, SlotLifecycle, SlotLifecycleUpdate, UntrackedSlot,
+        },
     },
     solana_commitment_config::CommitmentLevel,
     solana_hash::Hash,
@@ -18,7 +21,7 @@ pub const RESERVED_FILTER_NAME: &str = "_block-machine";
 ///
 /// Mainly a Wrapper to translate Grpc events to State Machine events.
 ///
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct BlocksStateMachineWrapper {
     sm: BlocksStateMachine,
 }
@@ -112,6 +115,14 @@ impl BlocksStateMachineWrapper {
         };
         self.sm.process_replay_event(block_summary.into())
         // Currently not used in block reconstruction
+    }
+
+    pub fn pop_next_state_machine_output(&mut self) -> Option<BlockStateMachineOutput> {
+        self.sm.pop_next_unprocess_blockstore_update()
+    }
+
+    pub fn fork_graph(&self) -> &Forks {
+        &self.sm.forks
     }
 
     pub fn pop_next_dlq(&mut self) -> Option<DeadletterEvent> {

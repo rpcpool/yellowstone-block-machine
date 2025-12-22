@@ -185,6 +185,7 @@ type Revision = usize;
 ///
 /// Is to the developer to implement the IO part of the state machine by implementing your own "driver".
 ///
+#[derive(Debug)]
 pub struct BlocksStateMachine {
     /// Holds block under construction, not yet frozen
     block_buffer_map: FxHashMap<Slot, Block>,
@@ -218,7 +219,7 @@ pub struct BlocksStateMachine {
     blockstore_update_queue: VecDeque<(usize, BlockStateMachineOutput)>,
 
     /// Maintain forks history of the blockchain.    
-    forks: Forks,
+    pub forks: Forks,
     forks_history: FxHashSet<Slot>,
 
     ///
