@@ -68,8 +68,8 @@ impl BlockAccumulator {
 pub struct Block {
     pub slot: Slot,
     pub events: Vec<Arc<SubscribeUpdate>>,
-    account_idx_map: Vec<usize>,
-    transaction_idx_map: Vec<usize>,
+    pub account_idx_map: Vec<usize>,
+    pub transaction_idx_map: Vec<usize>,
     entry_idx_map: Vec<usize>,
 }
 
@@ -389,7 +389,6 @@ where
                                     }
                                 },
                                 Err(e) => {
-                                    tracing::error!("Geyser stream error: {}", e);
                                     let _ = self.sink.send(Err(BlockMachineError::GrpcError(e))).await;
                                     break;
                                 }

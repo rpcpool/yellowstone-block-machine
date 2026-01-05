@@ -1,14 +1,7 @@
 use {
-    clap::Parser,
-    common_macros::hash_map,
-    std::path::PathBuf,
-    tokio::sync::mpsc,
-    tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt},
-    yellowstone_block_machine::dragonsmouth::client_ext::{
-        BlockMachineError, BlockMachineOutput, GeyserGrpcExt,
-    },
-    yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcBuilder},
-    yellowstone_grpc_proto::geyser::{CommitmentLevel, SubscribeRequest},
+    clap::Parser, common_macros::hash_map, solana_signature::Signature, std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc}, tokio::sync::mpsc, tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt}, yellowstone_block_machine::dragonsmouth::client_ext::{
+        Block, BlockMachineError, BlockMachineOutput, GeyserGrpcExt
+    }, yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcBuilder}, yellowstone_grpc_proto::geyser::{CommitmentLevel, SubscribeRequest, subscribe_update::UpdateOneof}
 };
 
 pub fn init_tracing() {
@@ -24,6 +17,45 @@ pub fn init_tracing() {
         .expect("tracing init");
 }
 
+
+fn cross_check_account_txn_join(block: Block) {
+    let mut account_txn_sig_set: HashSet<Signature> = HashSet::new();
+    let mut txn_sig_index_map: HashMap<Signature, u64> = HashMap::new();
+    for event in block.events.into_iter() {
+        let ev = Arc::unwrap_or_clone(event);
+
+        let Some(update) = ev.update_oneof else {
+            continue;
+        };
+
+        match update {
+            UpdateOneof::Account(subscribe_update_account) => {
+                let Some(sig) = subscribe_update_account.account.unwrap().txn_signature else {
+                    continue;
+                };
+                let sig = Signature::try_from(sig.as_slice()).expect("signature");
+                account_txn_sig_set.insert(sig);
+            }
+            UpdateOneof::Transaction(subscribe_update_transaction) => {
+                let Some(txn) = subscribe_update_transaction.transaction else {
+                    continue;
+                }; 
+                let sig = Signature::try_from(txn.signature.as_slice()).expect("signature");
+                txn_sig_index_map.insert(sig, txn.index);
+
+            }
+            _ => {}
+        }
+    }
+
+    for sig in account_txn_sig_set {
+        if !txn_sig_index_map.contains_key(&sig) {
+            panic!("Missing txn for account update sig: {}", sig);
+        }
+    }
+}
+
+
 #[derive(Debug, clap::Parser)]
 #[clap(
     author,
@@ -33,7 +65,7 @@ pub fn init_tracing() {
 struct Args {
     #[clap(long)]
     config: PathBuf,
-    #[clap(long, default_value_t = 10)]
+    #[clap(short, long, default_value_t = 10)]
     samples: usize,
 }
 
@@ -60,7 +92,8 @@ async fn process_block<W>(
                     let account_cnt = block.account_len();
                     let txn_cnt = block.txn_len();
                     let entry_cnt = block.entry_len();
-                    writeln!(out, "Block {slot} len: {n}, {txn_cnt} tx, {account_cnt} accounts, {entry_cnt} entries").expect("write");
+                    writeln!(out, "Block ({i}) {slot} len: {n}, {txn_cnt} tx, {account_cnt} accounts, {entry_cnt} entries").expect("write");
+                    cross_check_account_txn_join(block);
                     i += 1;
                 }
                 BlockMachineOutput::SlotCommitmentUpdate(slot_commitment_status_update) => {
@@ -84,6 +117,7 @@ async fn process_block<W>(
             }
         }
         if i >= sample {
+            writeln!(out, "Sample limit reached: {sample}").expect("write");
             break;
         }
     }
@@ -115,9 +149,6 @@ async fn main() {
             "test".to_string() => Default::default(),
         },
         transactions: hash_map! {
-            "test".to_string() => Default::default(),
-        },
-        entry: hash_map! {
             "test".to_string() => Default::default(),
         },
         commitment: Some(CommitmentLevel::Confirmed as i32),
