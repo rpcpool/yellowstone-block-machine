@@ -46,8 +46,8 @@
 //! - SLOT_COMPLETED: All the shreds for the given slot have been received by the RPC node you're connected to. However, this does not necessarily mean that the slot has been fully replayed yet.
 //! - SLOT_DEAD: Dead slots are slots that have been rejected by the validator for various reasons, such as invalid transaction signatures in the leader's shreds, incorrect entry hashes during Proof of History (PoH) verification, or an unexpected number of entries in the slot. When a slot is marked as dead, it is discarded by the network as a whole and effectively skipped. This can occur at any point during the replay process, even after the slot has been marked as 'completed'.
 //!
-//! Here's a "simplfied" overview of the expected lifecycle of a slot:\
-//!                                                                                                                                             
+//! Here's a "simplfied" overview of the expected lifecycle of a slot:
+//! ```ignore                                                                                           
 //!                                                                                                                                       
 //!                                                                                                                                       
 //!                                     TIME ->                                                                                           
@@ -75,7 +75,7 @@
 //!                                                                                                                                       
 //!
 //!
-//!
+//! ```
 //! ## IMPORTANT QUIRKS
 //!
 //! - Sometimes, BANK_CREATED is received before FIRST_SHRED_RECEIVED. This is because of internal Agave logic which sends
