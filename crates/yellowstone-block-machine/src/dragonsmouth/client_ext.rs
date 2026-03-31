@@ -216,6 +216,20 @@ pub struct BlockStream<Source> {
     pending: VecDeque<BlockMachineOutput>,
 }
 
+impl<Source> BlockStream<Source> {
+
+    pub fn new(source: Source, min_commitment_level: CommitmentLevel) -> Self {
+        Self {
+            min_commitment_level,
+            source,
+            machine: BlocksStateMachineWrapper::default(),
+            storage: InMemoryBlockStore::default(),
+            pending: VecDeque::new(),
+        }
+    }
+
+}
+
 fn compare_commitment(cl1: CommitmentLevel, cl2: CommitmentLevel) -> Ordering {
     match (cl1, cl2) {
         (CommitmentLevel::Processed, CommitmentLevel::Processed) => Ordering::Equal,

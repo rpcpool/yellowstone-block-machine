@@ -99,14 +99,14 @@
 //! }
 //!
 //! async fn process_block<W>(
-//!     mut block_recv: mpsc::Receiver<Result<BlockMachineOutput, BlockMachineError>>,
+//!     mut block_recv: GeyserBlockStream, BlockMachineError>>,
 //!     sample: usize,
 //!     mut out: W,
 //! ) where
 //!     W: std::io::Write,
 //! {
 //!     let mut i = 0;
-//!     while let Some(result) = block_recv.recv().await {
+//!     while let Some(result) = block_recv.next().await {
 //!         match result {
 //!             Ok(output) => match output {
 //!                 BlockMachineOutput::Block(block) => {
