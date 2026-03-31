@@ -396,6 +396,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "common_macros",
+ "futures-util",
  "serde",
  "serde_yaml",
  "solana-signature",
@@ -2389,7 +2390,7 @@ dependencies = [
 
 [[package]]
 name = "yellowstone-block-machine"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bs58",
  "bytesize 2.3.1",
@@ -2404,9 +2405,6 @@ dependencies = [
  "solana-pubkey",
  "solana-signature",
  "thiserror",
- "tokio",
- "tokio-stream",
- "tokio-util",
  "tonic",
  "tracing",
  "tracing-subscriber",
@@ -2416,9 +2414,9 @@ dependencies = [
 
 [[package]]
 name = "yellowstone-grpc-client"
-version = "12.2.0"
+version = "13.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32b250b0ed11fb0fb11b80e89599e6f5a77640bce3dafe26ffb8022cdfc6c49e"
+checksum = "d9c3e9328306945410423b40714b0fe9bfe361e5eba1da3e0a63288228313bfb"
 dependencies = [
  "bytes",
  "futures",

@@ -6,42 +6,29 @@ use {
         },
     },
     derive_more::From,
-    futures_util::{Sink, SinkExt, Stream, StreamExt, stream::BoxStream},
+    futures_util::{Stream, TryStream, TryStreamExt},
     rustc_hash::FxHashMap,
     solana_clock::Slot,
     solana_commitment_config::CommitmentLevel,
-    std::{
-        cmp::Ordering,
-        collections::{HashMap, VecDeque},
-        sync::Arc,
-    },
-    tokio::sync::mpsc,
-    tokio_stream::wrappers::ReceiverStream,
-    tokio_util::sync::PollSender,
+    std::{cmp::Ordering, collections::VecDeque, sync::Arc},
     tonic::async_trait,
-    yellowstone_grpc_client::{GeyserGrpcClient, GeyserGrpcClientError, Interceptor},
+    yellowstone_grpc_client::{GeyserGrpcClient, GeyserGrpcClientError, GeyserStream},
     yellowstone_grpc_proto::geyser::{
-        CommitmentLevel as ProtoCommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
-        SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions, SubscribeUpdate,
-        subscribe_update::UpdateOneof,
+        CommitmentLevel as ProtoCommitmentLevel, SubscribeRequest, SubscribeRequestFilterSlots,
+        SubscribeUpdate, subscribe_update::UpdateOneof,
     },
 };
 
 pub type BlockMachineResult = Result<BlockMachineOutput, BlockMachineError>;
 
-#[async_trait]
-pub trait GeyserGrpcExt<F> {
-    fn this(&mut self) -> &mut GeyserGrpcClient<F>;
+pub type GeyserBlockStream = BlockStream<GeyserStream>;
 
+#[async_trait]
+pub trait GeyserGrpcExt {
     async fn subscribe_block(
         &mut self,
         subscribe_request: SubscribeRequest,
-    ) -> Result<mpsc::Receiver<BlockMachineResult>, GeyserGrpcClientError>;
-}
-
-pub struct SimplifiedSubscribeRequest {
-    pub accounts: HashMap<String, SubscribeRequestFilterAccounts>,
-    pub transactions: HashMap<String, SubscribeRequestFilterTransactions>,
+    ) -> Result<GeyserBlockStream, GeyserGrpcClientError>;
 }
 
 #[derive(Debug, Default)]
@@ -64,6 +51,9 @@ impl BlockAccumulator {
     }
 }
 
+///
+/// A fully reconstructed block, containing all events (accounts, transactions, entries) for a given slot.
+///
 #[derive(Debug, Clone)]
 pub struct Block {
     pub slot: Slot,
@@ -74,39 +64,39 @@ pub struct Block {
 }
 
 impl Block {
+    ///
+    /// Returns the number of transactions in this block.
+    ///
     pub fn txn_len(&self) -> usize {
         self.transaction_idx_map.len()
     }
 
+    ///
+    /// Returns the number of accounts in this block.
+    ///
     pub fn account_len(&self) -> usize {
         self.account_idx_map.len()
     }
 
+    ///
+    /// Returns the number of entries in this block.
+    ///
     pub fn entry_len(&self) -> usize {
         self.entry_idx_map.len()
     }
 
+    ///
+    /// Checks if the block has no events.
+    ///
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
 
+    ///
+    /// Returns the number of events in this block.
+    ///
     pub fn len(&self) -> usize {
         self.events.len()
-    }
-}
-
-struct BlockStream {
-    inner: ReceiverStream<Result<BlockMachineOutput, BlockMachineError>>,
-}
-
-impl Stream for BlockStream {
-    type Item = Result<BlockMachineOutput, BlockMachineError>;
-
-    fn poll_next(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        self.inner.poll_next_unpin(cx)
     }
 }
 
@@ -152,18 +142,19 @@ pub enum BlockMachineOutput {
 }
 
 #[async_trait]
-impl<F> GeyserGrpcExt<F> for GeyserGrpcClient<F>
-where
-    F: Interceptor + Send + Sync + 'static,
-{
-    fn this(&mut self) -> &mut GeyserGrpcClient<F> {
-        self
-    }
-
+impl GeyserGrpcExt for GeyserGrpcClient {
+    ///
+    /// Subscribes to the gRPC stream and returns a stream of block machine outputs.
+    /// The provided `SubscribeRequest` will be modified to ensure compatibility with the block machine's
+    /// processing logic. Specifically, it will enforce the presence of the reserved filter and set the commitment level to `Processed`.
+    ///
+    /// The block machine will internally filter and process events based on the minimum commitment level specified in the original `SubscribeRequest`.
+    ///
+    ///
     async fn subscribe_block(
         &mut self,
         mut subscribe_request: SubscribeRequest,
-    ) -> Result<mpsc::Receiver<BlockMachineResult>, GeyserGrpcClientError> {
+    ) -> Result<GeyserBlockStream, GeyserGrpcClientError> {
         let proto_commitment_level =
             ProtoCommitmentLevel::try_from(subscribe_request.commitment.unwrap_or(0))
                 .expect("Invalid commitment level in subscribe request");
@@ -200,50 +191,29 @@ where
 
         subscribe_request.commitment = Some(0); // Processed
 
-        let (_sink, source) = self
-            .this()
-            .subscribe_with_request(Some(subscribe_request))
-            .await?;
-
-        let source = source.boxed();
+        let (_sink, source) = self.subscribe_with_request(Some(subscribe_request)).await?;
 
         let machine = BlocksStateMachineWrapper::default();
 
-        let (tx, rx) = mpsc::channel(DEFAULT_SUBSCRIBE_BLOCK_CHANNEL_CAPACITY);
-
-        let driver = AsyncDragonsmouthDriver {
+        Ok(BlockStream {
             min_commitment_level: commitment_level,
             source,
-            sink: PollSender::new(tx),
             machine,
             storage: InMemoryBlockStore::default(),
-        };
-
-        tokio::spawn(async move {
-            let _ = driver.run().await;
-        });
-
-        Ok(rx)
+            pending: VecDeque::new(),
+        })
     }
 }
 
 ///
-/// The driver that connects the Geyser gRPC stream to the DragonsmouthBlockMachine.
+/// A stream that yields [`BlockMachineOutput`] items.
 ///
-/// It reads from the gRPC stream, feeds events into the state machine, and sends outputs
-/// to the provided sink.
-pub struct AsyncDragonsmouthDriver<Sink> {
+pub struct BlockStream<Source> {
     min_commitment_level: CommitmentLevel,
-    source: BoxStream<'static, Result<SubscribeUpdate, tonic::Status>>,
-    sink: Sink,
+    source: Source,
     machine: BlocksStateMachineWrapper,
     storage: InMemoryBlockStore,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum DragonsmouthDriverError<SnkErr> {
-    #[error(transparent)]
-    SinkError(SnkErr),
+    pending: VecDeque<BlockMachineOutput>,
 }
 
 fn compare_commitment(cl1: CommitmentLevel, cl2: CommitmentLevel) -> Ordering {
@@ -259,14 +229,7 @@ fn compare_commitment(cl1: CommitmentLevel, cl2: CommitmentLevel) -> Ordering {
     }
 }
 
-impl<Snk, SnkErr> AsyncDragonsmouthDriver<Snk>
-where
-    Snk: Sink<Result<BlockMachineOutput, BlockMachineError>, Error = SnkErr>
-        + Unpin
-        + Send
-        + 'static,
-    SnkErr: std::error::Error + Send,
-{
+impl<Source> BlockStream<Source> {
     fn insert_into_storage(&mut self, event: SubscribeUpdate) {
         let SubscribeUpdate {
             filters,
@@ -316,11 +279,8 @@ where
         }
     }
 
-    async fn process_state_machine_output(
-        &mut self,
-        outputs: &mut VecDeque<BlockStateMachineOutput>,
-    ) -> Result<(), SnkErr> {
-        while let Some(output) = outputs.pop_front() {
+    fn process_state_machine_output(&mut self) {
+        while let Some(output) = self.machine.pop_next_state_machine_output() {
             match output {
                 BlockStateMachineOutput::FrozenBlock(frozen_block) => {
                     let slot = frozen_block.slot;
@@ -338,76 +298,65 @@ where
                                 commitment: cl,
                             };
                             if let Some(block) = self.storage.finish_slot(slot) {
-                                self.sink
-                                    .send(Ok(BlockMachineOutput::FrozenBlock(block)))
-                                    .await?;
+                                self.pending
+                                    .push_back(BlockMachineOutput::FrozenBlock(block));
                             }
 
-                            self.sink
-                                .send(Ok(BlockMachineOutput::SlotCommitmentUpdate(
+                            self.pending
+                                .push_back(BlockMachineOutput::SlotCommitmentUpdate(
                                     commitment_level_update,
-                                )))
-                                .await?;
+                                ));
                         }
                     }
                 }
                 BlockStateMachineOutput::ForksDetected(fork_detected) => {
                     self.storage.remove_slot(fork_detected.slot);
-                    self.sink
-                        .send(Ok(BlockMachineOutput::ForkDetected(fork_detected)))
-                        .await?;
+                    self.pending
+                        .push_back(BlockMachineOutput::ForkDetected(fork_detected));
                 }
                 BlockStateMachineOutput::DeadSlotDetected(dead_block) => {
                     self.storage.remove_slot(dead_block.slot);
-                    self.sink
-                        .send(Ok(BlockMachineOutput::DeadBlockDetect(dead_block)))
-                        .await?;
+                    self.pending
+                        .push_back(BlockMachineOutput::DeadBlockDetect(dead_block));
                 }
             }
         }
-        Ok(())
     }
+}
 
-    pub async fn run(mut self) -> Result<(), DragonsmouthDriverError<SnkErr>> {
-        let mut batch = VecDeque::with_capacity(10);
+impl<Source> Stream for BlockStream<Source>
+where
+    Source: TryStream<Ok = SubscribeUpdate> + Unpin,
+{
+    type Item = Result<BlockMachineOutput, Source::Error>;
 
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
         loop {
-            if !batch.is_empty() {
-                self.process_state_machine_output(&mut batch)
-                    .await
-                    .map_err(DragonsmouthDriverError::SinkError)?;
+            if let Some(output) = self.pending.pop_front() {
+                return std::task::Poll::Ready(Some(Ok(output)));
             }
 
-            tokio::select! {
-                maybe = self.source.next() => {
-                    match maybe {
-                        Some(result) => {
-                            match result {
-                                Ok(ev) => {
-                                    if self.machine.handle_new_geyser_event(&ev).is_ok() {
-                                        self.insert_into_storage(ev);
-                                    }
-                                },
-                                Err(e) => {
-                                    let _ = self.sink.send(Err(BlockMachineError::GrpcError(e))).await;
-                                    break;
-                                }
-                            }
-                        }
-                        None => {
-                            break;
-                        }
+            match self.source.try_poll_next_unpin(cx) {
+                std::task::Poll::Ready(Some(Ok(ev))) => {
+                    if self.machine.handle_new_geyser_event(&ev).is_ok() {
+                        self.insert_into_storage(ev);
                     }
                 }
+                std::task::Poll::Ready(Some(Err(e))) => {
+                    return std::task::Poll::Ready(Some(Err(e)));
+                }
+                std::task::Poll::Ready(None) => {
+                    return std::task::Poll::Ready(None);
+                }
+                std::task::Poll::Pending => {
+                    return std::task::Poll::Pending;
+                }
             }
-            self.machine.drain_unprocess_output(&mut batch);
+            self.process_state_machine_output();
         }
-        self.machine.drain_unprocess_output(&mut batch);
-
-        self.process_state_machine_output(&mut batch)
-            .await
-            .map_err(DragonsmouthDriverError::SinkError)?;
-        Ok(())
     }
 }
 

@@ -1,7 +1,21 @@
 use {
-    clap::Parser, common_macros::hash_map, solana_signature::Signature, std::{collections::{HashMap, HashSet}, path::PathBuf, sync::Arc}, tokio::sync::mpsc, tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt}, yellowstone_block_machine::dragonsmouth::client_ext::{
-        Block, BlockMachineError, BlockMachineOutput, GeyserGrpcExt
-    }, yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcBuilder}, yellowstone_grpc_proto::geyser::{CommitmentLevel, SubscribeRequest, subscribe_update::UpdateOneof}
+    clap::Parser,
+    common_macros::hash_map,
+    futures_util::StreamExt,
+    solana_signature::Signature,
+    std::{
+        collections::{HashMap, HashSet},
+        path::PathBuf,
+        sync::Arc,
+    },
+    tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt},
+    yellowstone_block_machine::dragonsmouth::client_ext::{
+        Block, BlockMachineOutput, GeyserBlockStream, GeyserGrpcExt,
+    },
+    yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcBuilder},
+    yellowstone_grpc_proto::geyser::{
+        CommitmentLevel, SubscribeRequest, subscribe_update::UpdateOneof,
+    },
 };
 
 pub fn init_tracing() {
@@ -16,7 +30,6 @@ pub fn init_tracing() {
         .try_init()
         .expect("tracing init");
 }
-
 
 fn cross_check_account_txn_join(block: Block) {
     let mut account_txn_sig_set: HashSet<Signature> = HashSet::new();
@@ -39,10 +52,9 @@ fn cross_check_account_txn_join(block: Block) {
             UpdateOneof::Transaction(subscribe_update_transaction) => {
                 let Some(txn) = subscribe_update_transaction.transaction else {
                     continue;
-                }; 
+                };
                 let sig = Signature::try_from(txn.signature.as_slice()).expect("signature");
                 txn_sig_index_map.insert(sig, txn.index);
-
             }
             _ => {}
         }
@@ -54,7 +66,6 @@ fn cross_check_account_txn_join(block: Block) {
         }
     }
 }
-
 
 #[derive(Debug, clap::Parser)]
 #[clap(
@@ -75,15 +86,12 @@ struct Config {
     x_token: Option<String>,
 }
 
-async fn process_block<W>(
-    mut block_recv: mpsc::Receiver<Result<BlockMachineOutput, BlockMachineError>>,
-    sample: usize,
-    mut out: W,
-) where
+async fn process_block<W>(mut block_stream: GeyserBlockStream, sample: usize, mut out: W)
+where
     W: std::io::Write,
 {
     let mut i = 0;
-    while let Some(result) = block_recv.recv().await {
+    while let Some(result) = block_stream.next().await {
         match result {
             Ok(output) => match output {
                 BlockMachineOutput::FrozenBlock(block) => {

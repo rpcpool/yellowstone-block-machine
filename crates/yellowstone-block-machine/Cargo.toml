@@ -1,6 +1,6 @@
 [package]
 name = "yellowstone-block-machine"
-version = "0.4.0"
+version = "0.5.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -15,9 +15,6 @@ publish = true
 dragonsmouth = [
     "dragonsmouth-thin",
     "dep:yellowstone-grpc-client",
-    "dep:tokio",
-    "dep:tokio-stream",
-    "dep:tokio-util",
     "tonic",
 ]
 dragonsmouth-thin = [
@@ -41,9 +38,6 @@ solana-pubkey = { workspace = true }
 solana-signature = { workspace = true, features = ["rand"] }
 solana-hash = { workspace = true, features = ["serde", "bytemuck", "atomic"]}
 thiserror = { workspace = true }
-tokio = { workspace = true, optional = true, features = ["rt-multi-thread"]}
-tokio-stream = { workspace = true, optional = true }
-tokio-util = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true, features = ["tls-ring", "tls-native-roots"]}
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
