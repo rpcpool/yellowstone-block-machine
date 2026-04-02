@@ -180,15 +180,4 @@ impl BlocksStateMachineWrapper {
         }
         Ok(())
     }
-
-    #[deprecated(since = "0.5.0", note = "Use `pop_next_state_machine_output` instead")]
-    pub fn drain_unprocess_output<Ext, O>(&mut self, out: &mut Ext)
-    where
-        O: From<BlockStateMachineOutput>,
-        Ext: Extend<O>,
-    {
-        while let Some(ev) = self.sm.pop_next_unprocess_blockstore_update() {
-            out.extend([ev.into()]);
-        }
-    }
 }

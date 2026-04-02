@@ -2390,7 +2390,7 @@ dependencies = [
 
 [[package]]
 name = "yellowstone-block-machine"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
  "bs58",
  "bytesize 2.3.1",

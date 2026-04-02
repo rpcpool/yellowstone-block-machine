@@ -9,8 +9,9 @@ use {
         sync::Arc,
     },
     tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt},
-    yellowstone_block_machine::dragonsmouth::client_ext::{
-        Block, BlockMachineOutput, GeyserBlockStream, GeyserGrpcExt,
+    yellowstone_block_machine::dragonsmouth::{
+        client_ext::{GeyserBlockStream, GeyserGrpcExt},
+        stream::{Block, BlockMachineOutput},
     },
     yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcBuilder},
     yellowstone_grpc_proto::geyser::{
