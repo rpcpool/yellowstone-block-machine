@@ -2,7 +2,7 @@ use {
     crate::{
         dragonsmouth::wrapper::{BlocksStateMachineWrapper, RESERVED_FILTER_NAME},
         state_machine::{
-            BlockStateMachineOutput, DeadBlockDetected, ForkDetected, SlotCommitmentStatusUpdate,
+            BlockStateMachineOutput, DeadBlockDetected, DeadletterEvent, ForkDetected, SlotCommitmentStatusUpdate
         },
     },
     derive_more::From,
@@ -20,7 +20,7 @@ use {
 #[derive(Debug, Clone)]
 pub struct Block {
     pub slot: Slot,
-    pub events: Vec<Arc<SubscribeUpdate>>,
+    pub events: Vec<Box<SubscribeUpdate>>,
     pub account_idx_map: Vec<usize>,
     pub transaction_idx_map: Vec<usize>,
     entry_idx_map: Vec<usize>,
@@ -222,6 +222,15 @@ impl<Source> BlockStream<Source> {
                 }
             }
         }
+
+        // Drain DLQ — clean up slots the state machine gave up on
+        while let Some(dlq_event) = self.machine.pop_next_dlq() {
+            match dlq_event {
+                DeadletterEvent::Incomplete(slot) => {
+                    self.storage.remove_slot(slot);
+                }
+            }
+        }
     }
 }
 
@@ -263,7 +272,7 @@ where
 
 #[derive(Debug, Default)]
 struct BlockAccumulator {
-    events: Vec<Arc<SubscribeUpdate>>,
+    events: Vec<Box<SubscribeUpdate>>,
     account_idx_map: Vec<usize>,
     transaction_idx_map: Vec<usize>,
     entry_idx_map: Vec<usize>,
@@ -309,7 +318,7 @@ impl InMemoryBlockStore {
                 unreachable!("unsupported update type for block data insertion");
             }
         }
-        block.events.push(Arc::new(update));
+        block.events.push(Box::new(update));
     }
 
     fn mark_block_as_frozen(&mut self, slot: Slot) {

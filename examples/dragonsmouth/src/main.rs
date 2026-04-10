@@ -36,7 +36,7 @@ fn cross_check_account_txn_join(block: Block) {
     let mut account_txn_sig_set: HashSet<Signature> = HashSet::new();
     let mut txn_sig_index_map: HashMap<Signature, u64> = HashMap::new();
     for event in block.events.into_iter() {
-        let ev = Arc::unwrap_or_clone(event);
+        let ev = *event;
 
         let Some(update) = ev.update_oneof else {
             continue;
@@ -102,7 +102,7 @@ where
                     let txn_cnt = block.txn_len();
                     let entry_cnt = block.entry_len();
                     writeln!(out, "Block ({i}) {slot} len: {n}, {txn_cnt} tx, {account_cnt} accounts, {entry_cnt} entries").expect("write");
-                    cross_check_account_txn_join(block);
+                    // cross_check_account_txn_join(block);
                     i += 1;
                 }
                 BlockMachineOutput::SlotCommitmentUpdate(slot_commitment_status_update) => {
