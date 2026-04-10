@@ -110,7 +110,7 @@ impl<Source> BlockStream<Source> {
         Self {
             min_commitment_level,
             source,
-            machine: BlocksStateMachineWrapper::default(),
+            machine: BlocksStateMachineWrapper::new_with_slot_gc_tracing(),
             storage: InMemoryBlockStore::default(),
             pending: VecDeque::new(),
         }
@@ -180,11 +180,27 @@ impl<Source> BlockStream<Source> {
         }
     }
 
+    fn on_new_frozen_block(&mut self) {
+        // Drain DLQ — clean up slots the state machine gave up on
+        while let Some(dlq_event) = self.machine.pop_next_dlq() {
+            match dlq_event {
+                DeadletterEvent::Incomplete(slot) => {
+                    self.storage.remove_slot(slot);
+                }
+            }
+        }
+
+        while let Some(slot) = self.machine.pop_slot_gc_trace() {
+            self.storage.remove_slot(slot);
+        }
+    }
+
     fn process_state_machine_output(&mut self) {
         while let Some(output) = self.machine.pop_next_state_machine_output() {
             match output {
                 BlockStateMachineOutput::FrozenBlock(frozen_block) => {
                     let slot = frozen_block.slot;
+                    self.on_new_frozen_block();
                     self.storage.mark_block_as_frozen(slot);
                 }
                 BlockStateMachineOutput::SlotStatus(slot_status) => {
@@ -219,15 +235,6 @@ impl<Source> BlockStream<Source> {
                     self.storage.remove_slot(dead_block.slot);
                     self.pending
                         .push_back(BlockMachineOutput::DeadBlockDetect(dead_block));
-                }
-            }
-        }
-
-        // Drain DLQ — clean up slots the state machine gave up on
-        while let Some(dlq_event) = self.machine.pop_next_dlq() {
-            match dlq_event {
-                DeadletterEvent::Incomplete(slot) => {
-                    self.storage.remove_slot(slot);
                 }
             }
         }
