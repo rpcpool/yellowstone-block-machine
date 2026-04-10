@@ -308,6 +308,7 @@ pub struct BlockstoreGCStats {
     pub slot_blocked_count: usize,
 }
 
+#[derive(Debug, Default, Clone)]
 pub struct BlockstoreStats {
     pub block_buffer_len: usize,
     pub forks_map_len: usize,
@@ -832,7 +833,7 @@ impl BlocksStateMachine {
     /// metadata about slot that are finalized -- Since they are finalized we don't need to keep them around anymore.
     /// Forked Slot -- Slot that are forked and we know we will never reach finalized status for them.
     ///
-    pub fn gc(&mut self) -> BlockstoreGCStats {
+    pub fn gc(&mut self, mut deleted: Option<&mut Vec<Slot>>) -> BlockstoreGCStats {
         self.process_deregister_finalized_block_queue();
         let mut stats = BlockstoreGCStats::default();
         let mut elligible_for_deletion = Vec::with_capacity(self.forks_history.len());
@@ -875,6 +876,9 @@ impl BlocksStateMachine {
         for slot in elligible_for_deletion {
             self.forks_history.remove(&slot);
             self.remove_slot_references_in_state(slot);
+            if let Some(trace) = deleted.as_mut() {
+                trace.push(slot);
+            }
         }
         stats
     }
@@ -1048,9 +1052,11 @@ mod tests {
     #[test]
     pub fn blockstore_gc_should_work_even_when_empty() {
         let mut blockstore = super::BlocksStateMachine::default();
-        let actual = blockstore.gc();
+        let mut gc_trace = Vec::new();
+        let actual = blockstore.gc(Some(&mut gc_trace));
         assert_eq!(actual.slot_purge_count, 0);
         assert_eq!(actual.slot_blocked_count, 0);
+        assert!(gc_trace.is_empty());
     }
 
     #[test]

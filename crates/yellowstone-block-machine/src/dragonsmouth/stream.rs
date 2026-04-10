@@ -2,7 +2,8 @@ use {
     crate::{
         dragonsmouth::wrapper::{BlocksStateMachineWrapper, RESERVED_FILTER_NAME},
         state_machine::{
-            BlockStateMachineOutput, DeadBlockDetected, ForkDetected, SlotCommitmentStatusUpdate,
+            BlockStateMachineOutput, BlockstoreStats, DeadBlockDetected, DeadletterEvent,
+            ForkDetected, SlotCommitmentStatusUpdate,
         },
     },
     derive_more::From,
@@ -10,7 +11,7 @@ use {
     rustc_hash::FxHashMap,
     solana_clock::Slot,
     solana_commitment_config::CommitmentLevel,
-    std::{cmp::Ordering, collections::VecDeque, sync::Arc},
+    std::{cmp::Ordering, collections::VecDeque},
     yellowstone_grpc_proto::geyser::{SubscribeUpdate, subscribe_update::UpdateOneof},
 };
 
@@ -20,7 +21,7 @@ use {
 #[derive(Debug, Clone)]
 pub struct Block {
     pub slot: Slot,
-    pub events: Vec<Arc<SubscribeUpdate>>,
+    pub events: Vec<SubscribeUpdate>,
     pub account_idx_map: Vec<usize>,
     pub transaction_idx_map: Vec<usize>,
     entry_idx_map: Vec<usize>,
@@ -110,7 +111,7 @@ impl<Source> BlockStream<Source> {
         Self {
             min_commitment_level,
             source,
-            machine: BlocksStateMachineWrapper::default(),
+            machine: BlocksStateMachineWrapper::new_with_slot_gc_tracing(),
             storage: InMemoryBlockStore::default(),
             pending: VecDeque::new(),
         }
@@ -131,6 +132,10 @@ fn compare_commitment(cl1: CommitmentLevel, cl2: CommitmentLevel) -> Ordering {
 }
 
 impl<Source> BlockStream<Source> {
+    pub fn state_machine_stats(&self) -> BlockstoreStats {
+        self.machine.sm.stats()
+    }
+
     fn insert_into_storage(&mut self, event: SubscribeUpdate) {
         let SubscribeUpdate {
             filters,
@@ -180,11 +185,27 @@ impl<Source> BlockStream<Source> {
         }
     }
 
+    fn on_new_frozen_block(&mut self) {
+        // Drain DLQ — clean up slots the state machine gave up on
+        while let Some(dlq_event) = self.machine.pop_next_dlq() {
+            match dlq_event {
+                DeadletterEvent::Incomplete(slot) => {
+                    self.storage.remove_slot(slot);
+                }
+            }
+        }
+
+        while let Some(slot) = self.machine.pop_slot_gc_trace() {
+            self.storage.remove_slot(slot);
+        }
+    }
+
     fn process_state_machine_output(&mut self) {
         while let Some(output) = self.machine.pop_next_state_machine_output() {
             match output {
                 BlockStateMachineOutput::FrozenBlock(frozen_block) => {
                     let slot = frozen_block.slot;
+                    self.on_new_frozen_block();
                     self.storage.mark_block_as_frozen(slot);
                 }
                 BlockStateMachineOutput::SlotStatus(slot_status) => {
@@ -263,7 +284,7 @@ where
 
 #[derive(Debug, Default)]
 struct BlockAccumulator {
-    events: Vec<Arc<SubscribeUpdate>>,
+    events: Vec<SubscribeUpdate>,
     account_idx_map: Vec<usize>,
     transaction_idx_map: Vec<usize>,
     entry_idx_map: Vec<usize>,
@@ -309,7 +330,7 @@ impl InMemoryBlockStore {
                 unreachable!("unsupported update type for block data insertion");
             }
         }
-        block.events.push(Arc::new(update));
+        block.events.push(update);
     }
 
     fn mark_block_as_frozen(&mut self, slot: Slot) {
