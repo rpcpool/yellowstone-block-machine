@@ -10,9 +10,18 @@ use {
     rustc_hash::FxHashMap,
     solana_clock::Slot,
     solana_commitment_config::CommitmentLevel,
-    std::{cmp::Ordering, collections::VecDeque, sync::Arc},
+    std::{
+        cmp::Ordering,
+        collections::VecDeque,
+        sync::Arc,
+        time::{Duration, Instant},
+    },
     yellowstone_grpc_proto::geyser::{SubscribeUpdate, subscribe_update::UpdateOneof},
 };
+
+/// Maximum time a slot can remain in `active_block_map` before being evicted.
+/// Normal slots freeze in under a second; anything beyond this is dead weight.
+const STALE_SLOT_TIMEOUT: Duration = Duration::from_secs(60);
 
 ///
 /// A fully reconstructed block, containing all events (accounts, transactions, entries) for a given slot.
@@ -231,9 +240,18 @@ impl<Source> BlockStream<Source> {
                 }
             }
         }
+
+        // GC stale slots from state machine
+        self.machine.sm.gc();
+
+        // Purge active slots that are either untracked by the state machine or stale
+        self.storage.active_block_map.retain(|slot, acc| {
+            self.machine.sm.is_slot_tracked(*slot) && acc.created_at.elapsed() < STALE_SLOT_TIMEOUT
+        });
     }
 }
 
+/// Diagnostic accessors for monitoring block stream health.
 impl<Source> BlockStream<Source> {
     pub fn active_block_count(&self) -> usize {
         self.storage.active_block_map.len()
@@ -284,12 +302,25 @@ where
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct BlockAccumulator {
     events: Vec<Arc<SubscribeUpdate>>,
     account_idx_map: Vec<usize>,
     transaction_idx_map: Vec<usize>,
     entry_idx_map: Vec<usize>,
+    created_at: Instant,
+}
+
+impl Default for BlockAccumulator {
+    fn default() -> Self {
+        Self {
+            events: Vec::new(),
+            account_idx_map: Vec::new(),
+            transaction_idx_map: Vec::new(),
+            entry_idx_map: Vec::new(),
+            created_at: Instant::now(),
+        }
+    }
 }
 
 impl BlockAccumulator {
@@ -364,6 +395,7 @@ mod tests {
             io,
             pin::Pin,
             task::{Context, Poll},
+            time::{Duration, Instant},
         },
         yellowstone_grpc_proto::geyser::{
             SlotStatus, SubscribeUpdate, SubscribeUpdateAccount, SubscribeUpdateBlockMeta,
@@ -551,25 +583,104 @@ mod tests {
     #[test]
     fn active_block_map_does_not_grow_unbounded() {
         let mut bs = empty_source_stream(CommitmentLevel::Confirmed);
-
         for slot in 10..500 {
-            feed(&mut bs, slot_update(slot, Some(slot - 1), SlotStatus::SlotFirstShredReceived));
-            feed(&mut bs, slot_update(slot, Some(slot - 1), SlotStatus::SlotCompleted));
+            feed(
+                &mut bs,
+                slot_update(slot, Some(slot - 1), SlotStatus::SlotFirstShredReceived),
+            );
+            feed(
+                &mut bs,
+                slot_update(slot, Some(slot - 1), SlotStatus::SlotCompleted),
+            );
             feed(&mut bs, entry_update(slot, 0));
             feed(&mut bs, tx_update(slot));
             feed(&mut bs, account_update(slot));
             feed(&mut bs, block_meta_update(slot, slot - 1, 1));
-            feed(&mut bs, slot_update(slot, Some(slot - 1), SlotStatus::SlotProcessed));
-            feed(&mut bs, slot_update(slot, Some(slot - 1), SlotStatus::SlotConfirmed));
+            feed(
+                &mut bs,
+                slot_update(slot, Some(slot - 1), SlotStatus::SlotProcessed),
+            );
+            feed(
+                &mut bs,
+                slot_update(slot, Some(slot - 1), SlotStatus::SlotConfirmed),
+            );
+            while bs.pending.pop_front().is_some() {}
+        }
+        assert_eq!(
+            bs.storage.active_block_map.len(),
+            0,
+            "active blocks should be empty"
+        );
+        assert_eq!(
+            bs.storage.frozen_block_map.len(),
+            0,
+            "frozen blocks should be empty"
+        );
+    }
 
-            // drain pending so blocks get dropped
+    #[test]
+    fn incomplete_slots_cleaned_from_active_block_map() {
+        let mut bs = empty_source_stream(CommitmentLevel::Confirmed);
+
+        // Feed 10 complete slots
+        for slot in 10..20 {
+            feed(
+                &mut bs,
+                slot_update(slot, Some(slot - 1), SlotStatus::SlotFirstShredReceived),
+            );
+            feed(
+                &mut bs,
+                slot_update(slot, Some(slot - 1), SlotStatus::SlotCompleted),
+            );
+            feed(&mut bs, entry_update(slot, 0));
+            feed(&mut bs, tx_update(slot));
+            feed(&mut bs, account_update(slot));
+            feed(&mut bs, block_meta_update(slot, slot - 1, 1));
+            feed(
+                &mut bs,
+                slot_update(slot, Some(slot - 1), SlotStatus::SlotProcessed),
+            );
+            feed(
+                &mut bs,
+                slot_update(slot, Some(slot - 1), SlotStatus::SlotConfirmed),
+            );
             while bs.pending.pop_front().is_some() {}
         }
 
-        assert_eq!(bs.storage.active_block_map.len(), 0, "active blocks should be empty");
-        assert_eq!(bs.storage.frozen_block_map.len(), 0, "frozen blocks should be empty");
-        
-        let stats = bs.machine.sm.stats();
-        println!("state machine: buffer={} forks={}", stats.block_buffer_len, stats.forks_map_len);
+        // Feed an incomplete slot — events but no BlockMeta
+        feed(
+            &mut bs,
+            slot_update(20, Some(19), SlotStatus::SlotFirstShredReceived),
+        );
+        feed(
+            &mut bs,
+            slot_update(20, Some(19), SlotStatus::SlotCompleted),
+        );
+        feed(&mut bs, entry_update(20, 0));
+        feed(&mut bs, tx_update(20));
+        feed(&mut bs, account_update(20));
+        while bs.pending.pop_front().is_some() {}
+
+        // Incomplete slot should be in active_block_map
+        assert_eq!(
+            bs.storage.active_block_map.len(),
+            1,
+            "incomplete slot should be in active map"
+        );
+        assert!(bs.storage.active_block_map.contains_key(&20));
+
+        // Simulate stale timeout by backdating the created_at
+        bs.storage.active_block_map.get_mut(&20).unwrap().created_at =
+            Instant::now() - Duration::from_secs(120);
+
+        // Run cleanup
+        bs.process_state_machine_output();
+
+        // Stale slot should be evicted
+        assert_eq!(
+            bs.storage.active_block_map.len(),
+            0,
+            "stale incomplete slot should be evicted"
+        );
     }
 }
