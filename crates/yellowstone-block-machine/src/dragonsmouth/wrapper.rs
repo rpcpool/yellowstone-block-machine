@@ -182,7 +182,7 @@ impl BlocksStateMachineWrapper {
         let Some(update_oneof) = update_oneof else {
             return Ok(());
         };
-        let result = match update_oneof {
+        match update_oneof {
             UpdateOneof::Slot(subscribe_update_slot) => {
                 self.handle_slot_update(subscribe_update_slot)
             }
@@ -220,8 +220,6 @@ impl BlocksStateMachineWrapper {
                 // Other event types are not currently used in block reconstruction
                 Ok(())
             }
-        };
-
-        result
+        }
     }
 }

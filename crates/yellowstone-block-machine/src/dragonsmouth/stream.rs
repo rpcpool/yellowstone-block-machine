@@ -2,7 +2,7 @@ use {
     crate::{
         dragonsmouth::wrapper::{BlocksStateMachineWrapper, RESERVED_FILTER_NAME},
         state_machine::{
-            BlockStateMachineOutput, DeadBlockDetected, DeadletterEvent, ForkDetected, SlotCommitmentStatusUpdate
+            BlockStateMachineOutput, BlockstoreStats, DeadBlockDetected, DeadletterEvent, ForkDetected, SlotCommitmentStatusUpdate
         },
     },
     derive_more::From,
@@ -131,6 +131,11 @@ fn compare_commitment(cl1: CommitmentLevel, cl2: CommitmentLevel) -> Ordering {
 }
 
 impl<Source> BlockStream<Source> {
+
+    pub fn state_machine_stats(&self) -> BlockstoreStats {
+        self.machine.sm.stats()
+    }
+
     fn insert_into_storage(&mut self, event: SubscribeUpdate) {
         let SubscribeUpdate {
             filters,
