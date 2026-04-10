@@ -2,7 +2,8 @@ use {
     crate::{
         dragonsmouth::wrapper::{BlocksStateMachineWrapper, RESERVED_FILTER_NAME},
         state_machine::{
-            BlockStateMachineOutput, BlockstoreStats, DeadBlockDetected, DeadletterEvent, ForkDetected, SlotCommitmentStatusUpdate
+            BlockStateMachineOutput, BlockstoreStats, DeadBlockDetected, DeadletterEvent,
+            ForkDetected, SlotCommitmentStatusUpdate,
         },
     },
     derive_more::From,
@@ -10,7 +11,7 @@ use {
     rustc_hash::FxHashMap,
     solana_clock::Slot,
     solana_commitment_config::CommitmentLevel,
-    std::{cmp::Ordering, collections::VecDeque, sync::Arc},
+    std::{cmp::Ordering, collections::VecDeque},
     yellowstone_grpc_proto::geyser::{SubscribeUpdate, subscribe_update::UpdateOneof},
 };
 
@@ -20,7 +21,7 @@ use {
 #[derive(Debug, Clone)]
 pub struct Block {
     pub slot: Slot,
-    pub events: Vec<Box<SubscribeUpdate>>,
+    pub events: Vec<SubscribeUpdate>,
     pub account_idx_map: Vec<usize>,
     pub transaction_idx_map: Vec<usize>,
     entry_idx_map: Vec<usize>,
@@ -131,7 +132,6 @@ fn compare_commitment(cl1: CommitmentLevel, cl2: CommitmentLevel) -> Ordering {
 }
 
 impl<Source> BlockStream<Source> {
-
     pub fn state_machine_stats(&self) -> BlockstoreStats {
         self.machine.sm.stats()
     }
@@ -284,7 +284,7 @@ where
 
 #[derive(Debug, Default)]
 struct BlockAccumulator {
-    events: Vec<Box<SubscribeUpdate>>,
+    events: Vec<SubscribeUpdate>,
     account_idx_map: Vec<usize>,
     transaction_idx_map: Vec<usize>,
     entry_idx_map: Vec<usize>,
@@ -330,7 +330,7 @@ impl InMemoryBlockStore {
                 unreachable!("unsupported update type for block data insertion");
             }
         }
-        block.events.push(Box::new(update));
+        block.events.push(update);
     }
 
     fn mark_block_as_frozen(&mut self, slot: Slot) {

@@ -5,10 +5,14 @@ use {
             BlockStateMachineOutput, BlockSummary, BlocksStateMachine, DeadletterEvent, EntryInfo,
             SlotCommitmentStatusUpdate, SlotLifecycle, SlotLifecycleUpdate, UntrackedSlot,
         },
-    }, solana_clock::Slot, solana_commitment_config::CommitmentLevel, solana_hash::Hash, yellowstone_grpc_proto::geyser::{
+    },
+    solana_clock::Slot,
+    solana_commitment_config::CommitmentLevel,
+    solana_hash::Hash,
+    yellowstone_grpc_proto::geyser::{
         SlotStatus, SubscribeUpdate, SubscribeUpdateBlockMeta, SubscribeUpdateEntry,
         SubscribeUpdateSlot, subscribe_update::UpdateOneof,
-    }
+    },
 };
 
 pub const RESERVED_FILTER_NAME: &str = "_block-machine";
@@ -39,7 +43,6 @@ impl From<SubscribeUpdateEntry> for EntryInfo {
 }
 
 impl BlocksStateMachineWrapper {
-
     pub fn new() -> Self {
         Self {
             sm: BlocksStateMachine::default(),
@@ -58,7 +61,7 @@ impl BlocksStateMachineWrapper {
 
     ///
     /// Pops the next slot that has been garbage collected by the state machine, if slot GC tracing is enabled.
-    /// 
+    ///
     #[inline]
     pub fn pop_slot_gc_trace(&mut self) -> Option<Slot> {
         let tracer = self.slot_gc_tracer.as_mut()?;

@@ -6,7 +6,6 @@ use {
     std::{
         collections::{HashMap, HashSet},
         path::PathBuf,
-        sync::Arc,
     },
     tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt},
     yellowstone_block_machine::dragonsmouth::{
@@ -32,12 +31,11 @@ pub fn init_tracing() {
         .expect("tracing init");
 }
 
+#[allow(dead_code)]
 fn cross_check_account_txn_join(block: Block) {
     let mut account_txn_sig_set: HashSet<Signature> = HashSet::new();
     let mut txn_sig_index_map: HashMap<Signature, u64> = HashMap::new();
-    for event in block.events.into_iter() {
-        let ev = *event;
-
+    for ev in block.events.into_iter() {
         let Some(update) = ev.update_oneof else {
             continue;
         };
