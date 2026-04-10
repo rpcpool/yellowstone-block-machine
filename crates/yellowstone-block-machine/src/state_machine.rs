@@ -308,6 +308,7 @@ pub struct BlockstoreGCStats {
     pub slot_blocked_count: usize,
 }
 
+#[derive(Debug, Default, Clone)]
 pub struct BlockstoreStats {
     pub block_buffer_len: usize,
     pub forks_map_len: usize,
