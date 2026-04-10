@@ -222,6 +222,29 @@ impl<Source> BlockStream<Source> {
                 }
             }
         }
+
+        // Drain DLQ — clean up slots the state machine gave up on
+        while let Some(dlq_event) = self.machine.pop_next_dlq() {
+            match dlq_event {
+                crate::state_machine::DeadletterEvent::Incomplete(slot) => {
+                    self.storage.remove_slot(slot);
+                }
+            }
+        }
+    }
+}
+
+impl<Source> BlockStream<Source> {
+    pub fn active_block_count(&self) -> usize {
+        self.storage.active_block_map.len()
+    }
+
+    pub fn frozen_block_count(&self) -> usize {
+        self.storage.frozen_block_map.len()
+    }
+
+    pub fn state_machine_stats(&self) -> crate::state_machine::BlockstoreStats {
+        self.machine.sm.stats()
     }
 }
 
@@ -523,5 +546,30 @@ mod tests {
         let mut bs = BlockStream::new(source, CommitmentLevel::Processed);
         let second = Pin::new(&mut bs).poll_next(&mut cx);
         assert!(matches!(second, Poll::Ready(None)));
+    }
+
+    #[test]
+    fn active_block_map_does_not_grow_unbounded() {
+        let mut bs = empty_source_stream(CommitmentLevel::Confirmed);
+
+        for slot in 10..500 {
+            feed(&mut bs, slot_update(slot, Some(slot - 1), SlotStatus::SlotFirstShredReceived));
+            feed(&mut bs, slot_update(slot, Some(slot - 1), SlotStatus::SlotCompleted));
+            feed(&mut bs, entry_update(slot, 0));
+            feed(&mut bs, tx_update(slot));
+            feed(&mut bs, account_update(slot));
+            feed(&mut bs, block_meta_update(slot, slot - 1, 1));
+            feed(&mut bs, slot_update(slot, Some(slot - 1), SlotStatus::SlotProcessed));
+            feed(&mut bs, slot_update(slot, Some(slot - 1), SlotStatus::SlotConfirmed));
+
+            // drain pending so blocks get dropped
+            while bs.pending.pop_front().is_some() {}
+        }
+
+        assert_eq!(bs.storage.active_block_map.len(), 0, "active blocks should be empty");
+        assert_eq!(bs.storage.frozen_block_map.len(), 0, "frozen blocks should be empty");
+        
+        let stats = bs.machine.sm.stats();
+        println!("state machine: buffer={} forks={}", stats.block_buffer_len, stats.forks_map_len);
     }
 }
