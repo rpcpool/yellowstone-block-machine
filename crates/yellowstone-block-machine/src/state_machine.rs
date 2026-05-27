@@ -282,6 +282,10 @@ pub enum BlockStateMachineOutput {
     SlotStatus(SlotCommitmentStatusUpdate),
     ForksDetected(ForkDetected),
     DeadSlotDetected(DeadBlockDetected),
+    BankCreated(Slot),
+    /// Given that Anza did not expose any information about the duplicate-unconfirmed-slot scenario, we have to assume that it can happen and
+    /// the only way to detect it is via a second BankCreated event for the same slot number.
+    BankReset(Slot),
 }
 
 impl BlockStateMachineOutput {
@@ -291,6 +295,8 @@ impl BlockStateMachineOutput {
             Self::FrozenBlock(blk) => blk.slot,
             Self::SlotStatus(update) => update.slot,
             Self::ForksDetected(info) => info.slot,
+            Self::BankCreated(slot) => *slot,
+            Self::BankReset(slot) => *slot,
         }
     }
 }
@@ -484,7 +490,20 @@ impl BlocksStateMachine {
             SlotLifecycle::CreatedBank => {
                 tracing::trace!("Bank created for slot {}", slot);
                 // In case of duplicate unconfirmed slot (replay of old slot), we may receive multiple "CreatedBank" event for the same slot.
-                self.block_buffer_map.insert(slot, Block::new(slot));
+                if self
+                    .block_buffer_map
+                    .insert(slot, Block::new(slot))
+                    .is_none()
+                {
+                    // New bank created
+                    if self.frozen_block_index.contains_key(&slot) {
+                        self.push_new_update(BlockStateMachineOutput::BankReset(slot));
+                    } else {
+                        self.push_new_update(BlockStateMachineOutput::BankCreated(slot));
+                    }
+                } else {
+                    self.push_new_update(BlockStateMachineOutput::BankReset(slot));
+                }
                 if let Some(pending) = self.pending_slot_status_update.get_mut(&slot) {
                     pending
                         .retain(|slot_status| slot_status.commitment != CommitmentLevel::Processed);
@@ -1302,6 +1321,12 @@ mod tests {
         let actual = blockstore.pop_next_unprocess_blockstore_update();
         assert!(matches!(
             actual,
+            Some(super::BlockStateMachineOutput::BankCreated(_))
+        ));
+
+        let actual = blockstore.pop_next_unprocess_blockstore_update();
+        assert!(matches!(
+            actual,
             Some(super::BlockStateMachineOutput::FrozenBlock(_))
         ));
         let actual = blockstore.pop_next_unprocess_blockstore_update();
@@ -1323,6 +1348,12 @@ mod tests {
             .process_replay_event(summary.clone().into())
             .unwrap();
         blockstore.process_consensus_event(slot_status_update.clone().into());
+
+        let actual = blockstore.pop_next_unprocess_blockstore_update();
+        assert!(matches!(
+            actual,
+            Some(super::BlockStateMachineOutput::BankReset(_))
+        ));
 
         let actual = blockstore.pop_next_unprocess_blockstore_update();
         assert!(matches!(
