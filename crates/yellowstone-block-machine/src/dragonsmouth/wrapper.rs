@@ -164,7 +164,7 @@ impl BlocksStateMachineWrapper {
         Some(output)
     }
 
-    pub fn fork_graph(&self) -> &Forks {
+    pub fn fork_graph(&self) -> &Forks<Slot> {
         &self.sm.forks
     }
 
