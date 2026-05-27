@@ -194,8 +194,6 @@ pub struct BlocksStateMachine {
     /// Holds block under construction, not yet frozen
     block_buffer_map: FxHashMap<Slot, Block>,
 
-    completed_blocks: FxHashSet<Slot>,
-
     /// Holds blocks that are frozen
     frozen_block_index: FxHashMap<Slot, FxHashSet<CommitmentLevel>>,
 
@@ -223,7 +221,7 @@ pub struct BlocksStateMachine {
     blockstore_update_queue: VecDeque<(usize, BlockStateMachineOutput)>,
 
     /// Maintain forks history of the blockchain.    
-    pub forks: Forks,
+    pub forks: Forks<Slot>,
     forks_history: FxHashSet<Slot>,
 
     ///
@@ -363,7 +361,7 @@ pub struct LongShortForksMutationTracer<'a> {
     short: &'a mut FxHashSet<Slot>,
 }
 
-impl ForksMutationTracer for LongShortForksMutationTracer<'_> {
+impl ForksMutationTracer<Slot> for LongShortForksMutationTracer<'_> {
     fn insert(&mut self, slot: Slot) {
         // We only insert into short if slot not already present in long.
         if self.long.insert(slot) {
@@ -386,7 +384,6 @@ impl BlocksStateMachine {
     pub fn new() -> Self {
         Self {
             block_buffer_map: Default::default(),
-            completed_blocks: Default::default(),
             frozen_block_index: Default::default(),
             pending_slot_status_update: Default::default(),
             blockstore_update_queue: VecDeque::with_capacity(1000),
@@ -472,7 +469,7 @@ impl BlocksStateMachine {
         }
 
         match slot_lifecycle_status.stage {
-            SlotLifecycle::FirstShredReceived | SlotLifecycle::CreatedBank => {
+            SlotLifecycle::FirstShredReceived => {
                 tracing::trace!("First shred received for slot {}", slot);
                 match self.block_buffer_map.entry(slot) {
                     std::collections::hash_map::Entry::Vacant(vacant_entry) => {
@@ -484,13 +481,20 @@ impl BlocksStateMachine {
                     }
                 }
             }
+            SlotLifecycle::CreatedBank => {
+                tracing::trace!("Bank created for slot {}", slot);
+                // In case of duplicate unconfirmed slot (replay of old slot), we may receive multiple "CreatedBank" event for the same slot.
+                self.block_buffer_map.insert(slot, Block::new(slot));
+                if let Some(pending) = self.pending_slot_status_update.get_mut(&slot) {
+                    pending
+                        .retain(|slot_status| slot_status.commitment != CommitmentLevel::Processed);
+                }
+                if let Some(visited_commitment) = self.frozen_block_index.get_mut(&slot) {
+                    visited_commitment.remove(&CommitmentLevel::Processed);
+                }
+            }
             SlotLifecycle::Completed => {
-                if self.block_buffer_map.contains_key(&slot) {
-                    if !self.completed_blocks.insert(slot) {
-                        // This should never happen, but in case it does we should not panic.
-                        tracing::warn!("Slot {} is already completed", slot);
-                    }
-                } else {
+                if !self.block_buffer_map.contains_key(&slot) {
                     tracing::trace!("Slot {} is not in the block buffer map, skipping", slot);
                     return Err(UntrackedSlot);
                 }
@@ -530,15 +534,6 @@ impl BlocksStateMachine {
             && !self.block_buffer_map.contains_key(&slot)
         {
             return;
-        }
-
-        if !self.completed_blocks.contains(&slot) && self.block_buffer_map.contains_key(&slot) {
-            // If we receive a slot status before the block is completed then we should not process it.
-            // This mean should never happen, but in case it does we should not panic.
-            tracing::warn!(
-                "Received slot status for slot {} before the block is completed",
-                slot
-            );
         }
 
         match self.frozen_block_index.get_mut(&slot_status.slot) {
@@ -679,17 +674,6 @@ impl BlocksStateMachine {
             }
         }
 
-        // Block is now frozen which mean every transaction and account update is now in the block
-        if !self.completed_blocks.contains(&slot) {
-            // This happened one time in 24 hours of testing.
-            // This might be a code in either gRPC or Agave.
-            // Completed block should event should be sent when all shred are received.
-            // This should any Slot Status update.
-            tracing::warn!("Block {} is frozen but not completed", slot);
-            // Artifially mark the block as completed.
-            self.completed_blocks.insert(slot);
-        }
-
         tracing::debug!("Block frozen for slot {}", slot);
         self.frozen_block_index.entry(slot).or_default();
         self.push_new_update(BlockStateMachineOutput::FrozenBlock(frozen_block));
@@ -803,7 +787,6 @@ impl BlocksStateMachine {
         self.frozen_block_index.remove(&slot);
         self.pending_slot_status_update.remove(&slot);
         self.slot_max_version_referenced.remove(&slot);
-        self.completed_blocks.remove(&slot);
         self.slot_age.remove(&slot);
     }
 
@@ -1264,5 +1247,95 @@ mod tests {
             assert_eq!(status.slot, 1);
             assert_eq!(status.commitment, expected_cl);
         }
+    }
+
+    #[test]
+    pub fn it_should_handle_rolledback_slot() {
+        // During an duplicate unconfirmed slot, we may process a slot, then restart all over again from bank_created.
+        // the state machine should be able to handle this case and not panic, and correctly process the new slot lifecycle update.
+        let mut blockstore = super::BlocksStateMachine::default();
+
+        let bank_created = SlotLifecycleUpdate {
+            slot: 1,
+            parent_slot: None,
+            stage: SlotLifecycle::CreatedBank,
+        };
+
+        let completed_block = SlotLifecycleUpdate {
+            slot: 1,
+            parent_slot: None,
+            stage: SlotLifecycle::Completed,
+        };
+
+        let slot_status_update = SlotCommitmentStatusUpdate {
+            slot: 1,
+            parent_slot: None,
+            commitment: CommitmentLevel::Processed,
+        };
+
+        const NUM_DATA_ENTRIES: u64 = 64;
+        let entries = generate_entries(1, NUM_DATA_ENTRIES, 10);
+        let last_entry_hash = entries.last().unwrap().entry_hash;
+        let summary = BlockSummary {
+            slot: 1,
+            parent_slot: 0,
+            entry_count: NUM_DATA_ENTRIES + DEFAULT_TICKS_PER_SLOT,
+            executed_transaction_count: NUM_DATA_ENTRIES * 10,
+            blockhash: last_entry_hash,
+        };
+
+        // Whatever the order of insertion it should to notify the sealed block before slot status
+        blockstore
+            .process_replay_event(bank_created.into())
+            .unwrap();
+        blockstore
+            .process_replay_event(completed_block.into())
+            .unwrap();
+        for e in &entries {
+            blockstore.process_replay_event(e.clone().into()).unwrap();
+        }
+        blockstore
+            .process_replay_event(summary.clone().into())
+            .unwrap();
+        blockstore.process_consensus_event(slot_status_update.clone().into());
+
+        let actual = blockstore.pop_next_unprocess_blockstore_update();
+        assert!(matches!(
+            actual,
+            Some(super::BlockStateMachineOutput::FrozenBlock(_))
+        ));
+        let actual = blockstore.pop_next_unprocess_blockstore_update();
+        assert!(matches!(
+            actual,
+            Some(super::BlockStateMachineOutput::SlotStatus(_))
+        ));
+        let actual = blockstore.pop_next_unprocess_blockstore_update();
+        assert!(actual.is_none());
+
+        // Now we receive a new bank created for the same slot, which mean the previous slot lifecycle is rolled back.
+        blockstore
+            .process_replay_event(bank_created.into())
+            .unwrap();
+        for e in &entries {
+            blockstore.process_replay_event(e.clone().into()).unwrap();
+        }
+        blockstore
+            .process_replay_event(summary.clone().into())
+            .unwrap();
+        blockstore.process_consensus_event(slot_status_update.clone().into());
+
+        let actual = blockstore.pop_next_unprocess_blockstore_update();
+        assert!(matches!(
+            actual,
+            Some(super::BlockStateMachineOutput::FrozenBlock(_))
+        ));
+        let actual = blockstore.pop_next_unprocess_blockstore_update();
+        assert!(actual.is_some());
+        assert!(matches!(
+            actual,
+            Some(super::BlockStateMachineOutput::SlotStatus(_))
+        ));
+        let actual = blockstore.pop_next_unprocess_blockstore_update();
+        assert!(actual.is_none());
     }
 }

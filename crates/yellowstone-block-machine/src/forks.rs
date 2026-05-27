@@ -1,6 +1,5 @@
 use {
     rustc_hash::{FxHashMap, FxHashSet},
-    solana_clock::Slot,
     std::{
         collections::{BTreeSet, HashSet, VecDeque},
         hash::Hash,
@@ -203,17 +202,23 @@ where
 /// Unlike the ForkBanks in Solana runtmie, this struct is more of a utility to detect forks in a blockchain incrementally.
 /// It retroactively detects forks in a blockchain.
 #[derive(Debug)]
-pub struct Forks {
-    parent_children_map: FxHashMap<Slot /*parent */, BTreeSet<Slot> /*children */>,
-    rooted_slots: BTreeSet<Slot>,
+pub struct Forks<T>
+where
+    T: Ord,
+{
+    parent_children_map: FxHashMap<T /*parent */, BTreeSet<T> /*children */>,
+    rooted_slots: BTreeSet<T>,
     // Map from child to parent
-    reverse_parent_children_map: FxHashMap<Slot /*child */, Slot /* parent */>,
-    forked_slots: FxHashSet<Slot>,
+    reverse_parent_children_map: FxHashMap<T /*child */, T /* parent */>,
+    forked_slots: FxHashSet<T>,
     // Maximum number of rooted slots to keep track of.
     max_rooted_depth_capacity: usize,
 }
 
-impl Default for Forks {
+impl<T> Default for Forks<T>
+where
+    T: Clone + Eq + Hash + Ord,
+{
     fn default() -> Self {
         Self::with_max_capacity(1000)
     }
@@ -226,15 +231,21 @@ pub enum ForksCapacityStatus {
     AboveCapacity,
 }
 
-pub struct ForksIterator<'forks> {
-    forks: &'forks Forks,
-    to_visit: FxHashSet<Slot>,
-    visited: FxHashSet<Slot>,
-    queue: VecDeque<Slot>,
+pub struct ForksIterator<'forks, T>
+where
+    T: Ord,
+{
+    forks: &'forks Forks<T>,
+    to_visit: FxHashSet<T>,
+    visited: FxHashSet<T>,
+    queue: VecDeque<T>,
 }
 
-impl Iterator for ForksIterator<'_> {
-    type Item = Slot;
+impl<T> Iterator for ForksIterator<'_, T>
+where
+    T: Clone + Eq + Hash + Ord,
+{
+    type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
         while !self.to_visit.is_empty() {
@@ -242,11 +253,11 @@ impl Iterator for ForksIterator<'_> {
                 if self.visited.contains(&slot) {
                     continue;
                 }
-                self.visited.insert(slot);
+                self.visited.insert(slot.clone());
                 self.to_visit.remove(&slot);
 
                 if let Some(children) = self.forks.parent_children_map.get(&slot) {
-                    for child in children.iter().copied() {
+                    for child in children.iter().cloned() {
                         if !self.visited.contains(&child) {
                             self.queue.push_back(child);
                         }
@@ -255,7 +266,7 @@ impl Iterator for ForksIterator<'_> {
                 return Some(slot);
             }
 
-            if let Some(slot) = self.to_visit.iter().copied().next() {
+            if let Some(slot) = self.to_visit.iter().next().cloned() {
                 self.queue.push_back(slot);
             }
         }
@@ -266,45 +277,54 @@ impl Iterator for ForksIterator<'_> {
 ///
 /// Trait for tracing forks update during mutations of the Forks structure.
 ///
-pub trait ForksMutationTracer {
-    fn insert(&mut self, slot: Slot);
+pub trait ForksMutationTracer<T> {
+    fn insert(&mut self, slot: T);
 
-    fn extend(&mut self, slots: impl IntoIterator<Item = Slot>) {
+    fn extend(&mut self, slots: impl IntoIterator<Item = T>) {
         for slot in slots {
             self.insert(slot);
         }
     }
 }
 
-impl ForksMutationTracer for FxHashSet<Slot> {
-    fn insert(&mut self, slot: Slot) {
+impl<T> ForksMutationTracer<T> for FxHashSet<T>
+where
+    T: Eq + Hash,
+{
+    fn insert(&mut self, slot: T) {
         self.insert(slot);
     }
 
-    fn extend(&mut self, slots: impl IntoIterator<Item = Slot>) {
+    fn extend(&mut self, slots: impl IntoIterator<Item = T>) {
         Extend::extend(self, slots);
     }
 }
 
-impl ForksMutationTracer for HashSet<Slot> {
-    fn insert(&mut self, slot: Slot) {
+impl<T> ForksMutationTracer<T> for HashSet<T>
+where
+    T: Eq + Hash,
+{
+    fn insert(&mut self, slot: T) {
         self.insert(slot);
     }
 
-    fn extend(&mut self, slots: impl IntoIterator<Item = Slot>) {
+    fn extend(&mut self, slots: impl IntoIterator<Item = T>) {
         Extend::extend(self, slots);
     }
 }
 
-impl ForksMutationTracer for Vec<Slot> {
-    fn insert(&mut self, slot: Slot) {
+impl<T> ForksMutationTracer<T> for Vec<T>
+where
+    T: PartialEq,
+{
+    fn insert(&mut self, slot: T) {
         if self.contains(&slot) {
             return;
         }
         self.push(slot);
     }
 
-    fn extend(&mut self, slots: impl IntoIterator<Item = Slot>) {
+    fn extend(&mut self, slots: impl IntoIterator<Item = T>) {
         for slot in slots {
             if self.contains(&slot) {
                 continue;
@@ -314,12 +334,15 @@ impl ForksMutationTracer for Vec<Slot> {
     }
 }
 
-impl ForksMutationTracer for BTreeSet<Slot> {
-    fn insert(&mut self, slot: Slot) {
+impl<T> ForksMutationTracer<T> for BTreeSet<T>
+where
+    T: Ord,
+{
+    fn insert(&mut self, slot: T) {
         self.insert(slot);
     }
 
-    fn extend(&mut self, slots: impl IntoIterator<Item = Slot>) {
+    fn extend(&mut self, slots: impl IntoIterator<Item = T>) {
         Extend::extend(self, slots);
     }
 }
@@ -329,13 +352,16 @@ impl ForksMutationTracer for BTreeSet<Slot> {
 ///
 pub struct NoTrace;
 
-impl ForksMutationTracer for NoTrace {
-    fn insert(&mut self, _slot: Slot) {
+impl<T> ForksMutationTracer<T> for NoTrace {
+    fn insert(&mut self, _slot: T) {
         // Do nothing
     }
 }
 
-impl Forks {
+impl<T> Forks<T>
+where
+    T: Clone + Eq + Hash + Ord,
+{
     pub fn with_max_capacity(capacity: usize) -> Self {
         assert!(capacity > 0);
         Self {
@@ -347,8 +373,8 @@ impl Forks {
         }
     }
 
-    pub fn oldest_rooted_slot(&self) -> Option<Slot> {
-        self.rooted_slots.first().copied()
+    pub fn oldest_rooted_slot(&self) -> Option<T> {
+        self.rooted_slots.first().cloned()
     }
 
     pub fn capacity_status(&self) -> ForksCapacityStatus {
@@ -361,7 +387,7 @@ impl Forks {
 
     ///
     /// Remove the old rooted slot and all forks derived from it.
-    fn pop_oldest_rooted_slot(&mut self, forks_removed: &mut FxHashSet<Slot>) {
+    fn pop_oldest_rooted_slot(&mut self, forks_removed: &mut FxHashSet<T>) {
         if let Some(root) = self.rooted_slots.pop_first() {
             let child = self.parent_children_map.remove(&root).unwrap_or_default();
             let mut queue = VecDeque::from_iter(child);
@@ -371,7 +397,7 @@ impl Forks {
                 if !self.forked_slots.contains(&slot) {
                     continue;
                 }
-                forks_removed.insert(slot);
+                forks_removed.insert(slot.clone());
                 self.reverse_parent_children_map.remove(&slot);
                 self.forked_slots.remove(&slot);
 
@@ -380,27 +406,27 @@ impl Forks {
                 }
             }
 
-            if let Some(new_root) = self.rooted_slots.first().copied() {
+            if let Some(new_root) = self.rooted_slots.first().cloned() {
                 self.reverse_parent_children_map.remove(&new_root);
             }
         }
     }
 
-    pub fn truncate_excess_rooted_slots(&mut self, forks_removed: &mut FxHashSet<Slot>) {
+    pub fn truncate_excess_rooted_slots(&mut self, forks_removed: &mut FxHashSet<T>) {
         while self.capacity_status() == ForksCapacityStatus::AboveCapacity {
             self.pop_oldest_rooted_slot(forks_removed);
         }
     }
 
-    fn get_all_nodes(&self) -> FxHashSet<Slot> {
-        self.parent_children_map.keys().copied().collect()
+    fn get_all_nodes(&self) -> FxHashSet<T> {
+        self.parent_children_map.keys().cloned().collect()
     }
 
-    pub fn get_parent(&self, slot: &Slot) -> Option<Slot> {
-        self.reverse_parent_children_map.get(slot).copied()
+    pub fn get_parent(&self, slot: &T) -> Option<T> {
+        self.reverse_parent_children_map.get(slot).cloned()
     }
 
-    pub fn visit_slots(&self) -> ForksIterator {
+    pub fn visit_slots(&self) -> ForksIterator<'_, T> {
         ForksIterator {
             forks: self,
             to_visit: self.get_all_nodes(),
@@ -409,23 +435,23 @@ impl Forks {
         }
     }
     #[allow(clippy::collapsible_else_if)]
-    fn mark_children_as_forks(&mut self, slot: Slot) -> FxHashSet<Slot> {
+    fn mark_children_as_forks(&mut self, slot: T) -> FxHashSet<T> {
         let mut queue = VecDeque::from([slot]);
         let mut newly_forked_slots = FxHashSet::default();
         let mut visited = FxHashSet::default();
         while !queue.is_empty() {
             let slot2 = queue.pop_front().unwrap();
-            if !visited.insert(slot2) {
+            if !visited.insert(slot2.clone()) {
                 continue;
             }
 
             if let Some(children) = self.parent_children_map.get(&slot2) {
-                for child in children.iter().copied() {
+                for child in children.iter().cloned() {
                     if self.rooted_slots.contains(&child) {
                         continue;
                     } else {
-                        if self.forked_slots.insert(child) {
-                            queue.push_back(child);
+                        if self.forked_slots.insert(child.clone()) {
+                            queue.push_back(child.clone());
                             newly_forked_slots.insert(child);
                         }
                     }
@@ -435,66 +461,66 @@ impl Forks {
         newly_forked_slots
     }
 
-    pub fn is_rooted_slot(&self, slot: &Slot) -> bool {
+    pub fn is_rooted_slot(&self, slot: &T) -> bool {
         self.rooted_slots.contains(slot)
     }
 
     pub fn make_slot_rooted_with_rooted_trace<T1, T2>(
         &mut self,
-        slot: Slot,
+        slot: T,
         newly_forked_slot_out: &mut T1,
         indirectly_rooted_slots: &mut T2,
     ) where
-        T1: ForksMutationTracer,
-        T2: ForksMutationTracer,
+        T1: ForksMutationTracer<T>,
+        T2: ForksMutationTracer<T>,
     {
         if self.rooted_slots.contains(&slot) {
             return;
         }
-        self.rooted_slots.insert(slot);
+        self.rooted_slots.insert(slot.clone());
 
         // The rest of the function retroactively detect forks of slot's sibblings, cousins and great* cousins.
         let mut queue = VecDeque::new();
         if let Some(parent) = self.reverse_parent_children_map.get(&slot) {
-            queue.push_back(*parent);
+            queue.push_back(parent.clone());
         }
         while !queue.is_empty() {
             let slot2 = queue.pop_front().expect("empty");
             // this line will only work the first iteration in the case
             // we mark a slot i "rooted" and its parent is not rooted yet.
-            if self.rooted_slots.insert(slot2) {
-                indirectly_rooted_slots.insert(slot2);
+            if self.rooted_slots.insert(slot2.clone()) {
+                indirectly_rooted_slots.insert(slot2.clone());
             }
 
-            newly_forked_slot_out.extend(self.mark_children_as_forks(slot2));
+            newly_forked_slot_out.extend(self.mark_children_as_forks(slot2.clone()));
 
             if let Some(parent2) = self.reverse_parent_children_map.get(&slot2) {
                 // If the parent is already rooted, we don't need to mark its children as forks.
                 // because this process must have been done in the past.
-                if !self.rooted_slots.insert(*parent2) {
+                if !self.rooted_slots.insert(parent2.clone()) {
                     continue;
                 } else {
-                    indirectly_rooted_slots.insert(*parent2);
+                    indirectly_rooted_slots.insert(parent2.clone());
                 }
-                queue.push_back(*parent2);
+                queue.push_back(parent2.clone());
             }
         }
     }
 
-    pub fn mark_slot_as_forked<T>(&mut self, slot: Slot, forks_detected: &mut T)
+    pub fn mark_slot_as_forked<TTracer>(&mut self, slot: T, forks_detected: &mut TTracer)
     where
-        T: ForksMutationTracer,
+        TTracer: ForksMutationTracer<T>,
     {
-        self.parent_children_map.entry(slot).or_default();
-        if self.forked_slots.insert(slot) {
-            forks_detected.insert(slot);
+        self.parent_children_map.entry(slot.clone()).or_default();
+        if self.forked_slots.insert(slot.clone()) {
+            forks_detected.insert(slot.clone());
         }
         forks_detected.extend(self.mark_children_as_forks(slot))
     }
 
-    pub fn make_slot_rooted<T>(&mut self, slot: Slot, newly_forked_slot_out: &mut T)
+    pub fn make_slot_rooted<TTracer>(&mut self, slot: T, newly_forked_slot_out: &mut TTracer)
     where
-        T: ForksMutationTracer,
+        TTracer: ForksMutationTracer<T>,
     {
         self.make_slot_rooted_with_rooted_trace(slot, newly_forked_slot_out, &mut NoTrace);
     }
@@ -502,18 +528,18 @@ impl Forks {
     #[allow(clippy::collapsible_if)]
     pub fn add_slot_with_parent_with_rooted_trace<T1, T2>(
         &mut self,
-        slot: Slot,
-        parent: Slot,
+        slot: T,
+        parent: T,
         newly_forked_slot_out: &mut T1,
         indireclty_rooted: &mut T2,
     ) -> bool
     where
-        T1: ForksMutationTracer,
-        T2: ForksMutationTracer,
+        T1: ForksMutationTracer<T>,
+        T2: ForksMutationTracer<T>,
     {
         if self
             .parent_children_map
-            .entry(parent)
+            .entry(parent.clone())
             .or_default()
             .contains(&slot)
         {
@@ -526,7 +552,7 @@ impl Forks {
             parent_is_rooted = true;
             // If the parent is rooted, we must make sure that none of its children is rooted before inserting.
             // Otherwise slot is a fork
-            let sibblings = self.parent_children_map.entry(parent).or_default();
+            let sibblings = self.parent_children_map.entry(parent.clone()).or_default();
             for sibbling in sibblings.iter() {
                 if sibbling == &slot {
                     break;
@@ -534,25 +560,26 @@ impl Forks {
                 if self.rooted_slots.contains(sibbling) {
                     // Parent is rooted so is one of its children.
                     // This mean that `slot` is a fork
-                    if self.forked_slots.insert(slot) {
-                        newly_forked_slot_out.insert(slot);
+                    if self.forked_slots.insert(slot.clone()) {
+                        newly_forked_slot_out.insert(slot.clone());
                     }
                 }
             }
         }
 
         self.parent_children_map
-            .entry(parent)
+            .entry(parent.clone())
             .or_default()
-            .insert(slot);
-        self.parent_children_map.entry(slot).or_default();
-        self.reverse_parent_children_map.insert(slot, parent);
+            .insert(slot.clone());
+        self.parent_children_map.entry(slot.clone()).or_default();
+        self.reverse_parent_children_map
+            .insert(slot.clone(), parent.clone());
 
         let is_rooted = self.is_rooted_slot(&slot);
 
         match (is_rooted, parent_is_rooted) {
             (true, false) => {
-                indireclty_rooted.insert(parent);
+                indireclty_rooted.insert(parent.clone());
                 self.make_slot_rooted_with_rooted_trace(
                     parent,
                     newly_forked_slot_out,
@@ -561,7 +588,7 @@ impl Forks {
             }
             (false, false) => {
                 if self.forked_slots.contains(&parent) {
-                    if self.forked_slots.insert(slot) {
+                    if self.forked_slots.insert(slot.clone()) {
                         newly_forked_slot_out.insert(slot);
                     }
                 }
@@ -571,14 +598,14 @@ impl Forks {
         true
     }
 
-    pub fn add_slot_with_parent<T>(
+    pub fn add_slot_with_parent<TTracer>(
         &mut self,
-        slot: Slot,
-        parent: Slot,
-        newly_forked_slot_out: &mut T,
+        slot: T,
+        parent: T,
+        newly_forked_slot_out: &mut TTracer,
     ) -> bool
     where
-        T: ForksMutationTracer,
+        TTracer: ForksMutationTracer<T>,
     {
         self.add_slot_with_parent_with_rooted_trace(
             slot,
