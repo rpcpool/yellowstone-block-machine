@@ -241,6 +241,10 @@ impl<Source> BlockStream<Source> {
                     self.pending
                         .push_back(BlockMachineOutput::DeadBlockDetect(dead_block));
                 }
+                BlockStateMachineOutput::BankCreated(_) => {}
+                BlockStateMachineOutput::BankReset(slot) => {
+                    self.storage.remove_slot(slot);
+                }
             }
         }
     }
