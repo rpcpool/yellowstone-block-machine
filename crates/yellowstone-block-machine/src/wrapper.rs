@@ -1,5 +1,6 @@
 use {
     crate::{
+        event::{BlockMetaEvInfo, EntryEvInfo, GeyserEventInfo, SlotStatusKind, SlotUpdateEvInfo},
         forks::Forks,
         state_machine::{
             BlockStateMachineOutput, BlockSummary, BlocksStateMachine, DeadletterEvent, EntryInfo,
@@ -9,13 +10,8 @@ use {
     solana_clock::Slot,
     solana_commitment_config::CommitmentLevel,
     solana_hash::Hash,
-    yellowstone_grpc_proto::geyser::{
-        SlotStatus, SubscribeUpdate, SubscribeUpdateBlockMeta, SubscribeUpdateEntry,
-        SubscribeUpdateSlot, subscribe_update::UpdateOneof,
-    },
 };
 
-pub const RESERVED_FILTER_NAME: &str = "_block-machine";
 const STATE_MACHINE_GC_EVERY_COMPLETED_SLOTS: usize = 10;
 
 ///
@@ -30,8 +26,8 @@ pub struct BlocksStateMachineWrapper {
     slot_gc_tracer: Option<Vec<Slot>>,
 }
 
-impl From<SubscribeUpdateEntry> for EntryInfo {
-    fn from(value: SubscribeUpdateEntry) -> Self {
+impl From<EntryEvInfo> for EntryInfo {
+    fn from(value: EntryEvInfo) -> Self {
         Self {
             entry_hash: Hash::new_from_array(value.hash.try_into().expect("entry format")),
             slot: value.slot,
@@ -76,42 +72,38 @@ impl BlocksStateMachineWrapper {
         }
     }
 
-    pub fn handle_block_entry(
-        &mut self,
-        entry: &SubscribeUpdateEntry,
-    ) -> Result<(), UntrackedSlot> {
-        let entry_info: EntryInfo = entry.clone().into();
+    pub fn handle_block_entry(&mut self, entry: EntryEvInfo) -> Result<(), UntrackedSlot> {
+        let entry_info: EntryInfo = entry.into();
         self.sm.process_replay_event(entry_info.into())
     }
 
     #[allow(clippy::collapsible_else_if)]
     pub fn handle_slot_update(
         &mut self,
-        slot_update: &SubscribeUpdateSlot,
+        slot_update: SlotUpdateEvInfo,
     ) -> Result<(), UntrackedSlot> {
-        let slot_status = slot_update.status();
-        const LIFE_CYCLE_STATUS: [SlotStatus; 4] = [
-            SlotStatus::SlotFirstShredReceived,
-            SlotStatus::SlotCompleted,
-            SlotStatus::SlotCreatedBank,
-            SlotStatus::SlotDead,
+        const LIFE_CYCLE_STATUS: [SlotStatusKind; 4] = [
+            SlotStatusKind::FirstShredReceived,
+            SlotStatusKind::Completed,
+            SlotStatusKind::CreatedBank,
+            SlotStatusKind::Dead,
         ];
 
-        if LIFE_CYCLE_STATUS.contains(&slot_status) {
+        if LIFE_CYCLE_STATUS.contains(&slot_update.status) {
             let lifecycle_update = SlotLifecycleUpdate {
                 slot: slot_update.slot,
                 parent_slot: slot_update.parent,
-                stage: match slot_status {
-                    SlotStatus::SlotFirstShredReceived => SlotLifecycle::FirstShredReceived,
-                    SlotStatus::SlotCompleted => SlotLifecycle::Completed,
-                    SlotStatus::SlotCreatedBank => SlotLifecycle::CreatedBank,
-                    SlotStatus::SlotDead => SlotLifecycle::Dead,
+                stage: match slot_update.status {
+                    SlotStatusKind::FirstShredReceived => SlotLifecycle::FirstShredReceived,
+                    SlotStatusKind::Completed => SlotLifecycle::Completed,
+                    SlotStatusKind::CreatedBank => SlotLifecycle::CreatedBank,
+                    SlotStatusKind::Dead => SlotLifecycle::Dead,
                     _ => unreachable!(),
                 },
             };
             self.sm.process_replay_event(lifecycle_update.into())?;
         } else {
-            if slot_update.dead_error.is_some() {
+            if slot_update.dead_error {
                 // Downgrade to lifecycle update
                 let lifecycle_update = SlotLifecycleUpdate {
                     slot: slot_update.slot,
@@ -123,10 +115,10 @@ impl BlocksStateMachineWrapper {
                 let commitment_level_update = SlotCommitmentStatusUpdate {
                     parent_slot: slot_update.parent,
                     slot: slot_update.slot,
-                    commitment: match slot_status {
-                        SlotStatus::SlotProcessed => CommitmentLevel::Processed,
-                        SlotStatus::SlotConfirmed => CommitmentLevel::Confirmed,
-                        SlotStatus::SlotFinalized => CommitmentLevel::Finalized,
+                    commitment: match slot_update.status {
+                        SlotStatusKind::Processed => CommitmentLevel::Processed,
+                        SlotStatusKind::Confirmed => CommitmentLevel::Confirmed,
+                        SlotStatusKind::Finalized => CommitmentLevel::Finalized,
                         _ => unreachable!(),
                     },
                 };
@@ -138,19 +130,13 @@ impl BlocksStateMachineWrapper {
         Ok(())
     }
 
-    pub fn handle_block_meta(
-        &mut self,
-        block_meta: &SubscribeUpdateBlockMeta,
-    ) -> Result<(), UntrackedSlot> {
-        let bh = bs58::decode(block_meta.blockhash.as_str())
-            .into_vec()
-            .expect("blockhash format");
+    pub fn handle_block_meta(&mut self, block_meta: BlockMetaEvInfo) -> Result<(), UntrackedSlot> {
         let block_summary = BlockSummary {
             slot: block_meta.slot,
             entry_count: block_meta.entries_count,
             parent_slot: block_meta.parent_slot,
             executed_transaction_count: block_meta.executed_transaction_count,
-            blockhash: Hash::new_from_array(bh.try_into().expect("blockhash length")),
+            blockhash: Hash::new_from_array(block_meta.blockhash),
         };
         self.sm.process_replay_event(block_summary.into())
         // Currently not used in block reconstruction
@@ -173,54 +159,17 @@ impl BlocksStateMachineWrapper {
         self.sm.pop_next_dlq()
     }
 
-    pub fn handle_new_geyser_event(
-        &mut self,
-        event: &SubscribeUpdate,
-    ) -> Result<(), UntrackedSlot> {
-        let SubscribeUpdate {
-            filters: _,
-            created_at: _,
-            update_oneof,
-        } = event;
-        let Some(update_oneof) = update_oneof else {
-            return Ok(());
-        };
-        match update_oneof {
-            UpdateOneof::Slot(subscribe_update_slot) => {
-                self.handle_slot_update(subscribe_update_slot)
-            }
-            UpdateOneof::BlockMeta(subscribe_update_block_meta) => {
-                self.handle_block_meta(subscribe_update_block_meta)
-            }
-            UpdateOneof::Entry(subscribe_update_entry) => {
-                self.handle_block_entry(subscribe_update_entry)
-            }
-            UpdateOneof::Transaction(tx) => {
-                let slot = tx.slot;
+    pub fn handle_new_geyser_event(&mut self, event: GeyserEventInfo) -> Result<(), UntrackedSlot> {
+        match event {
+            GeyserEventInfo::Slot(slot_update) => self.handle_slot_update(slot_update),
+            GeyserEventInfo::BlockMeta(block_meta) => self.handle_block_meta(block_meta),
+            GeyserEventInfo::Entry(entry) => self.handle_block_entry(entry),
+            GeyserEventInfo::Transaction { slot }
+            | GeyserEventInfo::Account { slot }
+            | GeyserEventInfo::Other { slot } => {
                 if !self.sm.is_slot_tracked(slot) {
                     return Err(UntrackedSlot);
                 }
-                // Transactions are not currently used in block reconstruction
-                Ok(())
-            }
-            UpdateOneof::Account(account) => {
-                let slot = account.slot;
-                if !self.sm.is_slot_tracked(slot) {
-                    return Err(UntrackedSlot);
-                }
-                // Accounts are not currently used in block reconstruction
-                Ok(())
-            }
-            UpdateOneof::TransactionStatus(tx) => {
-                let slot = tx.slot;
-                if !self.sm.is_slot_tracked(slot) {
-                    return Err(UntrackedSlot);
-                }
-                // Transaction statuses are not currently used in block reconstruction
-                Ok(())
-            }
-            _ => {
-                // Other event types are not currently used in block reconstruction
                 Ok(())
             }
         }

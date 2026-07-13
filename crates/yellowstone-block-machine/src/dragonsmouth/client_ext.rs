@@ -1,14 +1,18 @@
 use {
-    crate::dragonsmouth::{stream::BlockStream, wrapper::RESERVED_FILTER_NAME},
+    crate::{
+        dragonsmouth::{RESERVED_FILTER_NAME, block_cumulator::DragonsmouthBlockCumulator},
+        stream::BlockStream,
+    },
     solana_commitment_config::CommitmentLevel,
     tonic::async_trait,
     yellowstone_grpc_client::{GeyserGrpcClient, GeyserGrpcClientError, GeyserStream},
     yellowstone_grpc_proto::geyser::{
         CommitmentLevel as ProtoCommitmentLevel, SubscribeRequest, SubscribeRequestFilterSlots,
+        SubscribeUpdate,
     },
 };
 
-pub type GeyserBlockStream = BlockStream<GeyserStream>;
+pub type GeyserBlockStream = BlockStream<GeyserStream, SubscribeUpdate, DragonsmouthBlockCumulator>;
 
 #[async_trait]
 pub trait GeyserGrpcExt {
@@ -84,6 +88,10 @@ impl GeyserGrpcExt for GeyserGrpcClient {
 
         let (_sink, source) = self.subscribe_with_request(Some(subscribe_request)).await?;
 
-        Ok(BlockStream::new(source, commitment_level))
+        Ok(BlockStream::new(
+            source,
+            Default::default(),
+            commitment_level,
+        ))
     }
 }

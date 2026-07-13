@@ -1,38 +1,35 @@
-# Sans-IO Solana Block Reconsruction State Machine
+# Sans-IO Solana Block Reconstruction State Machine
 
-This crates introduce a [sans-io](https://sans-io.readthedocs.io/) state machine to rebuild solana slot
-properly, mainly from geyser events.
+`yellowstone-block-machine` provides a [sans-IO](https://sans-io.readthedocs.io/) state machine to reconstruct Solana blocks from Geyser events.
 
-The state-machine encodes all the undocumented/implicit rules you must know about Geyser in order
-to properly reconstruct a Slot. 
+The state machine encodes ordering and lifecycle rules that are easy to miss when consuming raw Geyser streams directly.
 
-## Dragon's mouth integration
+## What it does
 
-Visit [docs.rs](https://docs.rs/yellowstone-block-machine/latest/yellowstone_block_machine/) for more detailed example.
+- Reconstructs per-slot blocks from replay and metadata signals.
+- Emits commitment progression updates.
+- Detects forks and dead slots.
 
-You can also look at the repo's [examples](https://github.com/rpcpool/yellowstone-block-machine/tree/main/examples/dragonsmouth) folder.
+## Wire-format agnostic design
 
+The core stream and wrapper are generic over `event::GeyserEventAdapter`, so you can use this crate with:
 
-## Slot lifecycle Up to Processed
+- the bundled Yellowstone proto adapter (`dragonsmouth-thin` feature), or
+- your own adapter for a different event type/version.
 
-```
+This keeps block-reconstruction logic reusable without forcing all consumers onto a specific `yellowstone-grpc-proto` version.
 
-                                                                                                                                            
-                                                                                                                                            
-                                          TIME ->                                                                                           
-      ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────►   
-      ┌───────────────────────────────────────────────────────┐                                                                             
-      │ Slot download                                         │                                                                             
-      │ ┌───────────┐┌──────┐         ┌───────┐┌───────────┐  │                                                                             
-      │ │FIRST_SHRED││SHRED2│  ...    │SHRED N││ COMPLETED │  │                                                                             
-      │ │ RECEIVED  │└──────┘         └───────┘└───────────┘  │                                                                             
-      │ └───────────                                          │                                                                             
-      └──────────────┌───────────────────────────────────────────────────────────────────────────────┐                                      
-                     │ REPLAY STAGE                                                                  │                                      
-                     │┌─────────────┐ ┌──────────────┐ ┌───┌───┐┌──────┐    ┌──────────┐ ┌─────────┐ │                                      
-                     ││BANK_CREATED │ │ACCOUNT UPDATE│ │TX1│TX2││ENTRY1│... │BLOCK_META│ │PROCESSED│ │                                      
-                     │└─────────────┘ └──────────────┘ └───└───┘└──────┘    └──────────┘ └─────────┘ │                                      
-                     │                                                                               │                                      
-                     └───────────────────────────────────────────────────────────────────────────────┘          
-```
+## Feature flags
 
+- `dragonsmouth-thin`: enables the built-in adapter for `yellowstone_grpc_proto::geyser::SubscribeUpdate`.
+- `dragonsmouth`: enables gRPC client extensions (`GeyserGrpcExt`) on top of `dragonsmouth-thin`.
+
+## Dragonsmouth integration
+
+See docs.rs for full API docs and examples:
+
+- https://docs.rs/yellowstone-block-machine/latest/yellowstone_block_machine/
+
+You can also run the repository example:
+
+- https://github.com/rpcpool/yellowstone-block-machine/tree/main/examples/dragonsmouth

@@ -8,13 +8,13 @@ use {
         path::PathBuf,
     },
     tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt},
-    yellowstone_block_machine::dragonsmouth::{
-        client_ext::{GeyserBlockStream, GeyserGrpcExt},
+    yellowstone_block_machine::{
+        dragonsmouth::client_ext::{GeyserBlockStream, GeyserGrpcExt},
         stream::{Block, BlockMachineOutput},
     },
     yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcBuilder},
     yellowstone_grpc_proto::geyser::{
-        CommitmentLevel, SubscribeRequest, subscribe_update::UpdateOneof,
+        CommitmentLevel, SubscribeRequest, SubscribeUpdate, subscribe_update::UpdateOneof,
     },
 };
 
@@ -31,15 +31,13 @@ pub fn init_tracing() {
         .expect("tracing init");
 }
 
-#[allow(dead_code)]
-fn cross_check_account_txn_join(block: Block) {
+fn cross_check_account_txn_join(block: Block<SubscribeUpdate>) {
     let mut account_txn_sig_set: HashSet<Signature> = HashSet::new();
     let mut txn_sig_index_map: HashMap<Signature, u64> = HashMap::new();
     for ev in block.events.into_iter() {
         let Some(update) = ev.update_oneof else {
             continue;
         };
-
         match update {
             UpdateOneof::Account(subscribe_update_account) => {
                 let Some(sig) = subscribe_update_account.account.unwrap().txn_signature else {
@@ -82,6 +80,7 @@ struct Args {
 #[derive(Debug, Clone, serde::Deserialize)]
 struct Config {
     endpoint: String,
+    #[serde(alias = "x-token")]
     x_token: Option<String>,
 }
 
@@ -100,7 +99,7 @@ where
                     let txn_cnt = block.txn_len();
                     let entry_cnt = block.entry_len();
                     writeln!(out, "Block ({i}) {slot} len: {n}, {txn_cnt} tx, {account_cnt} accounts, {entry_cnt} entries").expect("write");
-                    // cross_check_account_txn_join(block);
+                    cross_check_account_txn_join(block);
                     i += 1;
                 }
                 BlockMachineOutput::SlotCommitmentUpdate(slot_commitment_status_update) => {
@@ -158,7 +157,10 @@ async fn main() {
         transactions: hash_map! {
             "test".to_string() => Default::default(),
         },
-        commitment: Some(CommitmentLevel::Confirmed as i32),
+        entry: hash_map! {
+            "test".to_string() => Default::default(),
+        },
+        commitment: Some(CommitmentLevel::Processed as i32),
         ..Default::default()
     };
 

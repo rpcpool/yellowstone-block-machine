@@ -1,33 +1,74 @@
 use {
     crate::{
-        dragonsmouth::wrapper::{BlocksStateMachineWrapper, RESERVED_FILTER_NAME},
+        event::{GeyserEventAdapter, GeyserEventInfo},
         state_machine::{
             BlockStateMachineOutput, BlockstoreStats, DeadBlockDetected, DeadletterEvent,
-            ForkDetected, SlotCommitmentStatusUpdate,
+            ForkDetected, FrozenBlock, SlotCommitmentStatusUpdate,
         },
+        wrapper::BlocksStateMachineWrapper,
     },
     derive_more::From,
     futures_util::{Stream, TryStream, TryStreamExt},
     rustc_hash::FxHashMap,
     solana_clock::Slot,
     solana_commitment_config::CommitmentLevel,
-    std::{cmp::Ordering, collections::VecDeque},
-    yellowstone_grpc_proto::geyser::{SubscribeUpdate, subscribe_update::UpdateOneof},
+    solana_hash::HASH_BYTES,
+    std::{cmp::Ordering, collections::VecDeque, marker::PhantomData},
 };
 
 ///
 /// A fully reconstructed block, containing all events (accounts, transactions, entries) for a given slot.
 ///
 #[derive(Debug, Clone)]
-pub struct Block {
+pub struct Block<E> {
     pub slot: Slot,
-    pub events: Vec<SubscribeUpdate>,
+    pub blockhash: [u8; HASH_BYTES],
+    pub events: Vec<E>,
     pub account_idx_map: Vec<usize>,
     pub transaction_idx_map: Vec<usize>,
-    entry_idx_map: Vec<usize>,
+    pub entry_idx_map: Vec<usize>,
+    pub other_idx_map: Vec<usize>,
 }
 
-impl Block {
+///
+/// A trait for types that can accumulate events into blocks.
+///
+pub trait BlockAccumulator {
+    ///
+    /// The type of events that this cumulator can handle. This is typically the same as the `EventT` associated type of the `GeyserEventAdapter` used by the `BlockStream`.
+    type EventT;
+
+    ///
+    /// Inserts a new event into the block accumulator for the given slot, under the given
+    /// [`Bucket`].
+    fn add_event(&mut self, event: Self::EventT, slot: Slot, ev_info: &GeyserEventInfo);
+
+    ///
+    /// Marks a block as frozen, indicating that it has been fully reconstructed and is ready for processing.
+    ///
+    /// See [`BlockAccumulator::finish_block`] for how to retrieve the frozen block.
+    fn freeze_block(&mut self, frozen_block_info: FrozenBlock);
+
+    ///
+    /// Finishes a block and returns it, if it exists. This is typically called when the block has been fully processed and is ready to be consumed.
+    ///
+    /// # Note
+    ///
+    /// This function should only return Some if the block was previously `freeze_block`.
+    ///
+    /// # Idempotency
+    ///
+    /// This function is NOT idempotent. Calling it multiple times for the same slot will return None after the first call.
+    fn finish_block(&mut self, slot: Slot) -> Option<Block<Self::EventT>>;
+
+    ///
+    /// Prunes a block from the accumulator, removing all associated events and data for the given slot.
+    /// This is typically called when a block is no longer needed, such as when it has been finalized or when a fork has been detected.
+    ///
+    fn prune_block(&mut self, slot: Slot);
+}
+
+impl<E> Block<E> {
     ///
     /// Returns the number of transactions in this block.
     ///
@@ -68,16 +109,16 @@ impl Block {
 /// The different types of outputs produced by the Dragon's mouth block machine.
 ///
 #[derive(Debug, From)]
-pub enum BlockMachineOutput {
+pub enum BlockMachineOutput<E> {
     ///
     /// A fully reconstructed block, ready for processing.
     ///
-    FrozenBlock(Block),
+    FrozenBlock(Block<E>),
     ///
     /// An update on the commitment status of a slot.
     /// Note: This is sent when the slot reaches or exceeds the minimum commitment level set during initialization.
     /// It is guaranteed that the block for this slot has been sent before this update.
-    ///  
+    ///
     SlotCommitmentUpdate(SlotCommitmentStatusUpdate),
     ///
     /// A notification that a fork has been detected.
@@ -96,26 +137,50 @@ pub enum BlockMachineOutput {
 ///
 /// # Generic Parameters
 ///
-/// - `Source`: The underlying source of `SubscribeUpdate` events, typically a gRPC stream from the Geyser plugin.
+/// - `Source`: The underlying source of raw Geyser events, typically a gRPC stream from the Geyser
+///   plugin. Its `Ok` item type must match `V::EventT`.
+/// - `V`: A [`GeyserEventAdapter`] that knows how to view the events yielded by `Source`. Use
+///   `yellowstone_grpc_proto::geyser::SubscribeUpdate` (behind the `dragonsmouth-thin` feature,
+///   which implements this trait on itself) or implement [`GeyserEventAdapter`] on your own type to
+///   avoid depending on a specific version of `yellowstone-grpc-proto`.
 ///
-pub struct BlockStream<Source> {
+pub struct BlockStream<Source, Adaptor, Acc>
+where
+    Adaptor: GeyserEventAdapter,
+{
     pub(crate) min_commitment_level: CommitmentLevel,
     pub(crate) source: Source,
     pub(crate) machine: BlocksStateMachineWrapper,
-    pub(crate) storage: InMemoryBlockStore,
-    pub(crate) pending: VecDeque<BlockMachineOutput>,
+    pub(crate) storage: Acc,
+    pub(crate) pending: VecDeque<BlockMachineOutput<Adaptor::EventT>>,
+    pub(crate) _adapter: PhantomData<Adaptor>,
 }
 
-impl<Source> BlockStream<Source> {
-    pub fn new(source: Source, min_commitment_level: CommitmentLevel) -> Self {
+impl<Source, Adaptor, Acc> BlockStream<Source, Adaptor, Acc>
+where
+    Adaptor: GeyserEventAdapter,
+{
+    pub fn new(source: Source, block_acc: Acc, min_commitment_level: CommitmentLevel) -> Self {
         Self {
             min_commitment_level,
             source,
             machine: BlocksStateMachineWrapper::new_with_slot_gc_tracing(),
-            storage: InMemoryBlockStore::default(),
+            storage: block_acc,
             pending: VecDeque::new(),
+            _adapter: PhantomData,
         }
     }
+}
+
+// Auto-derivation of `Unpin` doesn't see through the `Adaptor::EventT` associated-type projection
+// held (transitively) by `pending`, so it's implemented explicitly here instead.
+impl<Source, Adaptor, Acc> Unpin for BlockStream<Source, Adaptor, Acc>
+where
+    Source: Unpin,
+    Adaptor: GeyserEventAdapter,
+    Adaptor::EventT: Unpin,
+    Acc: Unpin,
+{
 }
 
 fn compare_commitment(cl1: CommitmentLevel, cl2: CommitmentLevel) -> Ordering {
@@ -131,58 +196,18 @@ fn compare_commitment(cl1: CommitmentLevel, cl2: CommitmentLevel) -> Ordering {
     }
 }
 
-impl<Source> BlockStream<Source> {
+impl<Source, Adaptor, Acc> BlockStream<Source, Adaptor, Acc>
+where
+    Adaptor: GeyserEventAdapter,
+    Acc: BlockAccumulator<EventT = Adaptor::EventT>,
+{
     pub fn state_machine_stats(&self) -> BlockstoreStats {
         self.machine.sm.stats()
     }
 
-    fn insert_into_storage(&mut self, event: SubscribeUpdate) {
-        let SubscribeUpdate {
-            filters,
-            created_at,
-            update_oneof,
-        } = event;
-        let Some(update_oneof) = update_oneof else {
-            return;
-        };
-        match update_oneof {
-            UpdateOneof::Account(update) => {
-                let slot = update.slot;
-                self.storage.insert_block_data(
-                    slot,
-                    SubscribeUpdate {
-                        filters,
-                        created_at,
-                        update_oneof: Some(UpdateOneof::Account(update)),
-                    },
-                );
-            }
-            UpdateOneof::Transaction(update) => {
-                let slot = update.slot;
-                self.storage.insert_block_data(
-                    slot,
-                    SubscribeUpdate {
-                        filters,
-                        created_at,
-                        update_oneof: Some(UpdateOneof::Transaction(update)),
-                    },
-                );
-            }
-            UpdateOneof::Entry(update) => {
-                let slot = update.slot;
-                if filters.iter().any(|k| k != RESERVED_FILTER_NAME) {
-                    self.storage.insert_block_data(
-                        slot,
-                        SubscribeUpdate {
-                            filters,
-                            created_at,
-                            update_oneof: Some(UpdateOneof::Entry(update)),
-                        },
-                    );
-                }
-            }
-            _ => {}
-        }
+    fn insert_into_storage(&mut self, event: Adaptor::EventT, ev_info: &GeyserEventInfo) {
+        let slot = ev_info.slot();
+        self.storage.add_event(event, slot, &ev_info);
     }
 
     fn on_new_frozen_block(&mut self) {
@@ -190,13 +215,13 @@ impl<Source> BlockStream<Source> {
         while let Some(dlq_event) = self.machine.pop_next_dlq() {
             match dlq_event {
                 DeadletterEvent::Incomplete(slot) => {
-                    self.storage.remove_slot(slot);
+                    self.storage.prune_block(slot);
                 }
             }
         }
 
         while let Some(slot) = self.machine.pop_slot_gc_trace() {
-            self.storage.remove_slot(slot);
+            self.storage.prune_block(slot);
         }
     }
 
@@ -204,9 +229,8 @@ impl<Source> BlockStream<Source> {
         while let Some(output) = self.machine.pop_next_state_machine_output() {
             match output {
                 BlockStateMachineOutput::FrozenBlock(frozen_block) => {
-                    let slot = frozen_block.slot;
                     self.on_new_frozen_block();
-                    self.storage.mark_block_as_frozen(slot);
+                    self.storage.freeze_block(frozen_block);
                 }
                 BlockStateMachineOutput::SlotStatus(slot_status) => {
                     let slot = slot_status.slot;
@@ -219,7 +243,7 @@ impl<Source> BlockStream<Source> {
                                 slot: slot_status.slot,
                                 commitment: cl,
                             };
-                            if let Some(block) = self.storage.finish_slot(slot) {
+                            if let Some(block) = self.storage.finish_block(slot) {
                                 self.pending
                                     .push_back(BlockMachineOutput::FrozenBlock(block));
                             }
@@ -232,29 +256,32 @@ impl<Source> BlockStream<Source> {
                     }
                 }
                 BlockStateMachineOutput::ForksDetected(fork_detected) => {
-                    self.storage.remove_slot(fork_detected.slot);
+                    self.storage.prune_block(fork_detected.slot);
                     self.pending
                         .push_back(BlockMachineOutput::ForkDetected(fork_detected));
                 }
                 BlockStateMachineOutput::DeadSlotDetected(dead_block) => {
-                    self.storage.remove_slot(dead_block.slot);
+                    self.storage.prune_block(dead_block.slot);
                     self.pending
                         .push_back(BlockMachineOutput::DeadBlockDetect(dead_block));
                 }
                 BlockStateMachineOutput::BankCreated(_) => {}
                 BlockStateMachineOutput::BankReset(slot) => {
-                    self.storage.remove_slot(slot);
+                    self.storage.prune_block(slot);
                 }
             }
         }
     }
 }
 
-impl<Source> Stream for BlockStream<Source>
+impl<Source, Adaptor, Acc> Stream for BlockStream<Source, Adaptor, Acc>
 where
-    Source: TryStream<Ok = SubscribeUpdate> + Unpin,
+    Source: TryStream<Ok = Adaptor::EventT> + Unpin,
+    Adaptor: GeyserEventAdapter,
+    Adaptor::EventT: Unpin,
+    Acc: BlockAccumulator<EventT = Adaptor::EventT> + Unpin,
 {
-    type Item = Result<BlockMachineOutput, Source::Error>;
+    type Item = Result<BlockMachineOutput<Adaptor::EventT>, Source::Error>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
@@ -267,8 +294,17 @@ where
 
             match self.source.try_poll_next_unpin(cx) {
                 std::task::Poll::Ready(Some(Ok(ev))) => {
-                    if self.machine.handle_new_geyser_event(&ev).is_ok() {
-                        self.insert_into_storage(ev);
+                    let event_view = match Adaptor::extract_geyser_ev_info(&ev) {
+                        Some(ev) => ev,
+                        None => continue,
+                    };
+
+                    if self
+                        .machine
+                        .handle_new_geyser_event(event_view.clone())
+                        .is_ok()
+                    {
+                        self.insert_into_storage(ev, &event_view);
                     }
                 }
                 std::task::Poll::Ready(Some(Err(e))) => {
@@ -286,22 +322,50 @@ where
     }
 }
 
-#[derive(Debug, Default)]
-struct BlockAccumulator {
-    events: Vec<SubscribeUpdate>,
+///
+/// Which per-block index map an event's position should be recorded in.
+///
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bucket {
+    Account,
+    Transaction,
+    Entry,
+    Other,
+}
+
+#[derive(Debug)]
+struct BlockBuffer<E> {
+    blockhash: [u8; HASH_BYTES],
+    events: Vec<E>,
     account_idx_map: Vec<usize>,
     transaction_idx_map: Vec<usize>,
     entry_idx_map: Vec<usize>,
+    other_idx_map: Vec<usize>,
 }
 
-impl BlockAccumulator {
-    fn finish(self, slot: Slot) -> Block {
+impl<E> Default for BlockBuffer<E> {
+    fn default() -> Self {
+        Self {
+            blockhash: [0; HASH_BYTES],
+            events: Vec::new(),
+            account_idx_map: Vec::new(),
+            transaction_idx_map: Vec::new(),
+            entry_idx_map: Vec::new(),
+            other_idx_map: Vec::new(),
+        }
+    }
+}
+
+impl<E> BlockBuffer<E> {
+    fn finish(self, slot: Slot) -> Block<E> {
         Block {
             slot,
+            blockhash: self.blockhash,
             events: self.events,
             account_idx_map: self.account_idx_map,
             transaction_idx_map: self.transaction_idx_map,
             entry_idx_map: self.entry_idx_map,
+            other_idx_map: self.other_idx_map,
         }
     }
 }
@@ -310,55 +374,63 @@ impl BlockAccumulator {
 /// An in-memory store for blocks being reconstructed.
 ///
 /// It maintains active blocks (currently being reconstructed) and frozen blocks (fully reconstructed).
-#[derive(Default)]
-pub struct InMemoryBlockStore {
-    active_block_map: FxHashMap<Slot, BlockAccumulator>,
-    frozen_block_map: FxHashMap<Slot, BlockAccumulator>,
+pub struct SimpleBlockCumulator<E> {
+    active_block_map: FxHashMap<Slot, BlockBuffer<E>>,
+    frozen_block_map: FxHashMap<Slot, BlockBuffer<E>>,
 }
 
-impl InMemoryBlockStore {
-    fn insert_block_data(&mut self, slot: Slot, update: SubscribeUpdate) {
+impl<E> Default for SimpleBlockCumulator<E> {
+    fn default() -> Self {
+        Self {
+            active_block_map: FxHashMap::default(),
+            frozen_block_map: FxHashMap::default(),
+        }
+    }
+}
+
+impl<E> BlockAccumulator for SimpleBlockCumulator<E> {
+    type EventT = E;
+
+    fn add_event(&mut self, event: E, slot: Slot, ev_info: &GeyserEventInfo) {
         let block = self.active_block_map.entry(slot).or_default();
         let idx = block.events.len();
-        match &update.update_oneof {
-            Some(UpdateOneof::Account(_)) => {
-                block.account_idx_map.push(idx);
-            }
-            Some(UpdateOneof::Transaction(_)) => {
-                block.transaction_idx_map.push(idx);
-            }
-            Some(UpdateOneof::Entry(_)) => {
-                block.entry_idx_map.push(idx);
-            }
+        match ev_info {
+            GeyserEventInfo::Account { .. } => block.account_idx_map.push(idx),
+            GeyserEventInfo::Transaction { .. } => block.transaction_idx_map.push(idx),
+            GeyserEventInfo::Entry(_) => block.entry_idx_map.push(idx),
+            GeyserEventInfo::Other { .. } => block.other_idx_map.push(idx),
             _ => {
-                unreachable!("unsupported update type for block data insertion");
+                //block meta and slot are ignored
+                return;
             }
         }
-        block.events.push(update);
+        block.events.push(event);
     }
 
-    fn mark_block_as_frozen(&mut self, slot: Slot) {
-        let Some(block) = self.active_block_map.remove(&slot) else {
+    fn freeze_block(&mut self, frozen_block_info: FrozenBlock) {
+        let Some(mut block) = self.active_block_map.remove(&frozen_block_info.slot) else {
             return;
         };
-        self.frozen_block_map.insert(slot, block);
+        block.blockhash = frozen_block_info.blockhash.to_bytes();
+        self.frozen_block_map.insert(frozen_block_info.slot, block);
     }
 
-    fn remove_slot(&mut self, slot: Slot) {
-        self.active_block_map.remove(&slot);
-        self.frozen_block_map.remove(&slot);
-    }
-
-    fn finish_slot(&mut self, slot: Slot) -> Option<Block> {
+    fn finish_block(&mut self, slot: Slot) -> Option<Block<E>> {
         let acc = self.frozen_block_map.remove(&slot)?;
         Some(acc.finish(slot))
     }
+
+    fn prune_block(&mut self, slot: Slot) {
+        self.active_block_map.remove(&slot);
+        self.frozen_block_map.remove(&slot);
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dragonsmouth-thin"))]
 mod tests {
     use {
-        super::{BlockMachineOutput, BlockStream},
+        super::{BlockMachineOutput, BlockStream, SimpleBlockCumulator},
+        crate::event::GeyserEventAdapter,
         futures_util::{Stream, stream},
         solana_commitment_config::CommitmentLevel,
         solana_hash::Hash,
@@ -446,20 +518,32 @@ mod tests {
     fn feed(
         stream: &mut BlockStream<
             stream::Iter<std::vec::IntoIter<Result<SubscribeUpdate, io::Error>>>,
+            SubscribeUpdate,
+            SimpleBlockCumulator<SubscribeUpdate>,
         >,
         ev: SubscribeUpdate,
     ) {
-        if stream.machine.handle_new_geyser_event(&ev).is_ok() {
-            stream.insert_into_storage(ev);
+        let ev_info = SubscribeUpdate::extract_geyser_ev_info(&ev).unwrap();
+        if stream
+            .machine
+            .handle_new_geyser_event(ev_info.clone())
+            .is_ok()
+        {
+            stream.insert_into_storage(ev, &ev_info);
         }
         stream.process_state_machine_output();
     }
 
     fn empty_source_stream(
         min_commitment_level: CommitmentLevel,
-    ) -> BlockStream<stream::Iter<std::vec::IntoIter<Result<SubscribeUpdate, io::Error>>>> {
+    ) -> BlockStream<
+        stream::Iter<std::vec::IntoIter<Result<SubscribeUpdate, io::Error>>>,
+        SubscribeUpdate,
+        SimpleBlockCumulator<SubscribeUpdate>,
+    > {
         BlockStream::new(
             stream::iter(Vec::<Result<SubscribeUpdate, io::Error>>::new()),
+            SimpleBlockCumulator::default(),
             min_commitment_level,
         )
     }
@@ -536,8 +620,12 @@ mod tests {
 
     #[test]
     fn stream_forwards_source_error_and_end_of_stream() {
-        let source = stream::iter(vec![Err(io::Error::other("boom"))]);
-        let mut bs = BlockStream::new(source, CommitmentLevel::Processed);
+        let source = stream::iter(vec![Err::<SubscribeUpdate, _>(io::Error::other("boom"))]);
+        let mut bs = BlockStream::<_, SubscribeUpdate, SimpleBlockCumulator<SubscribeUpdate>>::new(
+            source,
+            SimpleBlockCumulator::default(),
+            CommitmentLevel::Processed,
+        );
         let waker = futures_util::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -545,7 +633,11 @@ mod tests {
         assert!(matches!(first, Poll::Ready(Some(Err(_)))));
 
         let source = stream::iter(Vec::<Result<SubscribeUpdate, io::Error>>::new());
-        let mut bs = BlockStream::new(source, CommitmentLevel::Processed);
+        let mut bs = BlockStream::<_, SubscribeUpdate, SimpleBlockCumulator<SubscribeUpdate>>::new(
+            source,
+            SimpleBlockCumulator::default(),
+            CommitmentLevel::Processed,
+        );
         let second = Pin::new(&mut bs).poll_next(&mut cx);
         assert!(matches!(second, Poll::Ready(None)));
     }
