@@ -123,7 +123,7 @@ where
     ///
     /// Returns an iterator over the keys in the set.
     ///
-    pub fn iter(&self) -> OrderedSetIter<K> {
+    pub fn iter(&self) -> OrderedSetIter<'_, K> {
         OrderedSetIter {
             ordered_set: self,
             next_index: 0,
