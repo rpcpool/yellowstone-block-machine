@@ -147,6 +147,9 @@ async fn main() {
         .expect("tls_config")
         .max_decoding_message_size(50 * 1024 * 1024) // 50MB
         .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
+        .initial_connection_window_size(Some(10_000_000))
+        .initial_stream_window_size(Some(8_000_000))
+        .http2_adaptive_window(true)
         .connect()
         .await
         .expect("Failed to connect to geyser");

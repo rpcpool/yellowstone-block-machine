@@ -29,7 +29,7 @@ pub struct BlocksStateMachineWrapper {
 impl From<EntryEvInfo> for EntryInfo {
     fn from(value: EntryEvInfo) -> Self {
         Self {
-            entry_hash: Hash::new_from_array(value.hash.try_into().expect("entry format")),
+            entry_hash: Hash::new_from_array(value.hash),
             slot: value.slot,
             entry_index: value.index,
             starting_txn_index: value.starting_transaction_index,

@@ -2189,7 +2189,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "yellowstone-block-machine"
-version = "0.9.0-rc4"
+version = "0.9.0"
 dependencies = [
  "bs58",
  "bytesize 2.4.2",

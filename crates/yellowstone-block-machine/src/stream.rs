@@ -281,7 +281,7 @@ where
 
     fn insert_into_storage(&mut self, event: Adaptor::EventT, ev_info: &GeyserEventInfo) {
         let slot = ev_info.slot();
-        self.storage.add_event(event, slot, &ev_info);
+        self.storage.add_event(event, slot, ev_info);
     }
 
     fn on_new_frozen_block(&mut self) {
@@ -319,10 +319,6 @@ where
                             };
 
                             self.pending.push_back(PendingEvent::FrozenBlock(slot));
-                            // if let Some(block) = self.storage.finish_block(slot) {
-                            //     self.pending
-                            //         .push_back(BlockMachineOutput::FrozenBlock(block));
-                            // }
 
                             self.pending.push_back(PendingEvent::SlotCommitmentUpdate(
                                 commitment_level_update,
@@ -471,17 +467,17 @@ impl<'a, E> Iterator for SimpleBlockStoreIter<'a, E> {
             if self.idx_pos < idx_map.len() {
                 let idx = idx_map[self.idx_pos];
                 self.idx_pos += 1;
-                return self.events.get(idx);
+                self.events.get(idx)
             } else {
-                return None;
+                None
             }
         } else {
             if self.idx_pos < self.events.len() {
                 let event = &self.events[self.idx_pos];
                 self.idx_pos += 1;
-                return Some(event);
+                Some(event)
             } else {
-                return None;
+                None
             }
         }
     }

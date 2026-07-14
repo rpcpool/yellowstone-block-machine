@@ -402,7 +402,7 @@ where
                 self.forked_slots.remove(&slot);
 
                 if let Some(children) = self.parent_children_map.remove(&slot) {
-                    queue.extend(children.into_iter());
+                    queue.extend(children);
                 }
             }
 

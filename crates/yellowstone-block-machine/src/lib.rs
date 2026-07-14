@@ -39,16 +39,19 @@
 //! # Dragonsmouth integration
 //!
 //! With the Dragonsmouth integration enabled, you can consume a typed stream of:
-//! - `BlockMachineOutput::FrozenBlock`,
-//! - `BlockMachineOutput::SlotCommitmentUpdate`,
-//! - `BlockMachineOutput::ForkDetected`,
-//! - `BlockMachineOutput::DeadBlockDetect`.
+//! - `BlockStreamEvent::FrozenBlock`,
+//! - `BlockStreamEvent::SlotCommitmentUpdate`,
+//! - `BlockStreamEvent::ForkDetected`,
+//! - `BlockStreamEvent::DeadBlockDetected`.
 //!
 //! High-level example:
 //!
-//! ```ignore
+//! ```no_run
 //! use futures_util::StreamExt;
-//! use yellowstone_block_machine::{dragonsmouth::client_ext::GeyserGrpcExt, stream::BlockMachineOutput};
+//! use yellowstone_block_machine::{
+//!     dragonsmouth::client_ext::{BlockStreamEvent, GeyserGrpcExt},
+//!     stream::BlockEventStore,
+//! };
 //! use yellowstone_grpc_client::GeyserGrpcBuilder;
 //! use yellowstone_grpc_proto::geyser::{CommitmentLevel, SubscribeRequest};
 //!
@@ -61,16 +64,21 @@
 //!
 //!     while let Some(item) = stream.next().await {
 //!         match item.expect("stream item") {
-//!             BlockMachineOutput::FrozenBlock(block) => {
-//!                 let _ = (block.slot, block.txn_len(), block.account_len(), block.entry_len());
+//!             BlockStreamEvent::FrozenBlock(block) => {
+//!                 let _ = (
+//!                     block.slot(),
+//!                     block.transaction_len(),
+//!                     block.account_len(),
+//!                     block.entry_len(),
+//!                 );
 //!             }
-//!             BlockMachineOutput::SlotCommitmentUpdate(update) => {
+//!             BlockStreamEvent::SlotCommitmentUpdate(update) => {
 //!                 let _ = (update.slot, update.commitment);
 //!             }
-//!             BlockMachineOutput::ForkDetected(fork) => {
+//!             BlockStreamEvent::ForkDetected(fork) => {
 //!                 let _ = fork.slot;
 //!             }
-//!             BlockMachineOutput::DeadBlockDetect(dead) => {
+//!             BlockStreamEvent::DeadBlockDetected(dead) => {
 //!                 let _ = dead.slot;
 //!             }
 //!         }
