@@ -9,12 +9,14 @@ use {
     },
     tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt},
     yellowstone_block_machine::{
-        dragonsmouth::client_ext::{GeyserBlockStream, GeyserGrpcExt},
-        stream::{Block, BlockMachineOutput},
+        dragonsmouth::client_ext::{
+            BlockStreamEvent, DragonsmouthBlock, DragonsmouthBlockStream, GeyserGrpcExt,
+        },
+        stream::BlockEventStore,
     },
     yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcBuilder},
     yellowstone_grpc_proto::geyser::{
-        CommitmentLevel, SubscribeRequest, SubscribeUpdate, subscribe_update::UpdateOneof,
+        CommitmentLevel, SubscribeRequest, subscribe_update::UpdateOneof,
     },
 };
 
@@ -31,10 +33,10 @@ pub fn init_tracing() {
         .expect("tracing init");
 }
 
-fn cross_check_account_txn_join(block: Block<SubscribeUpdate>) {
+fn cross_check_account_txn_join(block: DragonsmouthBlock) {
     let mut account_txn_sig_set: HashSet<Signature> = HashSet::new();
     let mut txn_sig_index_map: HashMap<Signature, u64> = HashMap::new();
-    for ev in block.events.into_iter() {
+    for ev in block.into_iter() {
         let Some(update) = ev.update_oneof else {
             continue;
         };
@@ -84,7 +86,7 @@ struct Config {
     x_token: Option<String>,
 }
 
-async fn process_block<W>(mut block_stream: GeyserBlockStream, sample: usize, mut out: W)
+async fn process_block<W>(mut block_stream: DragonsmouthBlockStream, sample: usize, mut out: W)
 where
     W: std::io::Write,
 {
@@ -92,17 +94,17 @@ where
     while let Some(result) = block_stream.next().await {
         match result {
             Ok(output) => match output {
-                BlockMachineOutput::FrozenBlock(block) => {
+                BlockStreamEvent::FrozenBlock(block) => {
                     let n = block.len();
-                    let slot = block.slot;
+                    let slot = block.slot();
                     let account_cnt = block.account_len();
-                    let txn_cnt = block.txn_len();
+                    let txn_cnt = block.transaction_len();
                     let entry_cnt = block.entry_len();
                     writeln!(out, "Block ({i}) {slot} len: {n}, {txn_cnt} tx, {account_cnt} accounts, {entry_cnt} entries").expect("write");
                     cross_check_account_txn_join(block);
                     i += 1;
                 }
-                BlockMachineOutput::SlotCommitmentUpdate(slot_commitment_status_update) => {
+                BlockStreamEvent::SlotCommitmentUpdate(slot_commitment_status_update) => {
                     writeln!(
                         out,
                         "SlotCommitmentUpdate: {:?}",
@@ -110,10 +112,10 @@ where
                     )
                     .expect("write");
                 }
-                BlockMachineOutput::ForkDetected(fork_detected) => {
+                BlockStreamEvent::ForkDetected(fork_detected) => {
                     writeln!(out, "ForkDetected: {}", fork_detected.slot).expect("write");
                 }
-                BlockMachineOutput::DeadBlockDetect(dead_block_detected) => {
+                BlockStreamEvent::DeadBlockDetected(dead_block_detected) => {
                     writeln!(out, "DeadBlockDetect: {}", dead_block_detected.slot).expect("write");
                 }
             },

@@ -4,6 +4,6 @@ pub mod client_ext;
 pub mod proto_adapter;
 
 #[cfg(feature = "dragonsmouth-thin")]
-pub mod block_cumulator;
+pub mod block_accumulator;
 
 pub const RESERVED_FILTER_NAME: &str = "_block-machine";

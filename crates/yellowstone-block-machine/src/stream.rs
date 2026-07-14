@@ -20,14 +20,80 @@ use {
 /// A fully reconstructed block, containing all events (accounts, transactions, entries) for a given slot.
 ///
 #[derive(Debug, Clone)]
-pub struct Block<E> {
+pub struct Block<Storage> {
     pub slot: Slot,
     pub blockhash: [u8; HASH_BYTES],
-    pub events: Vec<E>,
-    pub account_idx_map: Vec<usize>,
-    pub transaction_idx_map: Vec<usize>,
-    pub entry_idx_map: Vec<usize>,
-    pub other_idx_map: Vec<usize>,
+    pub events: Storage,
+}
+
+impl<Storage> AsRef<Storage> for Block<Storage> {
+    fn as_ref(&self) -> &Storage {
+        &self.events
+    }
+}
+
+///
+/// A trait for types that can store events for a block, and provide iterators over those events.
+///
+pub trait BlockEventStore {
+    type EventT;
+
+    type Iter<'a>: Iterator<Item = &'a Self::EventT>
+    where
+        Self: 'a,
+        Self::EventT: 'a;
+
+    type IntoIter: IntoIterator<Item = Self::EventT>;
+
+    fn len(&self) -> usize;
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn iter(&self) -> Self::Iter<'_>;
+
+    ///
+    /// Returns an iterator over the events in this block that are accounts.
+    fn account_iter(&self) -> Self::Iter<'_>;
+
+    ///
+    /// Returns the number of account events in this block.
+    fn account_len(&self) -> usize {
+        self.account_iter().count()
+    }
+
+    ///
+    /// Returns an iterator over the events in this block that are transactions.
+    fn transaction_iter(&self) -> Self::Iter<'_>;
+
+    ///
+    /// Returns the number of transaction events in this block.
+    fn transaction_len(&self) -> usize {
+        self.transaction_iter().count()
+    }
+
+    ///
+    /// Returns an iterator over the events in this block that are entries.
+    fn entry_iter(&self) -> Self::Iter<'_>;
+
+    ///
+    /// Returns the number of entry events in this block.
+    fn entry_len(&self) -> usize {
+        self.entry_iter().count()
+    }
+
+    ///
+    /// Returns an iterator over the events in this block that are neither accounts, transactions, nor entries.
+    fn other_iter(&self) -> Self::Iter<'_>;
+
+    ///
+    /// Returns the number of events in this block that are neither accounts, transactions, nor entries.
+    fn other_len(&self) -> usize {
+        self.other_iter().count()
+    }
+
+    fn into_iter(self) -> Self::IntoIter;
 }
 
 ///
@@ -37,6 +103,10 @@ pub trait BlockAccumulator {
     ///
     /// The type of events that this cumulator can handle. This is typically the same as the `EventT` associated type of the `GeyserEventAdapter` used by the `BlockStream`.
     type EventT;
+
+    ///
+    /// The type of storage used to hold the events for a block. This is typically a `Vec<EventT>`, but can be any type that can hold the events for a block.
+    type EventStore: BlockEventStore;
 
     ///
     /// Inserts a new event into the block accumulator for the given slot, under the given
@@ -59,7 +129,7 @@ pub trait BlockAccumulator {
     /// # Idempotency
     ///
     /// This function is NOT idempotent. Calling it multiple times for the same slot will return None after the first call.
-    fn finish_block(&mut self, slot: Slot) -> Option<Block<Self::EventT>>;
+    fn finish_block(&mut self, slot: Slot) -> Option<Block<Self::EventStore>>;
 
     ///
     /// Prunes a block from the accumulator, removing all associated events and data for the given slot.
@@ -68,52 +138,59 @@ pub trait BlockAccumulator {
     fn prune_block(&mut self, slot: Slot);
 }
 
-impl<E> Block<E> {
-    ///
-    /// Returns the number of transactions in this block.
-    ///
-    pub fn txn_len(&self) -> usize {
-        self.transaction_idx_map.len()
-    }
+impl<Storage> Block<Storage> {
+    // ///
+    // /// Returns the number of transactions in this block.
+    // ///
+    // pub fn txn_len(&self) -> usize {
+    //     self.transaction_idx_map.len()
+    // }
 
-    ///
-    /// Returns the number of accounts in this block.
-    ///
-    pub fn account_len(&self) -> usize {
-        self.account_idx_map.len()
-    }
+    // ///
+    // /// Returns the number of accounts in this block.
+    // ///
+    // pub fn account_len(&self) -> usize {
+    //     self.account_idx_map.len()
+    // }
 
-    ///
-    /// Returns the number of entries in this block.
-    ///
-    pub fn entry_len(&self) -> usize {
-        self.entry_idx_map.len()
-    }
+    // ///
+    // /// Returns the number of entries in this block.
+    // ///
+    // pub fn entry_len(&self) -> usize {
+    //     self.entry_idx_map.len()
+    // }
 
-    ///
-    /// Checks if the block has no events.
-    ///
-    pub fn is_empty(&self) -> bool {
-        self.events.is_empty()
-    }
+    // ///
+    // /// Checks if the block has no events.
+    // ///
+    // pub fn is_empty(&self) -> bool {
+    //     self.events.is_empty()
+    // }
 
-    ///
-    /// Returns the number of events in this block.
-    ///
-    pub fn len(&self) -> usize {
-        self.events.len()
-    }
+    // ///
+    // /// Returns the number of events in this block.
+    // ///
+    // pub fn len(&self) -> usize {
+    //     self.events.len()
+    // }
+}
+
+enum PendingEvent {
+    FrozenBlock(Slot),
+    SlotCommitmentUpdate(SlotCommitmentStatusUpdate),
+    ForkDetected(ForkDetected),
+    DeadBlockDetect(DeadBlockDetected),
 }
 
 ///
 /// The different types of outputs produced by the Dragon's mouth block machine.
 ///
 #[derive(Debug, From)]
-pub enum BlockMachineOutput<E> {
+pub enum BlockMachineOutput<EventStore> {
     ///
     /// A fully reconstructed block, ready for processing.
     ///
-    FrozenBlock(Block<E>),
+    FrozenBlock(Block<EventStore>),
     ///
     /// An update on the commitment status of a slot.
     /// Note: This is sent when the slot reaches or exceeds the minimum commitment level set during initialization.
@@ -129,7 +206,7 @@ pub enum BlockMachineOutput<E> {
     /// Note: All Dead blocks are Forks, but not all Forks are Dead blocks.
     /// Dead blocks mostly come from corrupted entries early in the replay process of a slot.
     ///
-    DeadBlockDetect(DeadBlockDetected),
+    DeadBlockDetected(DeadBlockDetected),
 }
 
 ///
@@ -144,16 +221,13 @@ pub enum BlockMachineOutput<E> {
 ///   which implements this trait on itself) or implement [`GeyserEventAdapter`] on your own type to
 ///   avoid depending on a specific version of `yellowstone-grpc-proto`.
 ///
-pub struct BlockStream<Source, Adaptor, Acc>
-where
-    Adaptor: GeyserEventAdapter,
-{
-    pub(crate) min_commitment_level: CommitmentLevel,
-    pub(crate) source: Source,
-    pub(crate) machine: BlocksStateMachineWrapper,
-    pub(crate) storage: Acc,
-    pub(crate) pending: VecDeque<BlockMachineOutput<Adaptor::EventT>>,
-    pub(crate) _adapter: PhantomData<Adaptor>,
+pub struct BlockStream<Source, Adaptor, Acc> {
+    min_commitment_level: CommitmentLevel,
+    source: Source,
+    machine: BlocksStateMachineWrapper,
+    storage: Acc,
+    pending: VecDeque<PendingEvent>,
+    _adapter: PhantomData<Adaptor>,
 }
 
 impl<Source, Adaptor, Acc> BlockStream<Source, Adaptor, Acc>
@@ -243,27 +317,28 @@ where
                                 slot: slot_status.slot,
                                 commitment: cl,
                             };
-                            if let Some(block) = self.storage.finish_block(slot) {
-                                self.pending
-                                    .push_back(BlockMachineOutput::FrozenBlock(block));
-                            }
 
-                            self.pending
-                                .push_back(BlockMachineOutput::SlotCommitmentUpdate(
-                                    commitment_level_update,
-                                ));
+                            self.pending.push_back(PendingEvent::FrozenBlock(slot));
+                            // if let Some(block) = self.storage.finish_block(slot) {
+                            //     self.pending
+                            //         .push_back(BlockMachineOutput::FrozenBlock(block));
+                            // }
+
+                            self.pending.push_back(PendingEvent::SlotCommitmentUpdate(
+                                commitment_level_update,
+                            ));
                         }
                     }
                 }
                 BlockStateMachineOutput::ForksDetected(fork_detected) => {
                     self.storage.prune_block(fork_detected.slot);
                     self.pending
-                        .push_back(BlockMachineOutput::ForkDetected(fork_detected));
+                        .push_back(PendingEvent::ForkDetected(fork_detected));
                 }
                 BlockStateMachineOutput::DeadSlotDetected(dead_block) => {
                     self.storage.prune_block(dead_block.slot);
                     self.pending
-                        .push_back(BlockMachineOutput::DeadBlockDetect(dead_block));
+                        .push_back(PendingEvent::DeadBlockDetect(dead_block));
                 }
                 BlockStateMachineOutput::BankCreated(_) => {}
                 BlockStateMachineOutput::BankReset(slot) => {
@@ -281,14 +356,31 @@ where
     Adaptor::EventT: Unpin,
     Acc: BlockAccumulator<EventT = Adaptor::EventT> + Unpin,
 {
-    type Item = Result<BlockMachineOutput<Adaptor::EventT>, Source::Error>;
+    type Item = Result<BlockMachineOutput<Acc::EventStore>, Source::Error>;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         loop {
-            if let Some(output) = self.pending.pop_front() {
+            if let Some(pending_ev) = self.pending.pop_front() {
+                let output = match pending_ev {
+                    PendingEvent::FrozenBlock(slot) => {
+                        if let Some(block) = self.storage.finish_block(slot) {
+                            BlockMachineOutput::FrozenBlock(block)
+                        } else {
+                            continue;
+                        }
+                    }
+                    PendingEvent::SlotCommitmentUpdate(update) => {
+                        BlockMachineOutput::SlotCommitmentUpdate(update)
+                    }
+                    PendingEvent::ForkDetected(fork) => BlockMachineOutput::ForkDetected(fork),
+                    PendingEvent::DeadBlockDetect(dead) => {
+                        BlockMachineOutput::DeadBlockDetected(dead)
+                    }
+                };
+
                 return std::task::Poll::Ready(Some(Ok(output)));
             }
 
@@ -356,16 +448,133 @@ impl<E> Default for BlockBuffer<E> {
     }
 }
 
+pub struct SimpleBlockStore<E> {
+    pub slot: Slot,
+    pub events: Vec<E>,
+    pub account_idx_map: Vec<usize>,
+    pub transaction_idx_map: Vec<usize>,
+    pub entry_idx_map: Vec<usize>,
+    pub other_idx_map: Vec<usize>,
+}
+
+pub struct SimpleBlockStoreIter<'a, E> {
+    events: &'a [E],
+    idx_map: Option<&'a [usize]>,
+    idx_pos: usize,
+}
+
+impl<'a, E> Iterator for SimpleBlockStoreIter<'a, E> {
+    type Item = &'a E;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(idx_map) = self.idx_map {
+            if self.idx_pos < idx_map.len() {
+                let idx = idx_map[self.idx_pos];
+                self.idx_pos += 1;
+                return self.events.get(idx);
+            } else {
+                return None;
+            }
+        } else {
+            if self.idx_pos < self.events.len() {
+                let event = &self.events[self.idx_pos];
+                self.idx_pos += 1;
+                return Some(event);
+            } else {
+                return None;
+            }
+        }
+    }
+}
+
+impl<E> BlockEventStore for SimpleBlockStore<E> {
+    type EventT = E;
+    type Iter<'a>
+        = SimpleBlockStoreIter<'a, E>
+    where
+        Self: 'a,
+        E: 'a;
+
+    type IntoIter = std::vec::IntoIter<E>;
+
+    fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        SimpleBlockStoreIter {
+            events: &self.events,
+            idx_map: None,
+            idx_pos: 0,
+        }
+    }
+
+    fn account_iter(&self) -> Self::Iter<'_> {
+        SimpleBlockStoreIter {
+            events: &self.events,
+            idx_map: Some(&self.account_idx_map),
+            idx_pos: 0,
+        }
+    }
+
+    fn transaction_iter(&self) -> Self::Iter<'_> {
+        SimpleBlockStoreIter {
+            events: &self.events,
+            idx_map: Some(&self.transaction_idx_map),
+            idx_pos: 0,
+        }
+    }
+
+    fn entry_iter(&self) -> Self::Iter<'_> {
+        SimpleBlockStoreIter {
+            events: &self.events,
+            idx_map: Some(&self.entry_idx_map),
+            idx_pos: 0,
+        }
+    }
+
+    fn other_iter(&self) -> Self::Iter<'_> {
+        SimpleBlockStoreIter {
+            events: &self.events,
+            idx_map: Some(&self.other_idx_map),
+            idx_pos: 0,
+        }
+    }
+
+    fn account_len(&self) -> usize {
+        self.account_idx_map.len()
+    }
+
+    fn transaction_len(&self) -> usize {
+        self.transaction_idx_map.len()
+    }
+
+    fn entry_len(&self) -> usize {
+        self.entry_idx_map.len()
+    }
+
+    fn other_len(&self) -> usize {
+        self.other_idx_map.len()
+    }
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.events.into_iter()
+    }
+}
+
 impl<E> BlockBuffer<E> {
-    fn finish(self, slot: Slot) -> Block<E> {
+    fn finish(self, slot: Slot) -> Block<SimpleBlockStore<E>> {
         Block {
             slot,
             blockhash: self.blockhash,
-            events: self.events,
-            account_idx_map: self.account_idx_map,
-            transaction_idx_map: self.transaction_idx_map,
-            entry_idx_map: self.entry_idx_map,
-            other_idx_map: self.other_idx_map,
+            events: SimpleBlockStore {
+                slot,
+                events: self.events,
+                account_idx_map: self.account_idx_map,
+                transaction_idx_map: self.transaction_idx_map,
+                entry_idx_map: self.entry_idx_map,
+                other_idx_map: self.other_idx_map,
+            },
         }
     }
 }
@@ -374,12 +583,12 @@ impl<E> BlockBuffer<E> {
 /// An in-memory store for blocks being reconstructed.
 ///
 /// It maintains active blocks (currently being reconstructed) and frozen blocks (fully reconstructed).
-pub struct SimpleBlockCumulator<E> {
+pub struct SimpleBlockAccumulator<E> {
     active_block_map: FxHashMap<Slot, BlockBuffer<E>>,
     frozen_block_map: FxHashMap<Slot, BlockBuffer<E>>,
 }
 
-impl<E> Default for SimpleBlockCumulator<E> {
+impl<E> Default for SimpleBlockAccumulator<E> {
     fn default() -> Self {
         Self {
             active_block_map: FxHashMap::default(),
@@ -388,8 +597,9 @@ impl<E> Default for SimpleBlockCumulator<E> {
     }
 }
 
-impl<E> BlockAccumulator for SimpleBlockCumulator<E> {
+impl<E> BlockAccumulator for SimpleBlockAccumulator<E> {
     type EventT = E;
+    type EventStore = SimpleBlockStore<E>;
 
     fn add_event(&mut self, event: E, slot: Slot, ev_info: &GeyserEventInfo) {
         let block = self.active_block_map.entry(slot).or_default();
@@ -415,7 +625,7 @@ impl<E> BlockAccumulator for SimpleBlockCumulator<E> {
         self.frozen_block_map.insert(frozen_block_info.slot, block);
     }
 
-    fn finish_block(&mut self, slot: Slot) -> Option<Block<E>> {
+    fn finish_block(&mut self, slot: Slot) -> Option<Block<SimpleBlockStore<E>>> {
         let acc = self.frozen_block_map.remove(&slot)?;
         Some(acc.finish(slot))
     }
@@ -429,8 +639,11 @@ impl<E> BlockAccumulator for SimpleBlockCumulator<E> {
 #[cfg(all(test, feature = "dragonsmouth-thin"))]
 mod tests {
     use {
-        super::{BlockMachineOutput, BlockStream, SimpleBlockCumulator},
-        crate::event::GeyserEventAdapter,
+        super::{
+            BlockEventStore, BlockMachineOutput, BlockStream, PendingEvent, SimpleBlockAccumulator,
+            SimpleBlockStore,
+        },
+        crate::{event::GeyserEventAdapter, state_machine::SlotCommitmentStatusUpdate},
         futures_util::{Stream, stream},
         solana_commitment_config::CommitmentLevel,
         solana_hash::Hash,
@@ -519,7 +732,7 @@ mod tests {
         stream: &mut BlockStream<
             stream::Iter<std::vec::IntoIter<Result<SubscribeUpdate, io::Error>>>,
             SubscribeUpdate,
-            SimpleBlockCumulator<SubscribeUpdate>,
+            SimpleBlockAccumulator<SubscribeUpdate>,
         >,
         ev: SubscribeUpdate,
     ) {
@@ -539,11 +752,11 @@ mod tests {
     ) -> BlockStream<
         stream::Iter<std::vec::IntoIter<Result<SubscribeUpdate, io::Error>>>,
         SubscribeUpdate,
-        SimpleBlockCumulator<SubscribeUpdate>,
+        SimpleBlockAccumulator<SubscribeUpdate>,
     > {
         BlockStream::new(
             stream::iter(Vec::<Result<SubscribeUpdate, io::Error>>::new()),
-            SimpleBlockCumulator::default(),
+            SimpleBlockAccumulator::default(),
             min_commitment_level,
         )
     }
@@ -563,18 +776,22 @@ mod tests {
         feed(&mut bs, block_meta_update(10, 9, 1));
         feed(&mut bs, slot_update(10, Some(9), SlotStatus::SlotProcessed));
 
-        let first = bs.pending.pop_front().expect("first output");
-        let second = bs.pending.pop_front().expect("second output");
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
 
-        let BlockMachineOutput::FrozenBlock(block) = first else {
+        let first = Pin::new(&mut bs).poll_next(&mut cx);
+        let second = Pin::new(&mut bs).poll_next(&mut cx);
+
+        let Poll::Ready(Some(Ok(BlockMachineOutput::FrozenBlock(block)))) = first else {
             panic!("expected FrozenBlock first");
         };
         assert_eq!(block.slot, 10);
-        assert_eq!(block.entry_len(), 1);
-        assert_eq!(block.txn_len(), 1);
-        assert_eq!(block.account_len(), 1);
+        assert_eq!(block.events.entry_idx_map.len(), 1);
+        assert_eq!(block.events.transaction_idx_map.len(), 1);
+        assert_eq!(block.events.account_idx_map.len(), 1);
+        assert_eq!(block.events.events.len(), 3);
 
-        let BlockMachineOutput::SlotCommitmentUpdate(update) = second else {
+        let Poll::Ready(Some(Ok(BlockMachineOutput::SlotCommitmentUpdate(update)))) = second else {
             panic!("expected SlotCommitmentUpdate second");
         };
         assert_eq!(update.slot, 10);
@@ -601,31 +818,43 @@ mod tests {
             &mut bs,
             slot_update(42, Some(41), SlotStatus::SlotProcessed),
         );
-        assert!(bs.pending.is_empty());
+
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let none_after_processed = Pin::new(&mut bs).poll_next(&mut cx);
+        assert!(matches!(none_after_processed, Poll::Ready(None)));
 
         // Confirmed reaches minimum commitment and should emit both block and commitment update.
         feed(
             &mut bs,
             slot_update(42, Some(41), SlotStatus::SlotConfirmed),
         );
+
+        let first = Pin::new(&mut bs).poll_next(&mut cx);
         assert!(matches!(
-            bs.pending.pop_front(),
-            Some(BlockMachineOutput::FrozenBlock(_))
+            first,
+            Poll::Ready(Some(Ok(BlockMachineOutput::FrozenBlock(_))))
         ));
+
+        let second = Pin::new(&mut bs).poll_next(&mut cx);
         assert!(matches!(
-            bs.pending.pop_front(),
-            Some(BlockMachineOutput::SlotCommitmentUpdate(_))
+            second,
+            Poll::Ready(Some(Ok(BlockMachineOutput::SlotCommitmentUpdate(_))))
         ));
+
+        let third = Pin::new(&mut bs).poll_next(&mut cx);
+        assert!(matches!(third, Poll::Ready(None)));
     }
 
     #[test]
     fn stream_forwards_source_error_and_end_of_stream() {
         let source = stream::iter(vec![Err::<SubscribeUpdate, _>(io::Error::other("boom"))]);
-        let mut bs = BlockStream::<_, SubscribeUpdate, SimpleBlockCumulator<SubscribeUpdate>>::new(
-            source,
-            SimpleBlockCumulator::default(),
-            CommitmentLevel::Processed,
-        );
+        let mut bs =
+            BlockStream::<_, SubscribeUpdate, SimpleBlockAccumulator<SubscribeUpdate>>::new(
+                source,
+                SimpleBlockAccumulator::default(),
+                CommitmentLevel::Processed,
+            );
         let waker = futures_util::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
 
@@ -633,11 +862,88 @@ mod tests {
         assert!(matches!(first, Poll::Ready(Some(Err(_)))));
 
         let source = stream::iter(Vec::<Result<SubscribeUpdate, io::Error>>::new());
-        let mut bs = BlockStream::<_, SubscribeUpdate, SimpleBlockCumulator<SubscribeUpdate>>::new(
-            source,
-            SimpleBlockCumulator::default(),
-            CommitmentLevel::Processed,
-        );
+        let mut bs =
+            BlockStream::<_, SubscribeUpdate, SimpleBlockAccumulator<SubscribeUpdate>>::new(
+                source,
+                SimpleBlockAccumulator::default(),
+                CommitmentLevel::Processed,
+            );
+        let second = Pin::new(&mut bs).poll_next(&mut cx);
+        assert!(matches!(second, Poll::Ready(None)));
+    }
+
+    #[test]
+    fn simple_block_store_empty_iterators_are_empty() {
+        let store = SimpleBlockStore::<u64> {
+            slot: 99,
+            events: Vec::new(),
+            account_idx_map: Vec::new(),
+            transaction_idx_map: Vec::new(),
+            entry_idx_map: Vec::new(),
+            other_idx_map: Vec::new(),
+        };
+
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.account_len(), 0);
+        assert_eq!(store.transaction_len(), 0);
+        assert_eq!(store.entry_len(), 0);
+        assert_eq!(store.other_len(), 0);
+        assert_eq!(store.iter().count(), 0);
+        assert_eq!(store.account_iter().count(), 0);
+        assert_eq!(store.transaction_iter().count(), 0);
+        assert_eq!(store.entry_iter().count(), 0);
+        assert_eq!(store.other_iter().count(), 0);
+    }
+
+    #[test]
+    fn simple_block_store_partition_iterators_return_expected_events() {
+        let store = SimpleBlockStore {
+            slot: 7,
+            events: vec![10_u64, 11, 12, 13, 14],
+            account_idx_map: vec![1, 4],
+            transaction_idx_map: vec![0, 3],
+            entry_idx_map: vec![2],
+            other_idx_map: vec![4],
+        };
+
+        let all: Vec<u64> = store.iter().copied().collect();
+        let accounts: Vec<u64> = store.account_iter().copied().collect();
+        let txs: Vec<u64> = store.transaction_iter().copied().collect();
+        let entries: Vec<u64> = store.entry_iter().copied().collect();
+        let others: Vec<u64> = store.other_iter().copied().collect();
+
+        assert_eq!(all, vec![10, 11, 12, 13, 14]);
+        assert_eq!(accounts, vec![11, 14]);
+        assert_eq!(txs, vec![10, 13]);
+        assert_eq!(entries, vec![12]);
+        assert_eq!(others, vec![14]);
+    }
+
+    #[test]
+    fn skips_missing_frozen_block_and_emits_following_commitment_update() {
+        let mut bs = empty_source_stream(CommitmentLevel::Processed);
+
+        // Simulate a pending FrozenBlock for a slot that no longer exists in storage,
+        // followed by a valid commitment update for the same slot.
+        bs.pending.push_back(PendingEvent::FrozenBlock(77));
+        bs.pending.push_back(PendingEvent::SlotCommitmentUpdate(
+            SlotCommitmentStatusUpdate {
+                parent_slot: Some(76),
+                slot: 77,
+                commitment: CommitmentLevel::Processed,
+            },
+        ));
+
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+
+        let first = Pin::new(&mut bs).poll_next(&mut cx);
+        assert!(matches!(
+            first,
+            Poll::Ready(Some(Ok(BlockMachineOutput::SlotCommitmentUpdate(_))))
+        ));
+
         let second = Pin::new(&mut bs).poll_next(&mut cx);
         assert!(matches!(second, Poll::Ready(None)));
     }

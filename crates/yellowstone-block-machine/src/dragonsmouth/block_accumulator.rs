@@ -3,7 +3,7 @@ use {
         dragonsmouth::RESERVED_FILTER_NAME,
         event::GeyserEventInfo,
         state_machine::FrozenBlock,
-        stream::{Block, BlockAccumulator},
+        stream::{Block, BlockAccumulator, SimpleBlockStore},
     },
     rustc_hash::FxHashMap,
     solana_clock::Slot,
@@ -35,15 +35,18 @@ impl<E> Default for BlockBuffer<E> {
 }
 
 impl<E> BlockBuffer<E> {
-    fn finish(self, slot: Slot) -> Block<E> {
+    fn finish(self, slot: Slot) -> Block<SimpleBlockStore<E>> {
         Block {
             slot,
             blockhash: self.blockhash,
-            events: self.events,
-            account_idx_map: self.account_idx_map,
-            transaction_idx_map: self.transaction_idx_map,
-            entry_idx_map: self.entry_idx_map,
-            other_idx_map: self.other_idx_map,
+            events: SimpleBlockStore {
+                events: self.events,
+                account_idx_map: self.account_idx_map,
+                transaction_idx_map: self.transaction_idx_map,
+                entry_idx_map: self.entry_idx_map,
+                other_idx_map: self.other_idx_map,
+                slot,
+            },
         }
     }
 }
@@ -60,6 +63,7 @@ pub struct DragonsmouthBlockCumulator {
 
 impl BlockAccumulator for DragonsmouthBlockCumulator {
     type EventT = SubscribeUpdate;
+    type EventStore = SimpleBlockStore<SubscribeUpdate>;
 
     fn add_event(&mut self, mut event: SubscribeUpdate, slot: Slot, ev_info: &GeyserEventInfo) {
         let block = self.active_block_map.entry(slot).or_default();
@@ -104,7 +108,7 @@ impl BlockAccumulator for DragonsmouthBlockCumulator {
         self.frozen_block_map.insert(frozen_block_info.slot, block);
     }
 
-    fn finish_block(&mut self, slot: Slot) -> Option<Block<SubscribeUpdate>> {
+    fn finish_block(&mut self, slot: Slot) -> Option<Block<Self::EventStore>> {
         let acc = self.frozen_block_map.remove(&slot)?;
         Some(acc.finish(slot))
     }
