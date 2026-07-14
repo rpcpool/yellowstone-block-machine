@@ -135,13 +135,12 @@ impl Block {
     }
 
     fn freeze(self, summary: &BlockSummary) -> FrozenBlock {
-        let fb = FrozenBlock {
+        FrozenBlock {
             slot: self.slot,
             entries: self.entries.values().cloned().collect(),
             blockhash: summary.blockhash,
             parent_slot: summary.parent_slot,
-        };
-        fb
+        }
     }
 
     fn can_be_optimistic_frozen(&self) -> bool {
@@ -766,23 +765,27 @@ impl BlocksStateMachine {
             // Check if we can freeze the block : we must have some entry to compute the block hash.
             if let Some(block) = self.block_buffer_map.get(&slot) {
                 let parent_slot = self.forks.get_parent(&slot);
-                if block.can_be_optimistic_frozen() && parent_slot.is_some() {
-                    let parent_slot = parent_slot.unwrap();
-                    let forged_block_summary = block.forge_optimistic_block_summary(parent_slot);
-                    tracing::warn!(
-                        "Recoverd block summary for slot {}: {:?}",
-                        slot,
-                        forged_block_summary
-                    );
-                    self.handle_block_summary(forged_block_summary)
-                        .expect("untracked");
-                } else {
-                    tracing::error!(
-                        "Cannot optimistically freeze slot {} because it has no entries",
-                        slot
-                    );
-                    self.remove_slot_references_in_state(slot);
-                    self.push_to_dlq(DeadletterEvent::Incomplete(slot));
+
+                match (block.can_be_optimistic_frozen(), parent_slot) {
+                    (true, Some(parent_slot)) => {
+                        let forged_block_summary =
+                            block.forge_optimistic_block_summary(parent_slot);
+                        tracing::warn!(
+                            "Recoverd block summary for slot {}: {:?}",
+                            slot,
+                            forged_block_summary
+                        );
+                        self.handle_block_summary(forged_block_summary)
+                            .expect("untracked");
+                    }
+                    _ => {
+                        tracing::error!(
+                            "Cannot optimistically freeze slot {} because it has no entries",
+                            slot
+                        );
+                        self.remove_slot_references_in_state(slot);
+                        self.push_to_dlq(DeadletterEvent::Incomplete(slot));
+                    }
                 }
             }
         }

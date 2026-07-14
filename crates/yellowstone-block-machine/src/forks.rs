@@ -123,7 +123,7 @@ where
     ///
     /// Returns an iterator over the keys in the set.
     ///
-    pub fn iter(&self) -> OrderedSetIter<K> {
+    pub fn iter(&self) -> OrderedSetIter<'_, K> {
         OrderedSetIter {
             ordered_set: self,
             next_index: 0,
@@ -402,7 +402,7 @@ where
                 self.forked_slots.remove(&slot);
 
                 if let Some(children) = self.parent_children_map.remove(&slot) {
-                    queue.extend(children.into_iter());
+                    queue.extend(children);
                 }
             }
 

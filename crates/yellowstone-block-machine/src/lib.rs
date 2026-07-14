@@ -24,20 +24,33 @@
 //! It emits `BlockStateMachineOutput` values, including frozen blocks, slot status updates, and
 //! fork/dead-slot signals.
 //!
+//! # Wire-format independence
+//!
+//! [`stream::BlockStream`] and [`wrapper::BlocksStateMachineWrapper`] are generic over any
+//! [`event::GeyserEventAdapter`] — they do not depend on any specific version of
+//! `yellowstone-grpc-proto`. This crate ships an implementation of [`event::GeyserEventAdapter`] for
+//! `yellowstone_grpc_proto::geyser::SubscribeUpdate` behind the `dragonsmouth-thin` feature; if your
+//! project is pinned to a different major version of `yellowstone-grpc-proto` (or another Geyser
+//! wire format entirely), implement [`event::GeyserEventAdapter`] on your own (possibly zero-sized)
+//! marker type instead of enabling that feature — the implementing type doesn't have to be the
+//! event type itself, which keeps this legal under Rust's orphan rules even when neither the trait
+//! nor the event type is local to your crate — and reuse the reconstruction machinery unchanged.
+//!
 //! # Dragonsmouth integration
 //!
 //! With the Dragonsmouth integration enabled, you can consume a typed stream of:
-//! - `BlockMachineOutput::FrozenBlock`,
-//! - `BlockMachineOutput::SlotCommitmentUpdate`,
-//! - `BlockMachineOutput::ForkDetected`,
-//! - `BlockMachineOutput::DeadBlockDetect`.
+//! - `BlockStreamEvent::FrozenBlock`,
+//! - `BlockStreamEvent::SlotCommitmentUpdate`,
+//! - `BlockStreamEvent::ForkDetected`,
+//! - `BlockStreamEvent::DeadBlockDetected`.
 //!
 //! High-level example:
 //!
-//! ```ignore
+//! ```no_run
 //! use futures_util::StreamExt;
-//! use yellowstone_block_machine::dragonsmouth::client_ext::{
-//!     BlockMachineOutput, GeyserGrpcExt,
+//! use yellowstone_block_machine::{
+//!     dragonsmouth::client_ext::{BlockStreamEvent, GeyserGrpcExt},
+//!     stream::BlockEventStore,
 //! };
 //! use yellowstone_grpc_client::GeyserGrpcBuilder;
 //! use yellowstone_grpc_proto::geyser::{CommitmentLevel, SubscribeRequest};
@@ -51,16 +64,21 @@
 //!
 //!     while let Some(item) = stream.next().await {
 //!         match item.expect("stream item") {
-//!             BlockMachineOutput::FrozenBlock(block) => {
-//!                 let _ = (block.slot, block.txn_len(), block.account_len(), block.entry_len());
+//!             BlockStreamEvent::FrozenBlock(block) => {
+//!                 let _ = (
+//!                     block.slot(),
+//!                     block.transaction_len(),
+//!                     block.account_len(),
+//!                     block.entry_len(),
+//!                 );
 //!             }
-//!             BlockMachineOutput::SlotCommitmentUpdate(update) => {
+//!             BlockStreamEvent::SlotCommitmentUpdate(update) => {
 //!                 let _ = (update.slot, update.commitment);
 //!             }
-//!             BlockMachineOutput::ForkDetected(fork) => {
+//!             BlockStreamEvent::ForkDetected(fork) => {
 //!                 let _ = fork.slot;
 //!             }
-//!             BlockMachineOutput::DeadBlockDetect(dead) => {
+//!             BlockStreamEvent::DeadBlockDetected(dead) => {
 //!                 let _ = dead.slot;
 //!             }
 //!         }
@@ -70,14 +88,24 @@
 //!
 //! # Feature flags
 //!
-//! - `dragonsmouth-thin`: Enables the dragonsmouth module (`stream` + `wrapper`) for custom drivers.
+//! - `dragonsmouth-thin`: Enables the bundled [`event::GeyserEventAdapter`] impl for
+//!   `yellowstone_grpc_proto::geyser::SubscribeUpdate` and re-exports `yellowstone_grpc_proto`.
+//!   Not required if you implement [`event::GeyserEventAdapter`] yourself.
 //! - `dragonsmouth`: Enables `client_ext` helpers on top of `dragonsmouth-thin`, including
-//!   `GeyserGrpcExt::subscribe_block`.
+//!   `GeyserGrpcExt::subscribe_block`, and re-exports `yellowstone_grpc_client`.
 //!
 //! If you are integrating with Yellowstone gRPC directly, `dragonsmouth` is the easiest starting point.
-#[cfg(feature = "dragonsmouth-thin")]
+#[cfg(any(feature = "dragonsmouth", feature = "dragonsmouth-thin"))]
 pub mod dragonsmouth;
+pub mod event;
 pub mod forks;
 pub mod state_machine;
+pub mod stream;
 #[cfg(test)]
 pub mod testkit;
+pub mod wrapper;
+
+#[cfg(feature = "dragonsmouth")]
+pub use yellowstone_grpc_client;
+#[cfg(feature = "dragonsmouth-thin")]
+pub use yellowstone_grpc_proto;

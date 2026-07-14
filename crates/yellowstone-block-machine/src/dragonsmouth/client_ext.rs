@@ -1,21 +1,138 @@
 use {
-    crate::dragonsmouth::{stream::BlockStream, wrapper::RESERVED_FILTER_NAME},
+    crate::{
+        dragonsmouth::{RESERVED_FILTER_NAME, block_accumulator::DragonsmouthBlockCumulator},
+        state_machine::{DeadBlockDetected, ForkDetected, SlotCommitmentStatusUpdate},
+        stream::{
+            Block, BlockEventStore, BlockMachineOutput, BlockStream, SimpleBlockStore,
+            SimpleBlockStoreIter,
+        },
+    },
+    futures_util::Stream,
+    solana_clock::Slot,
     solana_commitment_config::CommitmentLevel,
+    std::task::ready,
     tonic::async_trait,
     yellowstone_grpc_client::{GeyserGrpcClient, GeyserGrpcClientError, GeyserStream},
     yellowstone_grpc_proto::geyser::{
         CommitmentLevel as ProtoCommitmentLevel, SubscribeRequest, SubscribeRequestFilterSlots,
+        SubscribeUpdate,
     },
 };
 
-pub type GeyserBlockStream = BlockStream<GeyserStream>;
+///
+/// A stream of [`BlockStreamEvent`] events produced by the block machine, adapted to the `SubscribeUpdate` type used by the gRPC client.
+pub struct DragonsmouthBlockStream {
+    inner: BlockStream<GeyserStream, SubscribeUpdate, DragonsmouthBlockCumulator>,
+}
+
+pub struct DragonsmouthBlock {
+    inner: Block<SimpleBlockStore<SubscribeUpdate>>,
+}
+
+impl DragonsmouthBlock {
+    pub fn slot(&self) -> Slot {
+        self.inner.slot
+    }
+}
+
+impl From<Block<SimpleBlockStore<SubscribeUpdate>>> for DragonsmouthBlock {
+    fn from(block: Block<SimpleBlockStore<SubscribeUpdate>>) -> Self {
+        Self { inner: block }
+    }
+}
+
+impl BlockEventStore for DragonsmouthBlock {
+    type EventT = SubscribeUpdate;
+
+    type Iter<'a> = SimpleBlockStoreIter<'a, SubscribeUpdate>;
+
+    type IntoIter = std::vec::IntoIter<SubscribeUpdate>;
+
+    fn len(&self) -> usize {
+        self.inner.as_ref().len()
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        self.inner.as_ref().iter()
+    }
+
+    fn account_iter(&self) -> Self::Iter<'_> {
+        self.inner.as_ref().account_iter()
+    }
+
+    fn transaction_iter(&self) -> Self::Iter<'_> {
+        self.inner.as_ref().transaction_iter()
+    }
+
+    fn entry_iter(&self) -> Self::Iter<'_> {
+        self.inner.as_ref().entry_iter()
+    }
+
+    fn other_iter(&self) -> Self::Iter<'_> {
+        self.inner.as_ref().other_iter()
+    }
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.inner.events.into_iter()
+    }
+}
+
+pub enum BlockStreamEvent {
+    ///
+    /// A fully reconstructed block, ready for processing.
+    ///
+    FrozenBlock(DragonsmouthBlock),
+    ///
+    /// An update to the commitment status of a slot, indicating whether it has been confirmed, finalized, or is still in progress.
+    SlotCommitmentUpdate(SlotCommitmentStatusUpdate),
+    ///
+    /// A fork has been detected in the blockchain, indicating that a previously accepted block has been replaced by a different block at the same slot.
+    ForkDetected(ForkDetected),
+    ///
+    /// A dead block has been detected, indicating that a block is no longer part of the canonical chain and should be discarded.
+    DeadBlockDetected(DeadBlockDetected),
+}
+
+impl Stream for DragonsmouthBlockStream {
+    type Item = Result<BlockStreamEvent, BlockMachineError>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.inner) };
+        let poll = ready!(inner.poll_next(cx));
+        match poll {
+            Some(Ok(output)) => {
+                let output2 = match output {
+                    BlockMachineOutput::FrozenBlock(block) => {
+                        let block2 = DragonsmouthBlock::from(block);
+                        BlockStreamEvent::FrozenBlock(block2)
+                    }
+                    BlockMachineOutput::SlotCommitmentUpdate(slot_commitment_status_update) => {
+                        BlockStreamEvent::SlotCommitmentUpdate(slot_commitment_status_update)
+                    }
+                    BlockMachineOutput::ForkDetected(fork_detected) => {
+                        BlockStreamEvent::ForkDetected(fork_detected)
+                    }
+                    BlockMachineOutput::DeadBlockDetected(dead_block_detected) => {
+                        BlockStreamEvent::DeadBlockDetected(dead_block_detected)
+                    }
+                };
+                std::task::Poll::Ready(Some(Ok(output2)))
+            }
+            Some(Err(e)) => std::task::Poll::Ready(Some(Err(BlockMachineError::GrpcError(e)))),
+            None => std::task::Poll::Ready(None),
+        }
+    }
+}
 
 #[async_trait]
 pub trait GeyserGrpcExt {
     async fn subscribe_block(
         &mut self,
         subscribe_request: SubscribeRequest,
-    ) -> Result<GeyserBlockStream, GeyserGrpcClientError>;
+    ) -> Result<DragonsmouthBlockStream, GeyserGrpcClientError>;
 }
 
 pub const DEFAULT_SUBSCRIBE_BLOCK_CHANNEL_CAPACITY: usize = 1_000_000;
@@ -45,7 +162,7 @@ impl GeyserGrpcExt for GeyserGrpcClient {
     async fn subscribe_block(
         &mut self,
         mut subscribe_request: SubscribeRequest,
-    ) -> Result<GeyserBlockStream, GeyserGrpcClientError> {
+    ) -> Result<DragonsmouthBlockStream, GeyserGrpcClientError> {
         let proto_commitment_level =
             ProtoCommitmentLevel::try_from(subscribe_request.commitment.unwrap_or(0))
                 .expect("Invalid commitment level in subscribe request");
@@ -84,6 +201,11 @@ impl GeyserGrpcExt for GeyserGrpcClient {
 
         let (_sink, source) = self.subscribe_with_request(Some(subscribe_request)).await?;
 
-        Ok(BlockStream::new(source, commitment_level))
+        let block_stream = BlockStream::new(source, Default::default(), commitment_level);
+        let dragonsmouth_block_stream = DragonsmouthBlockStream {
+            inner: block_stream,
+        };
+
+        Ok(dragonsmouth_block_stream)
     }
 }
