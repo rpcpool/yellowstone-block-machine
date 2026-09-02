@@ -403,6 +403,7 @@ dependencies = [
 name = "dragonsmouth"
 version = "0.1.0"
 dependencies = [
+ "bs58",
  "clap",
  "common_macros",
  "futures-util",

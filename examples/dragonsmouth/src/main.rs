@@ -12,7 +12,6 @@ use {
         dragonsmouth::client_ext::{
             BlockStreamEvent, DragonsmouthBlock, DragonsmouthBlockStream, GeyserGrpcExt,
         },
-        stream::BlockEventStore,
     },
     yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcBuilder},
     yellowstone_grpc_proto::geyser::{
@@ -20,6 +19,13 @@ use {
     },
 };
 
+/// Installs the process-global tracing subscriber for this example binary: ANSI-colored,
+/// line-numbered output filtered by the `RUST_LOG` environment variable (or its default filter
+/// if unset).
+///
+/// # Panics
+///
+/// Panics if a global tracing subscriber has already been installed.
 pub fn init_tracing() {
     let io_layer = tracing_subscriber::fmt::layer()
         .with_ansi(true)
@@ -33,6 +39,20 @@ pub fn init_tracing() {
         .expect("tracing init");
 }
 
+/// Cross-checks that every `Account` update's transaction signature (when it has one) also
+/// shows up among the `Transaction` updates in the same block.
+///
+/// # Arguments
+///
+/// * `block` - The [`DragonsmouthBlock`] to scan. Taken by value since matching every event
+///   inside it requires owning them.
+///
+/// # Panics
+///
+/// Panics if an `Account` update carries no
+/// [`SubscribeUpdateAccountInfo`](yellowstone_grpc_proto::geyser::SubscribeUpdateAccountInfo),
+/// if an account's or a transaction's signature bytes don't form a valid [`Signature`], or if an
+/// account update's transaction signature never appears among the block's transaction updates.
 fn cross_check_account_txn_join(block: DragonsmouthBlock) {
     let mut account_txn_sig_set: HashSet<Signature> = HashSet::new();
     let mut txn_sig_index_map: HashMap<Signature, u64> = HashMap::new();
@@ -66,6 +86,7 @@ fn cross_check_account_txn_join(block: DragonsmouthBlock) {
     }
 }
 
+/// Command-line arguments for this example binary.
 #[derive(Debug, clap::Parser)]
 #[clap(
     author,
@@ -73,21 +94,45 @@ fn cross_check_account_txn_join(block: DragonsmouthBlock) {
     about = "Yellowstone Block Machine with Dragonsmouth Extension Example"
 )]
 struct Args {
+    /// Path to a YAML file deserializable as [`Config`].
     #[clap(long)]
     config: PathBuf,
+    /// How many [`BlockStreamEvent::FrozenBlock`] events to print before [`process_block`]
+    /// stops.
     #[clap(short, long, default_value_t = 10)]
     samples: usize,
+    /// If set, suppresses printing [`BlockStreamEvent::SlotCommitmentUpdate`] events.
     #[clap(long)]
     no_slot_commitment_updates: bool,
 }
 
+/// Geyser gRPC endpoint configuration, loaded from the YAML file named by [`Args::config`].
 #[derive(Debug, Clone, serde::Deserialize)]
 struct Config {
+    /// The gRPC endpoint URL to connect to.
     endpoint: String,
+    /// Optional `x-token` metadata value used to authenticate with `endpoint`.
     #[serde(alias = "x-token")]
     x_token: Option<String>,
 }
 
+/// Drives a [`DragonsmouthBlockStream`] to completion, writing one human-readable line per
+/// event it yields, until `sample` [`BlockStreamEvent::FrozenBlock`] events have been printed,
+/// the stream ends, or it yields an error.
+///
+/// # Arguments
+///
+/// * `block_stream` - The [`DragonsmouthBlockStream`] to poll for events.
+/// * `sample` - How many [`BlockStreamEvent::FrozenBlock`] events to print before stopping.
+/// * `slot_commitment_updates` - Whether to also print [`BlockStreamEvent::SlotCommitmentUpdate`]
+///   events.
+/// * `out` - Destination for the printed output.
+///
+/// # Panics
+///
+/// Panics if writing to `out` fails, or if a frozen block's transaction count (summed across its
+/// entries) doesn't match the number of `Transaction` updates actually observed for it -- see
+/// [`cross_check_account_txn_join`] for the other consistency check run on each block.
 async fn process_block<W>(
     mut block_stream: DragonsmouthBlockStream,
     sample: usize,
@@ -102,25 +147,32 @@ async fn process_block<W>(
             Ok(output) => match output {
                 BlockStreamEvent::FrozenBlock(block) => {
                     let slot = block.slot();
-                    let account_cnt = block.account_len();
-                    let txn_cnt = block.transaction_len();
-                    let entry_cnt = block.entry_len();
-                    let entry_txn_cnt: u64 = block
-                        .entry_iter()
-                        .filter_map(|ev| match ev.update_oneof.as_ref() {
+                    let bank_id = block.bank_id();
+
+                    let mut account_cnt = 0u64;
+                    let mut txn_cnt = 0u64;
+                    let mut entry_cnt = 0u64;
+                    let mut entry_txn_cnt = 0u64;
+                    for ev in block.iter() {
+                        match ev.update_oneof.as_ref() {
+                            Some(UpdateOneof::Account(_)) => account_cnt += 1,
+                            Some(UpdateOneof::Transaction(_)) => txn_cnt += 1,
                             Some(UpdateOneof::Entry(entry)) => {
-                                Some(entry.executed_transaction_count)
+                                entry_cnt += 1;
+                                entry_txn_cnt += entry.executed_transaction_count;
                             }
-                            _ => None,
-                        })
-                        .sum();
+                            _ => {}
+                        }
+                    }
                     assert_eq!(
-                        entry_txn_cnt, txn_cnt as u64,
+                        entry_txn_cnt, txn_cnt,
                         "slot {}: sum of transaction count across entries ({}) must equal transactions received ({})",
                         slot, entry_txn_cnt, txn_cnt
                     );
-                    let bank_id = block.bank_id();
-                    writeln!(out, "Block ({i}) {slot}, bank_id: {bank_id}, txn: {txn_cnt}, account: {account_cnt}, entry: {entry_cnt}").expect("write");
+                    let parent_slot = block.parent_slot();
+                    let parent_blockhash = bs58::encode(block.parent_blockhash()).into_string();
+
+                    writeln!(out, "Block ({i}) {slot}, bank_id: {bank_id}, txn: {txn_cnt}, account: {account_cnt}, entry: {entry_cnt}, parent_slot: {parent_slot}, parent hash: {parent_blockhash}").expect("write");
                     cross_check_account_txn_join(block);
                     i += 1;
                 }
@@ -155,6 +207,16 @@ async fn process_block<W>(
     }
 }
 
+/// Entry point: parses [`Args`], loads the [`Config`] it points to, connects to the configured
+/// Geyser endpoint, subscribes to blocks via
+/// [`GeyserGrpcExt::subscribe_block`],
+/// and hands the resulting stream to [`process_block`].
+///
+/// # Panics
+///
+/// Panics if the config file named by [`Args::config`] can't be opened or parsed as [`Config`],
+/// if the endpoint can't be reached, TLS/auth can't be configured, or the block subscription
+/// fails, or (transitively) on any of the panic conditions documented on [`process_block`].
 #[tokio::main]
 async fn main() {
     init_tracing();

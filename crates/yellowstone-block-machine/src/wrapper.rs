@@ -179,14 +179,14 @@ impl BlocksStateMachineWrapper {
             GeyserEventInfo::Slot(slot_update) => self.handle_slot_update(slot_update),
             GeyserEventInfo::BlockMeta(block_meta) => self.handle_block_meta(block_meta),
             GeyserEventInfo::Entry(entry) => self.handle_block_entry(entry),
-            GeyserEventInfo::Transaction { bank_id, .. }
-            |
-            GeyserEventInfo::Account { bank_id, .. } => match bank_id {
-                Some(bank_id) if self.sm.is_bank_trackable(bank_id) => Ok(()),
-                _ => Err(UntrackedSlot),
-            },
-            // Not bank-scoped, and not used by block reconstruction -- always pass through.
-            GeyserEventInfo::Other { .. } => Ok(()),
+            GeyserEventInfo::BankData { bank_id, .. }
+            | GeyserEventInfo::SysvarAccount { bank_id, .. } => {
+                if self.sm.is_bank_trackable(bank_id) {
+                    Ok(())
+                } else {
+                    Err(UntrackedSlot)
+                }
+            }
         }
     }
 }

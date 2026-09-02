@@ -3,14 +3,14 @@ use {
         dragonsmouth::RESERVED_FILTER_NAME,
         event::{GeyserEventInfo, SlotStatusKind},
         state_machine::FrozenBlock,
-        stream::{Block, BlockAccumulator, SimpleBlockStore},
+        stream::{Block, BlockAccumulator, BlockEventStore},
     },
     rustc_hash::FxHashMap,
     solana_clock::{BankId, Slot},
     solana_hash::HASH_BYTES,
     solana_pubkey::Pubkey,
     std::collections::VecDeque,
-    yellowstone_grpc_proto::geyser::SubscribeUpdate,
+    yellowstone_grpc_proto::geyser::{SubscribeUpdate, subscribe_update::UpdateOneof},
 };
 
 // Sysvars a bank must be observed to have written before its block is considered complete.
@@ -49,15 +49,15 @@ struct PendingFreeze {
 }
 
 #[derive(Debug)]
-struct BlockBuffer<E> {
+pub struct BankBuffer {
     slot: Slot,
     bank_id: BankId,
     blockhash: [u8; HASH_BYTES],
-    events: Vec<E>,
+    events: Vec<SubscribeUpdate>,
     account_idx_map: Vec<usize>,
     transaction_idx_map: Vec<usize>,
+    transaction_status_map: Vec<usize>,
     entry_idx_map: Vec<usize>,
-    other_idx_map: Vec<usize>,
     created_bank_seen: bool,
     sysvar_bitmask: u8,
     // Every Entry observed for this bank, regardless of whether the client's own subscription
@@ -72,7 +72,34 @@ struct BlockBuffer<E> {
     blocktime_unix_ts: u64,
 }
 
-impl<E> BlockBuffer<E> {
+impl BlockEventStore for BankBuffer {
+    type EventT = SubscribeUpdate;
+
+    type Iter<'a> = std::slice::Iter<'a, Self::EventT>;
+
+    type IntoIter = std::vec::IntoIter<Self::EventT>;
+
+    fn len(&self) -> usize {
+        self.account_idx_map.len()
+            + self.transaction_idx_map.len()
+            + self.transaction_status_map.len()
+            + self.entry_idx_map.len()
+    }
+
+    fn blockhash(&self) -> [u8; HASH_BYTES] {
+        self.blockhash
+    }
+
+    fn iter(&self) -> Self::Iter<'_> {
+        self.events.iter()
+    }
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.events.into_iter()
+    }
+}
+
+impl BankBuffer {
     fn new(bank_id: BankId, slot: Slot) -> Self {
         Self {
             slot,
@@ -82,7 +109,7 @@ impl<E> BlockBuffer<E> {
             account_idx_map: Vec::new(),
             transaction_idx_map: Vec::new(),
             entry_idx_map: Vec::new(),
-            other_idx_map: Vec::new(),
+            transaction_status_map: Vec::new(),
             created_bank_seen: false,
             sysvar_bitmask: 0,
             entries_seen: 0,
@@ -108,28 +135,6 @@ impl<E> BlockBuffer<E> {
             && self.sysvar_bitmask == MUST_HAVE_SYSVAR_ACCOUNTS_MASK
             && self.entries_seen >= pending.entries_count
     }
-
-    fn finish(self) -> Block<SimpleBlockStore<E>> {
-        Block {
-            slot: self.slot,
-            bank_id: self.bank_id,
-            blockhash: self.blockhash,
-            entry_count: self.entry_count,
-            executed_transaction_count: self.executed_transaction_count,
-            parent_slot: self.parent_slot,
-            parent_blockhash: self.parent_blockhash,
-            blocktime_unix_ts: self.blocktime_unix_ts,
-            events: SimpleBlockStore {
-                blockhash: self.blockhash,
-                events: self.events,
-                account_idx_map: self.account_idx_map,
-                transaction_idx_map: self.transaction_idx_map,
-                entry_idx_map: self.entry_idx_map,
-                other_idx_map: self.other_idx_map,
-                slot: self.slot,
-            },
-        }
-    }
 }
 
 ///
@@ -143,8 +148,8 @@ impl<E> BlockBuffer<E> {
 /// sysvars in particular) can genuinely still be in flight when it shows up.
 #[derive(Default)]
 pub struct DragonsmouthBlockCumulator {
-    active_block_map: FxHashMap<BankId, BlockBuffer<SubscribeUpdate>>,
-    frozen_block_map: FxHashMap<BankId, BlockBuffer<SubscribeUpdate>>,
+    active_bank_map: FxHashMap<BankId, BankBuffer>,
+    frozen_bank_map: FxHashMap<BankId, BankBuffer>,
     newly_sealed: VecDeque<BankId>,
 }
 
@@ -154,14 +159,14 @@ impl DragonsmouthBlockCumulator {
     /// complete. Safe to call after any event that could plausibly have completed it.
     ///
     fn try_seal(&mut self, bank_id: BankId) {
-        let Some(block) = self.active_block_map.get(&bank_id) else {
+        let Some(block) = self.active_bank_map.get(&bank_id) else {
             return;
         };
         if !block.is_complete() {
             return;
         }
         let mut block = self
-            .active_block_map
+            .active_bank_map
             .remove(&bank_id)
             .expect("just checked present");
         let pending = block
@@ -174,14 +179,14 @@ impl DragonsmouthBlockCumulator {
         block.parent_slot = pending.parent_slot;
         block.parent_blockhash = pending.parent_blockhash;
         block.blocktime_unix_ts = pending.block_time;
-        self.frozen_block_map.insert(bank_id, block);
+        self.frozen_bank_map.insert(bank_id, block);
         self.newly_sealed.push_back(bank_id);
     }
 }
 
 impl BlockAccumulator for DragonsmouthBlockCumulator {
     type EventT = SubscribeUpdate;
-    type EventStore = SimpleBlockStore<SubscribeUpdate>;
+    type EventStore = BankBuffer;
 
     fn add_event(
         &mut self,
@@ -191,9 +196,9 @@ impl BlockAccumulator for DragonsmouthBlockCumulator {
     ) {
         let slot = ev_info.slot();
         let block = self
-            .active_block_map
+            .active_bank_map
             .entry(bank_id)
-            .or_insert_with(|| BlockBuffer::new(bank_id, slot));
+            .or_insert_with(|| BankBuffer::new(bank_id, slot));
 
         // Tracked unconditionally, regardless of whether the event below ends up being visible
         // to the client -- completeness must not depend on what the client's own subscription
@@ -202,7 +207,7 @@ impl BlockAccumulator for DragonsmouthBlockCumulator {
             GeyserEventInfo::Slot(update) if update.status == SlotStatusKind::CreatedBank => {
                 block.created_bank_seen = true;
             }
-            GeyserEventInfo::Account { pubkey, .. } => {
+            GeyserEventInfo::SysvarAccount { pubkey, .. } => {
                 if let Some(pos) = MUST_HAVE_SYSVAR_ACCOUNTS
                     .iter()
                     .position(|sysvar| sysvar.to_bytes() == *pubkey)
@@ -224,7 +229,7 @@ impl BlockAccumulator for DragonsmouthBlockCumulator {
             GeyserEventInfo::Slot(_)
             | GeyserEventInfo::BlockMeta(_)
             | GeyserEventInfo::Entry(_)
-            | GeyserEventInfo::Account { .. } => {
+            | GeyserEventInfo::SysvarAccount { .. } => {
                 event.filters.retain(|f| f != RESERVED_FILTER_NAME);
 
                 if event.filters.is_empty() {
@@ -239,10 +244,28 @@ impl BlockAccumulator for DragonsmouthBlockCumulator {
 
         let idx = block.events.len();
         match ev_info {
-            GeyserEventInfo::Account { .. } => block.account_idx_map.push(idx),
-            GeyserEventInfo::Transaction { .. } => block.transaction_idx_map.push(idx),
+            GeyserEventInfo::SysvarAccount { .. } => block.account_idx_map.push(idx),
+            GeyserEventInfo::BankData { .. } => {
+                let Some(ev) = event.update_oneof.as_ref() else {
+                    return;
+                };
+                match ev {
+                    UpdateOneof::Account(_) => {
+                        block.account_idx_map.push(idx);
+                    }
+                    UpdateOneof::Transaction(_) => {
+                        block.transaction_idx_map.push(idx);
+                    }
+                    UpdateOneof::TransactionStatus(_) => {
+                        block.transaction_status_map.push(idx);
+                    }
+                    _ => {
+                        let discriminant = std::mem::discriminant(ev);
+                        tracing::warn!("dropping event {:?}", discriminant);
+                    }
+                }
+            }
             GeyserEventInfo::Entry(_) => block.entry_idx_map.push(idx),
-            GeyserEventInfo::Other { .. } => block.other_idx_map.push(idx),
             _ => {
                 //block meta and slot are ignored
                 self.try_seal(bank_id);
@@ -254,7 +277,7 @@ impl BlockAccumulator for DragonsmouthBlockCumulator {
     }
 
     fn freeze_block(&mut self, frozen_block_info: FrozenBlock) {
-        let Some(block) = self.active_block_map.get_mut(&frozen_block_info.bank_id) else {
+        let Some(block) = self.active_bank_map.get_mut(&frozen_block_info.bank_id) else {
             // Should always be present -- `add_event` already ran for this same BlockMeta event
             // (and auto-vivified the buffer if needed) before this is ever called. Most likely
             // reachable only for a duplicate/late BlockMeta targeting an already-sealed bank.
@@ -277,13 +300,24 @@ impl BlockAccumulator for DragonsmouthBlockCumulator {
     }
 
     fn finish_block(&mut self, bank_id: BankId) -> Option<Block<Self::EventStore>> {
-        let acc = self.frozen_block_map.remove(&bank_id)?;
-        Some(acc.finish())
+        let bank = self.frozen_bank_map.remove(&bank_id)?;
+        let block = Block {
+            slot: bank.slot,
+            bank_id,
+            blockhash: bank.blockhash,
+            entry_count: bank.entry_count,
+            executed_transaction_count: bank.executed_transaction_count,
+            parent_slot: bank.parent_slot,
+            parent_blockhash: bank.parent_blockhash,
+            blocktime_unix_ts: bank.blocktime_unix_ts,
+            events: bank,
+        };
+        Some(block)
     }
 
     fn prune_block(&mut self, bank_id: BankId) {
-        self.active_block_map.remove(&bank_id);
-        self.frozen_block_map.remove(&bank_id);
+        self.active_bank_map.remove(&bank_id);
+        self.frozen_bank_map.remove(&bank_id);
     }
 
     fn pop_newly_sealed(&mut self) -> Option<BankId> {
@@ -295,7 +329,7 @@ impl BlockAccumulator for DragonsmouthBlockCumulator {
 mod tests {
     use {
         super::*,
-        crate::{event::GeyserEventAdapter, stream::BlockEventStore},
+        crate::event::GeyserEventAdapter,
         solana_hash::Hash,
         yellowstone_grpc_proto::geyser::{
             SlotStatus, SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateEntry,
@@ -497,7 +531,7 @@ mod tests {
             .finish_block(bank_id)
             .expect("created_bank + all sysvars + matching entry count are all satisfied");
         assert_eq!(
-            block.events.account_len(),
+            block.events.account_idx_map.len(),
             1,
             "only the sysvar the client actually subscribed to should be delivered"
         );

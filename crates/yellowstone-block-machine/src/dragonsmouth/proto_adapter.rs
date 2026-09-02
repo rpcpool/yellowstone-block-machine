@@ -43,17 +43,14 @@ impl GeyserEventAdapter for SubscribeUpdate {
                     blockhash: solana_hash::Hash::from_str(&block_meta.blockhash)
                         .expect("blockhash format")
                         .to_bytes(),
-                    // Unlike `blockhash`, `parent_blockhash` may legitimately be absent from the
-                    // wire (e.g. genesis, or a producer that doesn't report it) -- default to
-                    // the zero hash rather than panicking.
+                    // Lenient, unlike `blockhash` above -- genesis's parent_blockhash is empty,
+                    // not a valid base58 hash.
                     parent_blockhash: solana_hash::Hash::from_str(&block_meta.parent_blockhash)
-                        .unwrap_or_default()
-                        .to_bytes(),
+                        .map(|h| h.to_bytes())
+                        .unwrap_or([0; solana_hash::HASH_BYTES]),
                     block_time: block_meta
                         .block_time
-                        .as_ref()
-                        .map(|t| t.timestamp.max(0) as u64)
-                        .unwrap_or(0),
+                        .map_or(0, |t| t.timestamp.max(0) as u64),
                     bank_id: block_meta.bank_id,
                 }))
             }
@@ -66,27 +63,28 @@ impl GeyserEventAdapter for SubscribeUpdate {
                 bank_id: entry.bank_id,
                 // filters: event.filters.as_slice(),
             })),
-            UpdateOneof::Transaction(tx) => Some(GeyserEventInfo::Transaction {
+            UpdateOneof::Transaction(tx) => Some(GeyserEventInfo::BankData {
                 slot: tx.slot,
-                bank_id: Some(tx.bank_id),
+                bank_id: tx.bank_id,
             }),
-            UpdateOneof::Account(account) => Some(GeyserEventInfo::Account {
+            UpdateOneof::Account(account) => Some(GeyserEventInfo::SysvarAccount {
                 slot: account.slot,
-                bank_id: account.bank_id,
+                bank_id: account.bank_id?,
                 pubkey: account
                     .account
                     .as_ref()
                     .and_then(|a| a.pubkey.as_slice().try_into().ok())
                     .unwrap_or([0; 32]),
             }),
-            UpdateOneof::TransactionStatus(tx) => Some(GeyserEventInfo::Transaction {
+            UpdateOneof::TransactionStatus(tx) => Some(GeyserEventInfo::BankData {
                 slot: tx.slot,
-                bank_id: Some(tx.bank_id),
+                bank_id: tx.bank_id,
             }),
             // ev => Some(GeyserEventInfo::Other { slot: None }),
-            UpdateOneof::Block(subscribe_update_block) => Some(GeyserEventInfo::Other {
-                slot: subscribe_update_block.slot,
-            }),
+            UpdateOneof::Block(_) => {
+                tracing::warn!("dropping block update");
+                None
+            }
             UpdateOneof::Ping(_) => None,
             UpdateOneof::Pong(_) => None,
         }

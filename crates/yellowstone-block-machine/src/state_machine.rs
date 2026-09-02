@@ -187,8 +187,8 @@ impl Block {
             entry_count: self.entry_cnt,
             executed_transaction_count: self.entries.values().map(|e| e.executed_txn_count).sum(),
             blockhash: self.last_entry_hash().expect("last entry hash"),
-            // Not derivable without a wire `BlockMeta` -- this path forges a summary before one
-            // has arrived, so these are left at their "not reported" defaults.
+            // Genuinely unknown in a forged summary -- the real BlockMeta never arrived, which
+            // is exactly why this recovery path exists.
             parent_blockhash: Hash::default(),
             block_time: 0,
         }

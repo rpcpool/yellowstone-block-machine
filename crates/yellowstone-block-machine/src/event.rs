@@ -83,24 +83,18 @@ pub enum GeyserEventInfo {
     Slot(SlotUpdateEvInfo),
     BlockMeta(BlockMetaEvInfo),
     Entry(EntryEvInfo),
-    Transaction {
-        slot: Slot,
-        bank_id: Option<BankId>,
-    },
-    Account {
+    SysvarAccount {
         slot: Slot,
         ///
         /// Absent iff the account is a startup/snapshot account, which isn't part of live bank
         /// reconstruction.
         ///
-        bank_id: Option<BankId>,
+        bank_id: BankId,
         pubkey: [u8; 32],
     },
-    ///
-    /// Any event kind not used by block reconstruction (or not recognized by this crate).
-    ///
-    Other {
+    BankData {
         slot: Slot,
+        bank_id: BankId,
     },
 }
 
@@ -110,9 +104,8 @@ impl GeyserEventInfo {
             GeyserEventInfo::Slot(ev) => ev.slot,
             GeyserEventInfo::BlockMeta(ev) => ev.slot,
             GeyserEventInfo::Entry(ev) => ev.slot,
-            GeyserEventInfo::Transaction { slot, .. } => *slot,
-            GeyserEventInfo::Account { slot, .. } => *slot,
-            GeyserEventInfo::Other { slot } => *slot,
+            GeyserEventInfo::BankData { slot, .. } => *slot,
+            GeyserEventInfo::SysvarAccount { slot, .. } => *slot,
         }
     }
 
@@ -126,9 +119,8 @@ impl GeyserEventInfo {
             GeyserEventInfo::Slot(ev) => ev.bank_id,
             GeyserEventInfo::BlockMeta(ev) => Some(ev.bank_id),
             GeyserEventInfo::Entry(ev) => Some(ev.bank_id),
-            GeyserEventInfo::Transaction { bank_id, .. } => *bank_id,
-            GeyserEventInfo::Account { bank_id, .. } => *bank_id,
-            GeyserEventInfo::Other { .. } => None,
+            GeyserEventInfo::BankData { bank_id, .. } => Some(*bank_id),
+            GeyserEventInfo::SysvarAccount { bank_id, .. } => Some(*bank_id),
         }
     }
 }

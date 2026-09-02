@@ -2,23 +2,28 @@ use {
     crate::{
         dragonsmouth::{
             RESERVED_FILTER_NAME,
-            block_accumulator::{DragonsmouthBlockCumulator, SYSVAR_PROGRAM_ID},
+            block_accumulator::{BankBuffer, DragonsmouthBlockCumulator, SYSVAR_PROGRAM_ID},
         },
         state_machine::{DeadBlockDetected, ForkDetected, SlotCommitmentStatusUpdate},
-        stream::{
-            Block, BlockEventStore, BlockMachineOutput, BlockStream, SimpleBlockStore,
-            SimpleBlockStoreIter,
-        },
+        stream::{Block, BlockEventStore, BlockMachineOutput, BlockStream},
     },
     futures_util::Stream,
     solana_clock::{BankId, Slot},
     solana_commitment_config::CommitmentLevel,
-    std::task::ready,
+    std::{
+        any::{Any, TypeId},
+        task::ready,
+    },
     tonic::async_trait,
     yellowstone_grpc_client::{GeyserGrpcClient, GeyserGrpcClientError, GeyserStream},
-    yellowstone_grpc_proto::geyser::{
-        CommitmentLevel as ProtoCommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
-        SubscribeRequestFilterSlots, SubscribeUpdate,
+    yellowstone_grpc_proto::{
+        geyser::{
+            CommitmentLevel as ProtoCommitmentLevel, SubscribeRequest,
+            SubscribeRequestFilterAccounts, SubscribeRequestFilterSlots, SubscribeUpdate,
+            SubscribeUpdateAccount, SubscribeUpdateEntry, SubscribeUpdateTransaction,
+            SubscribeUpdateTransactionStatus,
+        },
+        prost_types::Type,
     },
 };
 
@@ -29,7 +34,7 @@ pub struct DragonsmouthBlockStream {
 }
 
 pub struct DragonsmouthBlock {
-    inner: Block<SimpleBlockStore<SubscribeUpdate>>,
+    inner: Block<BankBuffer>,
 }
 
 impl DragonsmouthBlock {
@@ -45,74 +50,51 @@ impl DragonsmouthBlock {
     /// The entry count reported by the wire's `BlockMeta` itself -- independent of however many
     /// `Entry` events this crate's own sans-io core happened to buffer.
     ///
-    pub const fn entry_count(&self) -> u64 {
+    pub fn entry_count(&self) -> u64 {
         self.inner.entry_count
     }
 
-    pub const fn executed_transaction_count(&self) -> u64 {
+    pub fn executed_transaction_count(&self) -> u64 {
         self.inner.executed_transaction_count
     }
 
-    pub const fn parent_slot(&self) -> Slot {
+    pub fn parent_slot(&self) -> Slot {
         self.inner.parent_slot
     }
 
-    pub const fn parent_blockhash(&self) -> [u8; solana_hash::HASH_BYTES] {
+    pub fn parent_blockhash(&self) -> [u8; solana_hash::HASH_BYTES] {
         self.inner.parent_blockhash
     }
 
     ///
     /// Unix timestamp the block was produced at. `0` if the wire didn't report one.
     ///
-    pub const fn blocktime_unix_ts(&self) -> u64 {
+    pub fn blocktime_unix_ts(&self) -> u64 {
         self.inner.blocktime_unix_ts
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &SubscribeUpdate> {
+        self.inner.events.iter()
+    }
+
+    pub fn into_iter(self) -> impl IntoIterator<Item = SubscribeUpdate> {
+        self.inner.events.into_iter()
     }
 }
 
-impl From<Block<SimpleBlockStore<SubscribeUpdate>>> for DragonsmouthBlock {
-    fn from(block: Block<SimpleBlockStore<SubscribeUpdate>>) -> Self {
+impl From<Block<BankBuffer>> for DragonsmouthBlock {
+    fn from(block: Block<BankBuffer>) -> Self {
         Self { inner: block }
     }
 }
 
-impl BlockEventStore for DragonsmouthBlock {
-    type EventT = SubscribeUpdate;
-
-    type Iter<'a> = SimpleBlockStoreIter<'a, SubscribeUpdate>;
-
-    type IntoIter = std::vec::IntoIter<SubscribeUpdate>;
-
-    fn len(&self) -> usize {
-        self.inner.as_ref().len()
-    }
-
-    fn blockhash(&self) -> [u8; solana_hash::HASH_BYTES] {
-        self.inner.blockhash
-    }
-
-    fn iter(&self) -> Self::Iter<'_> {
-        self.inner.as_ref().iter()
-    }
-
-    fn account_iter(&self) -> Self::Iter<'_> {
-        self.inner.as_ref().account_iter()
-    }
-
-    fn transaction_iter(&self) -> Self::Iter<'_> {
-        self.inner.as_ref().transaction_iter()
-    }
-
-    fn entry_iter(&self) -> Self::Iter<'_> {
-        self.inner.as_ref().entry_iter()
-    }
-
-    fn other_iter(&self) -> Self::Iter<'_> {
-        self.inner.as_ref().other_iter()
-    }
-
-    fn into_iter(self) -> Self::IntoIter {
-        self.inner.events.into_iter()
-    }
+impl DragonsmouthBlock {
+    const SUPPORTED_VARIANTS: &'static [std::any::TypeId] = &[
+        TypeId::of::<SubscribeUpdateAccount>(),
+        TypeId::of::<SubscribeUpdateEntry>(),
+        TypeId::of::<SubscribeUpdateTransaction>(),
+        TypeId::of::<SubscribeUpdateTransactionStatus>(),
+    ];
 }
 
 pub enum BlockStreamEvent {

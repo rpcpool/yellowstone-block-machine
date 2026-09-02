@@ -69,46 +69,6 @@ pub trait BlockEventStore {
 
     fn iter(&self) -> Self::Iter<'_>;
 
-    ///
-    /// Returns an iterator over the events in this block that are accounts.
-    fn account_iter(&self) -> Self::Iter<'_>;
-
-    ///
-    /// Returns the number of account events in this block.
-    fn account_len(&self) -> usize {
-        self.account_iter().count()
-    }
-
-    ///
-    /// Returns an iterator over the events in this block that are transactions.
-    fn transaction_iter(&self) -> Self::Iter<'_>;
-
-    ///
-    /// Returns the number of transaction events in this block.
-    fn transaction_len(&self) -> usize {
-        self.transaction_iter().count()
-    }
-
-    ///
-    /// Returns an iterator over the events in this block that are entries.
-    fn entry_iter(&self) -> Self::Iter<'_>;
-
-    ///
-    /// Returns the number of entry events in this block.
-    fn entry_len(&self) -> usize {
-        self.entry_iter().count()
-    }
-
-    ///
-    /// Returns an iterator over the events in this block that are neither accounts, transactions, nor entries.
-    fn other_iter(&self) -> Self::Iter<'_>;
-
-    ///
-    /// Returns the number of events in this block that are neither accounts, transactions, nor entries.
-    fn other_len(&self) -> usize {
-        self.other_iter().count()
-    }
-
     fn into_iter(self) -> Self::IntoIter;
 }
 
@@ -436,10 +396,6 @@ struct BlockBuffer<E> {
     bank_id: BankId,
     blockhash: [u8; HASH_BYTES],
     events: Vec<E>,
-    account_idx_map: Vec<usize>,
-    transaction_idx_map: Vec<usize>,
-    entry_idx_map: Vec<usize>,
-    other_idx_map: Vec<usize>,
     entry_count: u64,
     executed_transaction_count: u64,
     parent_slot: Slot,
@@ -454,10 +410,6 @@ impl<E> BlockBuffer<E> {
             bank_id,
             blockhash: [0; HASH_BYTES],
             events: Vec::new(),
-            account_idx_map: Vec::new(),
-            transaction_idx_map: Vec::new(),
-            entry_idx_map: Vec::new(),
-            other_idx_map: Vec::new(),
             entry_count: 0,
             executed_transaction_count: 0,
             parent_slot: 0,
@@ -471,10 +423,6 @@ pub struct SimpleBlockStore<E> {
     pub slot: Slot,
     pub blockhash: [u8; HASH_BYTES],
     pub events: Vec<E>,
-    pub account_idx_map: Vec<usize>,
-    pub transaction_idx_map: Vec<usize>,
-    pub entry_idx_map: Vec<usize>,
-    pub other_idx_map: Vec<usize>,
 }
 
 pub struct SimpleBlockStoreIter<'a, E> {
@@ -533,54 +481,6 @@ impl<E> BlockEventStore for SimpleBlockStore<E> {
         }
     }
 
-    fn account_iter(&self) -> Self::Iter<'_> {
-        SimpleBlockStoreIter {
-            events: &self.events,
-            idx_map: Some(&self.account_idx_map),
-            idx_pos: 0,
-        }
-    }
-
-    fn transaction_iter(&self) -> Self::Iter<'_> {
-        SimpleBlockStoreIter {
-            events: &self.events,
-            idx_map: Some(&self.transaction_idx_map),
-            idx_pos: 0,
-        }
-    }
-
-    fn entry_iter(&self) -> Self::Iter<'_> {
-        SimpleBlockStoreIter {
-            events: &self.events,
-            idx_map: Some(&self.entry_idx_map),
-            idx_pos: 0,
-        }
-    }
-
-    fn other_iter(&self) -> Self::Iter<'_> {
-        SimpleBlockStoreIter {
-            events: &self.events,
-            idx_map: Some(&self.other_idx_map),
-            idx_pos: 0,
-        }
-    }
-
-    fn account_len(&self) -> usize {
-        self.account_idx_map.len()
-    }
-
-    fn transaction_len(&self) -> usize {
-        self.transaction_idx_map.len()
-    }
-
-    fn entry_len(&self) -> usize {
-        self.entry_idx_map.len()
-    }
-
-    fn other_len(&self) -> usize {
-        self.other_idx_map.len()
-    }
-
     fn into_iter(self) -> Self::IntoIter {
         self.events.into_iter()
     }
@@ -601,10 +501,6 @@ impl<E> BlockBuffer<E> {
                 slot: self.slot,
                 blockhash: self.blockhash,
                 events: self.events,
-                account_idx_map: self.account_idx_map,
-                transaction_idx_map: self.transaction_idx_map,
-                entry_idx_map: self.entry_idx_map,
-                other_idx_map: self.other_idx_map,
             },
         }
     }
@@ -635,22 +531,20 @@ impl<E> BlockAccumulator for SimpleBlockAccumulator<E> {
     type EventStore = SimpleBlockStore<E>;
 
     fn add_event(&mut self, event: E, bank_id: BankId, ev_info: &GeyserEventInfo) {
+        // Slot/BlockMeta are lifecycle signals the state machine consumes internally -- not
+        // part of the block's actual content, so they're never stored here (matches
+        // `DragonsmouthBlockCumulator`'s own filtering).
+        if matches!(
+            ev_info,
+            GeyserEventInfo::Slot(_) | GeyserEventInfo::BlockMeta(_)
+        ) {
+            return;
+        }
         let slot = ev_info.slot();
         let block = self
             .active_block_map
             .entry(bank_id)
             .or_insert_with(|| BlockBuffer::new(bank_id, slot));
-        let idx = block.events.len();
-        match ev_info {
-            GeyserEventInfo::Account { .. } => block.account_idx_map.push(idx),
-            GeyserEventInfo::Transaction { .. } => block.transaction_idx_map.push(idx),
-            GeyserEventInfo::Entry(_) => block.entry_idx_map.push(idx),
-            GeyserEventInfo::Other { .. } => block.other_idx_map.push(idx),
-            _ => {
-                //block meta and slot are ignored
-                return;
-            }
-        }
         block.events.push(event);
     }
 
@@ -854,9 +748,6 @@ mod tests {
         };
         assert_eq!(block.slot, 10);
         assert_eq!(block.bank_id, bank_id);
-        assert_eq!(block.events.entry_idx_map.len(), 1);
-        assert_eq!(block.events.transaction_idx_map.len(), 1);
-        assert_eq!(block.events.account_idx_map.len(), 1);
         assert_eq!(block.events.events.len(), 3);
 
         let Poll::Ready(Some(Ok(BlockMachineOutput::SlotCommitmentUpdate(update)))) = second else {
@@ -948,23 +839,11 @@ mod tests {
             slot: 99,
             blockhash: [0; HASH_BYTES],
             events: Vec::new(),
-            account_idx_map: Vec::new(),
-            transaction_idx_map: Vec::new(),
-            entry_idx_map: Vec::new(),
-            other_idx_map: Vec::new(),
         };
 
         assert!(store.is_empty());
         assert_eq!(store.len(), 0);
-        assert_eq!(store.account_len(), 0);
-        assert_eq!(store.transaction_len(), 0);
-        assert_eq!(store.entry_len(), 0);
-        assert_eq!(store.other_len(), 0);
         assert_eq!(store.iter().count(), 0);
-        assert_eq!(store.account_iter().count(), 0);
-        assert_eq!(store.transaction_iter().count(), 0);
-        assert_eq!(store.entry_iter().count(), 0);
-        assert_eq!(store.other_iter().count(), 0);
     }
 
     #[test]
@@ -973,24 +852,12 @@ mod tests {
             slot: 7,
             blockhash: [42; HASH_BYTES],
             events: vec![10_u64, 11, 12, 13, 14],
-            account_idx_map: vec![1, 4],
-            transaction_idx_map: vec![0, 3],
-            entry_idx_map: vec![2],
-            other_idx_map: vec![4],
         };
 
         let all: Vec<u64> = store.iter().copied().collect();
-        let accounts: Vec<u64> = store.account_iter().copied().collect();
-        let txs: Vec<u64> = store.transaction_iter().copied().collect();
-        let entries: Vec<u64> = store.entry_iter().copied().collect();
-        let others: Vec<u64> = store.other_iter().copied().collect();
 
         assert_eq!(all, vec![10, 11, 12, 13, 14]);
         assert_eq!(store.blockhash(), [42; HASH_BYTES]);
-        assert_eq!(accounts, vec![11, 14]);
-        assert_eq!(txs, vec![10, 13]);
-        assert_eq!(entries, vec![12]);
-        assert_eq!(others, vec![14]);
     }
 
     #[test]
