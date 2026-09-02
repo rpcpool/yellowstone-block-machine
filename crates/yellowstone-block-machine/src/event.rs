@@ -1,4 +1,7 @@
-use {solana_clock::Slot, solana_hash::HASH_BYTES};
+use {
+    solana_clock::{BankId, Slot},
+    solana_hash::HASH_BYTES,
+};
 
 ///
 /// The lifecycle/commitment status of a slot, independent of any specific Geyser wire format.
@@ -28,6 +31,12 @@ pub struct SlotUpdateEvInfo {
     pub parent: Option<Slot>,
     pub status: SlotStatusKind,
     pub dead_error: bool,
+    ///
+    /// The bank instance this update applies to. Absent for `FirstShredReceived`/`Completed`,
+    /// which are slot-scoped rather than bank-scoped; present for `CreatedBank` and the
+    /// commitment statuses.
+    ///
+    pub bank_id: Option<BankId>,
 }
 
 ///
@@ -45,6 +54,7 @@ pub struct BlockMetaEvInfo {
     /// Unix timestamp the block was produced at. `0` if the wire didn't report one.
     ///
     pub block_time: u64,
+    pub bank_id: BankId,
 }
 
 ///
@@ -57,6 +67,7 @@ pub struct EntryEvInfo {
     pub starting_transaction_index: u64,
     pub executed_transaction_count: u64,
     pub hash: [u8; HASH_BYTES],
+    pub bank_id: BankId,
 }
 
 ///
@@ -74,9 +85,16 @@ pub enum GeyserEventInfo {
     Entry(EntryEvInfo),
     Transaction {
         slot: Slot,
+        bank_id: Option<BankId>,
     },
     Account {
         slot: Slot,
+        ///
+        /// Absent iff the account is a startup/snapshot account, which isn't part of live bank
+        /// reconstruction.
+        ///
+        bank_id: Option<BankId>,
+        pubkey: [u8; 32],
     },
     ///
     /// Any event kind not used by block reconstruction (or not recognized by this crate).
@@ -92,9 +110,25 @@ impl GeyserEventInfo {
             GeyserEventInfo::Slot(ev) => ev.slot,
             GeyserEventInfo::BlockMeta(ev) => ev.slot,
             GeyserEventInfo::Entry(ev) => ev.slot,
-            GeyserEventInfo::Transaction { slot } => *slot,
-            GeyserEventInfo::Account { slot } => *slot,
+            GeyserEventInfo::Transaction { slot, .. } => *slot,
+            GeyserEventInfo::Account { slot, .. } => *slot,
             GeyserEventInfo::Other { slot } => *slot,
+        }
+    }
+
+    ///
+    /// The bank instance this event belongs to, if any. `None` for slot-scoped lifecycle updates
+    /// (`FirstShredReceived`/`Completed`), startup accounts, and event kinds not used by block
+    /// reconstruction.
+    ///
+    pub fn bank_id(&self) -> Option<BankId> {
+        match self {
+            GeyserEventInfo::Slot(ev) => ev.bank_id,
+            GeyserEventInfo::BlockMeta(ev) => Some(ev.bank_id),
+            GeyserEventInfo::Entry(ev) => Some(ev.bank_id),
+            GeyserEventInfo::Transaction { bank_id, .. } => *bank_id,
+            GeyserEventInfo::Account { bank_id, .. } => *bank_id,
+            GeyserEventInfo::Other { .. } => None,
         }
     }
 }

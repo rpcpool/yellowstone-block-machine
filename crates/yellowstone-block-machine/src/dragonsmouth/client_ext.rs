@@ -1,6 +1,9 @@
 use {
     crate::{
-        dragonsmouth::{RESERVED_FILTER_NAME, block_accumulator::DragonsmouthBlockCumulator},
+        dragonsmouth::{
+            RESERVED_FILTER_NAME,
+            block_accumulator::{DragonsmouthBlockCumulator, SYSVAR_PROGRAM_ID},
+        },
         state_machine::{DeadBlockDetected, ForkDetected, SlotCommitmentStatusUpdate},
         stream::{
             Block, BlockEventStore, BlockMachineOutput, BlockStream, SimpleBlockStore,
@@ -8,14 +11,14 @@ use {
         },
     },
     futures_util::Stream,
-    solana_clock::Slot,
+    solana_clock::{BankId, Slot},
     solana_commitment_config::CommitmentLevel,
     std::task::ready,
     tonic::async_trait,
     yellowstone_grpc_client::{GeyserGrpcClient, GeyserGrpcClientError, GeyserStream},
     yellowstone_grpc_proto::geyser::{
-        CommitmentLevel as ProtoCommitmentLevel, SubscribeRequest, SubscribeRequestFilterSlots,
-        SubscribeUpdate,
+        CommitmentLevel as ProtoCommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
+        SubscribeRequestFilterSlots, SubscribeUpdate,
     },
 };
 
@@ -32,6 +35,10 @@ pub struct DragonsmouthBlock {
 impl DragonsmouthBlock {
     pub const fn slot(&self) -> Slot {
         self.inner.slot
+    }
+
+    pub fn bank_id(&self) -> BankId {
+        self.inner.bank_id
     }
 
     ///
@@ -77,6 +84,10 @@ impl BlockEventStore for DragonsmouthBlock {
 
     fn len(&self) -> usize {
         self.inner.as_ref().len()
+    }
+
+    fn blockhash(&self) -> [u8; solana_hash::HASH_BYTES] {
+        self.inner.blockhash
     }
 
     fn iter(&self) -> Self::Iter<'_> {
@@ -223,6 +234,19 @@ impl GeyserGrpcExt for GeyserGrpcClient {
         subscribe_request
             .entry
             .insert(RESERVED_FILTER_NAME.to_owned(), Default::default());
+
+        // Force-subscribe to every sysvar account (by owner, which covers all of them in one
+        // filter -- including MUST_HAVE_SYSVAR_ACCOUNTS), the same way as slots/blocks_meta/
+        // entry above -- `DragonsmouthBlockCumulator` won't consider a block complete without
+        // having observed all the must-have ones (see its module doc comment), whether or not
+        // the caller's own request asked for any accounts at all.
+        subscribe_request.accounts.insert(
+            RESERVED_FILTER_NAME.to_owned(),
+            SubscribeRequestFilterAccounts {
+                owner: vec![SYSVAR_PROGRAM_ID.to_string()],
+                ..Default::default()
+            },
+        );
 
         subscribe_request.commitment = Some(0); // Processed
 

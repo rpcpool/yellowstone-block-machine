@@ -32,6 +32,7 @@ impl GeyserEventAdapter for SubscribeUpdate {
                 parent: slot_update.parent,
                 status: slot_update.status().into(),
                 dead_error: slot_update.dead_error.is_some(),
+                bank_id: slot_update.bank_id,
             })),
             UpdateOneof::BlockMeta(block_meta) => {
                 Some(GeyserEventInfo::BlockMeta(BlockMetaEvInfo {
@@ -53,6 +54,7 @@ impl GeyserEventAdapter for SubscribeUpdate {
                         .as_ref()
                         .map(|t| t.timestamp.max(0) as u64)
                         .unwrap_or(0),
+                    bank_id: block_meta.bank_id,
                 }))
             }
             UpdateOneof::Entry(entry) => Some(GeyserEventInfo::Entry(EntryEvInfo {
@@ -61,13 +63,26 @@ impl GeyserEventAdapter for SubscribeUpdate {
                 starting_transaction_index: entry.starting_transaction_index,
                 executed_transaction_count: entry.executed_transaction_count,
                 hash: entry.hash.as_slice().try_into().expect("entry hash length"),
+                bank_id: entry.bank_id,
                 // filters: event.filters.as_slice(),
             })),
-            UpdateOneof::Transaction(tx) => Some(GeyserEventInfo::Transaction { slot: tx.slot }),
-            UpdateOneof::Account(account) => Some(GeyserEventInfo::Account { slot: account.slot }),
-            UpdateOneof::TransactionStatus(tx) => {
-                Some(GeyserEventInfo::Transaction { slot: tx.slot })
-            }
+            UpdateOneof::Transaction(tx) => Some(GeyserEventInfo::Transaction {
+                slot: tx.slot,
+                bank_id: Some(tx.bank_id),
+            }),
+            UpdateOneof::Account(account) => Some(GeyserEventInfo::Account {
+                slot: account.slot,
+                bank_id: account.bank_id,
+                pubkey: account
+                    .account
+                    .as_ref()
+                    .and_then(|a| a.pubkey.as_slice().try_into().ok())
+                    .unwrap_or([0; 32]),
+            }),
+            UpdateOneof::TransactionStatus(tx) => Some(GeyserEventInfo::Transaction {
+                slot: tx.slot,
+                bank_id: Some(tx.bank_id),
+            }),
             // ev => Some(GeyserEventInfo::Other { slot: None }),
             UpdateOneof::Block(subscribe_update_block) => Some(GeyserEventInfo::Other {
                 slot: subscribe_update_block.slot,

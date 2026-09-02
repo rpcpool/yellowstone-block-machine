@@ -77,6 +77,8 @@ struct Args {
     config: PathBuf,
     #[clap(short, long, default_value_t = 10)]
     samples: usize,
+    #[clap(long)]
+    no_slot_commitment_updates: bool,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -86,8 +88,12 @@ struct Config {
     x_token: Option<String>,
 }
 
-async fn process_block<W>(mut block_stream: DragonsmouthBlockStream, sample: usize, mut out: W)
-where
+async fn process_block<W>(
+    mut block_stream: DragonsmouthBlockStream,
+    sample: usize,
+    slot_commitment_updates: bool,
+    mut out: W,
+) where
     W: std::io::Write,
 {
     let mut i = 0;
@@ -95,22 +101,40 @@ where
         match result {
             Ok(output) => match output {
                 BlockStreamEvent::FrozenBlock(block) => {
-                    let n = block.len();
                     let slot = block.slot();
                     let account_cnt = block.account_len();
                     let txn_cnt = block.transaction_len();
                     let entry_cnt = block.entry_len();
-                    writeln!(out, "Block ({i}) {slot} len: {n}, {txn_cnt} tx, {account_cnt} accounts, {entry_cnt} entries").expect("write");
+                    let entry_txn_cnt: u64 = block
+                        .entry_iter()
+                        .filter_map(|ev| match ev.update_oneof.as_ref() {
+                            Some(UpdateOneof::Entry(entry)) => {
+                                Some(entry.executed_transaction_count)
+                            }
+                            _ => None,
+                        })
+                        .sum();
+                    assert_eq!(
+                        entry_txn_cnt, txn_cnt as u64,
+                        "slot {}: sum of transaction count across entries ({}) must equal transactions received ({})",
+                        slot, entry_txn_cnt, txn_cnt
+                    );
+                    let bank_id = block.bank_id();
+                    writeln!(out, "Block ({i}) {slot}, bank_id: {bank_id}, txn: {txn_cnt}, account: {account_cnt}, entry: {entry_cnt}").expect("write");
                     cross_check_account_txn_join(block);
                     i += 1;
                 }
                 BlockStreamEvent::SlotCommitmentUpdate(slot_commitment_status_update) => {
-                    writeln!(
-                        out,
-                        "SlotCommitmentUpdate: {:?}",
-                        slot_commitment_status_update
-                    )
-                    .expect("write");
+                    if slot_commitment_updates {
+                        writeln!(
+                            out,
+                            "slot: {}, bank_id: {},  commtiment: {}",
+                            slot_commitment_status_update.slot,
+                            slot_commitment_status_update.bank_id,
+                            slot_commitment_status_update.commitment,
+                        )
+                        .expect("write");
+                    }
                 }
                 BlockStreamEvent::ForkDetected(fork_detected) => {
                     writeln!(out, "ForkDetected: {}", fork_detected.slot).expect("write");
@@ -147,8 +171,6 @@ async fn main() {
         .expect("tls_config")
         .max_decoding_message_size(50 * 1024 * 1024) // 50MB
         .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
-        .initial_connection_window_size(Some(10_000_000))
-        .initial_stream_window_size(Some(8_000_000))
         .http2_adaptive_window(true)
         .connect()
         .await
@@ -173,5 +195,11 @@ async fn main() {
         .subscribe_block(request)
         .await
         .expect("subscribe_block");
-    process_block(block_machine_rx, args.samples, std::io::stdout()).await;
+    process_block(
+        block_machine_rx,
+        args.samples,
+        !args.no_slot_commitment_updates,
+        std::io::stdout(),
+    )
+    .await;
 }
