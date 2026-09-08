@@ -269,7 +269,7 @@ where
 {
 }
 
-fn compare_commitment(cl1: CommitmentLevel, cl2: CommitmentLevel) -> Ordering {
+const fn compare_commitment(cl1: CommitmentLevel, cl2: CommitmentLevel) -> Ordering {
     match (cl1, cl2) {
         (CommitmentLevel::Processed, CommitmentLevel::Processed) => Ordering::Equal,
         (CommitmentLevel::Confirmed, CommitmentLevel::Confirmed) => Ordering::Equal,
@@ -687,7 +687,7 @@ mod tests {
         },
     };
 
-    fn update(oneof: UpdateOneof, filters: Vec<String>) -> SubscribeUpdate {
+    const fn update(oneof: UpdateOneof, filters: Vec<String>) -> SubscribeUpdate {
         SubscribeUpdate {
             filters,
             created_at: None,
@@ -756,6 +756,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::type_complexity)]
     fn feed(
         stream: &mut BlockStream<
             stream::Iter<std::vec::IntoIter<Result<SubscribeUpdate, io::Error>>>,
@@ -775,6 +776,7 @@ mod tests {
         stream.process_state_machine_output();
     }
 
+    #[allow(clippy::type_complexity)]
     fn empty_source_stream(
         min_commitment_level: CommitmentLevel,
     ) -> BlockStream<

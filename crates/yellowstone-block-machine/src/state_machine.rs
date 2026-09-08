@@ -313,7 +313,7 @@ pub enum BlockStateMachineOutput {
 }
 
 impl BlockStateMachineOutput {
-    pub fn slot(&self) -> Slot {
+    pub const fn slot(&self) -> Slot {
         match self {
             Self::DeadSlotDetected(blk) => blk.slot,
             Self::FrozenBlock(blk) => blk.slot,
@@ -344,7 +344,7 @@ pub struct BlockstoreStats {
     pub blockstore_update_queue_len: usize,
 }
 
-fn cmp_commitment_level(a: &CommitmentLevel, b: &CommitmentLevel) -> std::cmp::Ordering {
+const fn cmp_commitment_level(a: CommitmentLevel, b: CommitmentLevel) -> std::cmp::Ordering {
     match (a, b) {
         (CommitmentLevel::Processed, CommitmentLevel::Processed) => std::cmp::Ordering::Equal,
         (CommitmentLevel::Finalized, CommitmentLevel::Finalized) => std::cmp::Ordering::Equal,
@@ -442,7 +442,7 @@ impl BlocksStateMachine {
         }
     }
 
-    fn next_history_revision(&mut self) -> usize {
+    const fn next_history_revision(&mut self) -> usize {
         let temp = self.revision;
         self.revision += 1;
         temp
@@ -727,9 +727,9 @@ impl BlocksStateMachine {
             .iter()
             .flat_map(|update| update.iter())
             .filter(|update| {
-                cmp_commitment_level(&update.commitment, &CommitmentLevel::Processed).is_gt()
+                cmp_commitment_level(update.commitment, CommitmentLevel::Processed).is_gt()
             })
-            .max_by(|x, y| cmp_commitment_level(&x.commitment, &y.commitment))
+            .max_by(|x, y| cmp_commitment_level(x.commitment, y.commitment))
         {
             // Sometime we may have a "processed" commitment level happens before slot is frozen,
             // this is because "frozen" state depends on block meta which may be sent after "Processed" slot status.
@@ -944,7 +944,7 @@ impl BlocksStateMachine {
     }
 }
 
-pub fn module_path_for_test() -> &'static str {
+pub const fn module_path_for_test() -> &'static str {
     module_path!()
 }
 

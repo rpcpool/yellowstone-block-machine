@@ -49,3 +49,7 @@ yellowstone-grpc-proto = { workspace = true, optional = true }
 [dev-dependencies]
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+
+[lints]
+workspace = true

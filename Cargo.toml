@@ -42,3 +42,9 @@ tracing-subscriber = "0.3.0"
 yellowstone-grpc-client = "13.0.0"
 yellowstone-grpc-proto = "12.0.0"
 yellowstone-block-machine = { path = "crates/yellowstone-block-machine" }
+
+[workspace.lints.clippy]
+clone_on_ref_ptr = "deny"
+missing_const_for_fn = "deny"
+trivially_copy_pass_by_ref = "deny"
+collapsible_match = "allow"

@@ -87,7 +87,7 @@ pub enum GeyserEventInfo {
 }
 
 impl GeyserEventInfo {
-    pub fn slot(&self) -> Slot {
+    pub const fn slot(&self) -> Slot {
         match self {
             GeyserEventInfo::Slot(ev) => ev.slot,
             GeyserEventInfo::BlockMeta(ev) => ev.slot,
