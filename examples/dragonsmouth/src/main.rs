@@ -150,13 +150,22 @@ async fn process_block<W>(
                     let bank_id = block.bank_id();
 
                     let mut account_cnt = 0u64;
-                    let mut txn_cnt = 0u64;
                     let mut entry_cnt = 0u64;
                     let mut entry_txn_cnt = 0u64;
+                    let mut unique_sig_set = HashSet::new();
                     for ev in block.iter() {
                         match ev.update_oneof.as_ref() {
                             Some(UpdateOneof::Account(_)) => account_cnt += 1,
-                            Some(UpdateOneof::Transaction(_)) => txn_cnt += 1,
+                            Some(UpdateOneof::Transaction(txn)) => {
+                                let sig = txn.transaction.as_ref().unwrap().signature.clone();
+                                let sig = Signature::try_from(sig).expect("sig");
+                                unique_sig_set.insert(sig);
+                            },
+                            Some(UpdateOneof::TransactionStatus(txn)) => {
+                                let sig = txn.signature.as_ref();
+                                let sig = Signature::try_from(sig).expect("sig");
+                                unique_sig_set.insert(sig);
+                            }
                             Some(UpdateOneof::Entry(entry)) => {
                                 entry_cnt += 1;
                                 entry_txn_cnt += entry.executed_transaction_count;
@@ -165,14 +174,14 @@ async fn process_block<W>(
                         }
                     }
                     assert_eq!(
-                        entry_txn_cnt, txn_cnt,
+                        entry_txn_cnt as usize, unique_sig_set.len(),
                         "slot {}: sum of transaction count across entries ({}) must equal transactions received ({})",
-                        slot, entry_txn_cnt, txn_cnt
+                        slot, entry_txn_cnt as usize, unique_sig_set.len()
                     );
                     let parent_slot = block.parent_slot();
                     let parent_blockhash = bs58::encode(block.parent_blockhash()).into_string();
 
-                    writeln!(out, "Block ({i}) {slot}, bank_id: {bank_id}, txn: {txn_cnt}, account: {account_cnt}, entry: {entry_cnt}, parent_slot: {parent_slot}, parent hash: {parent_blockhash}").expect("write");
+                    writeln!(out, "Block ({i}) {slot}, bank_id: {bank_id}, txn: {}, account: {account_cnt}, entry: {entry_cnt}, parent_slot: {parent_slot}, parent hash: {parent_blockhash}", unique_sig_set.len()).expect("write");
                     cross_check_account_txn_join(block);
                     i += 1;
                 }
