@@ -33,6 +33,33 @@ impl DragonsmouthBlock {
     pub fn slot(&self) -> Slot {
         self.inner.slot
     }
+
+    ///
+    /// The entry count reported by the wire's `BlockMeta` itself -- independent of however many
+    /// `Entry` events this crate's own sans-io core happened to buffer.
+    ///
+    pub fn entry_count(&self) -> u64 {
+        self.inner.entry_count
+    }
+
+    pub fn executed_transaction_count(&self) -> u64 {
+        self.inner.executed_transaction_count
+    }
+
+    pub fn parent_slot(&self) -> Slot {
+        self.inner.parent_slot
+    }
+
+    pub fn parent_blockhash(&self) -> [u8; solana_hash::HASH_BYTES] {
+        self.inner.parent_blockhash
+    }
+
+    ///
+    /// Unix timestamp the block was produced at. `0` if the wire didn't report one.
+    ///
+    pub fn blocktime_unix_ts(&self) -> u64 {
+        self.inner.blocktime_unix_ts
+    }
 }
 
 impl From<Block<SimpleBlockStore<SubscribeUpdate>>> for DragonsmouthBlock {

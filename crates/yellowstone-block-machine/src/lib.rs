@@ -70,6 +70,10 @@
 //!                     block.transaction_len(),
 //!                     block.account_len(),
 //!                     block.entry_len(),
+//!                     block.entry_count(),
+//!                     block.parent_slot(),
+//!                     block.parent_blockhash(),
+//!                     block.blocktime_unix_ts(),
 //!                 );
 //!             }
 //!             BlockStreamEvent::SlotCommitmentUpdate(update) => {

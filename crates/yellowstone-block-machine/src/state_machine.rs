@@ -46,6 +46,13 @@ pub struct BlockSummary {
     pub parent_slot: Slot,
     pub executed_transaction_count: u64,
     pub blockhash: Hash,
+    pub parent_blockhash: Hash,
+    ///
+    /// Unix timestamp the block was produced at. `0` if the wire didn't report one (this is
+    /// also what the optimistic-freeze path forges, since it has no wire `BlockMeta` to draw
+    /// this from).
+    ///
+    pub block_time: i64,
 }
 
 // #[derive(Debug, From)]
@@ -97,6 +104,16 @@ pub struct FrozenBlock {
     pub parent_slot: Slot,
     pub entries: Vec<EntryInfo>,
     pub blockhash: Hash,
+    ///
+    /// The entry count reported by the wire's BlockMeta itself -- independent of however many
+    /// `Entry` events this crate's own sans-io core happened to buffer, so a downstream
+    /// `BlockAccumulator` can verify its own observed entry count against the wire's expectation
+    /// rather than trusting this crate's internal bookkeeping.
+    ///
+    pub entries_count: u64,
+    pub executed_transaction_count: u64,
+    pub parent_blockhash: Hash,
+    pub block_time: i64,
 }
 
 // Avg 2k tx + 2k account update
@@ -140,6 +157,10 @@ impl Block {
             entries: self.entries.values().cloned().collect(),
             blockhash: summary.blockhash,
             parent_slot: summary.parent_slot,
+            entries_count: summary.entry_count,
+            executed_transaction_count: summary.executed_transaction_count,
+            parent_blockhash: summary.parent_blockhash,
+            block_time: summary.block_time,
         }
     }
 
@@ -158,6 +179,10 @@ impl Block {
             entry_count: self.entry_cnt,
             executed_transaction_count: self.entries.values().map(|e| e.executed_txn_count).sum(),
             blockhash: self.last_entry_hash().expect("last entry hash"),
+            // Not derivable without a wire `BlockMeta` -- this path forges a summary before one
+            // has arrived, so these are left at their "not reported" defaults.
+            parent_blockhash: Hash::default(),
+            block_time: 0,
         }
     }
 
@@ -1007,6 +1032,8 @@ mod tests {
             entry_count: NUM_DATA_ENTRIES + DEFAULT_TICKS_PER_SLOT,
             executed_transaction_count: NUM_DATA_ENTRIES * 10,
             blockhash: last_entry_hash,
+            parent_blockhash: Hash::default(),
+            block_time: 0,
         };
 
         // Whatever the order of insertion it should to notify the sealed block before slot status
@@ -1094,6 +1121,8 @@ mod tests {
             entry_count: NUM_DATA_ENTRIES + DEFAULT_TICKS_PER_SLOT,
             executed_transaction_count: NUM_DATA_ENTRIES * 10,
             blockhash: last_entry_hash,
+            parent_blockhash: Hash::default(),
+            block_time: 0,
         };
 
         // Whatever the order of insertion it should to notify the sealed block before slot status
@@ -1190,6 +1219,8 @@ mod tests {
             entry_count: NUM_DATA_ENTRIES + DEFAULT_TICKS_PER_SLOT,
             executed_transaction_count: NUM_DATA_ENTRIES * 10,
             blockhash: last_entry_hash1,
+            parent_blockhash: Hash::default(),
+            block_time: 0,
         };
 
         let slot2_summary = BlockSummary {
@@ -1198,6 +1229,8 @@ mod tests {
             entry_count: NUM_DATA_ENTRIES + DEFAULT_TICKS_PER_SLOT,
             executed_transaction_count: NUM_DATA_ENTRIES * 10,
             blockhash: last_entry_hash2,
+            parent_blockhash: Hash::default(),
+            block_time: 0,
         };
 
         // Whatever the order of insertion it should to notify the sealed block before slot status
@@ -1304,6 +1337,8 @@ mod tests {
             entry_count: NUM_DATA_ENTRIES + DEFAULT_TICKS_PER_SLOT,
             executed_transaction_count: NUM_DATA_ENTRIES * 10,
             blockhash: last_entry_hash,
+            parent_blockhash: Hash::default(),
+            block_time: 0,
         };
 
         // Whatever the order of insertion it should to notify the sealed block before slot status

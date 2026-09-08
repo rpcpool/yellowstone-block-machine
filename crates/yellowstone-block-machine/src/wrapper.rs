@@ -137,6 +137,8 @@ impl BlocksStateMachineWrapper {
             parent_slot: block_meta.parent_slot,
             executed_transaction_count: block_meta.executed_transaction_count,
             blockhash: Hash::new_from_array(block_meta.blockhash),
+            parent_blockhash: Hash::new_from_array(block_meta.parent_blockhash),
+            block_time: block_meta.block_time,
         };
         self.sm.process_replay_event(block_summary.into())
         // Currently not used in block reconstruction
