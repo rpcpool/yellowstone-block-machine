@@ -33,7 +33,7 @@ pub struct Block<Storage> {
     pub entry_count: u64,
     pub executed_transaction_count: u64,
     pub parent_slot: Slot,
-    pub parent_blockhash: Option<[u8; HASH_BYTES]>,
+    pub parent_blockhash: [u8; HASH_BYTES],
     ///
     /// Unix timestamp the block was produced at. `0` if the wire didn't report one.
     ///
@@ -399,7 +399,7 @@ struct BlockBuffer<E> {
     entry_count: u64,
     executed_transaction_count: u64,
     parent_slot: Slot,
-    parent_blockhash: Option<[u8; HASH_BYTES]>,
+    parent_blockhash: [u8; HASH_BYTES],
     blocktime_unix_ts: u64,
 }
 
@@ -413,7 +413,7 @@ impl<E> BlockBuffer<E> {
             entry_count: 0,
             executed_transaction_count: 0,
             parent_slot: 0,
-            parent_blockhash: None,
+            parent_blockhash: [0; HASH_BYTES],
             blocktime_unix_ts: 0,
         }
     }
@@ -556,7 +556,7 @@ impl<E> BlockAccumulator for SimpleBlockAccumulator<E> {
         block.entry_count = frozen_block_info.entries_count;
         block.executed_transaction_count = frozen_block_info.executed_transaction_count;
         block.parent_slot = frozen_block_info.parent_slot;
-        block.parent_blockhash = frozen_block_info.parent_blockhash.map(|h| h.to_bytes());
+        block.parent_blockhash = frozen_block_info.parent_blockhash.to_bytes();
         block.blocktime_unix_ts = frozen_block_info.block_time;
         self.frozen_block_map
             .insert(frozen_block_info.bank_id, block);

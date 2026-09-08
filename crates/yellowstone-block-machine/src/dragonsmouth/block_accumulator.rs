@@ -44,7 +44,7 @@ struct PendingFreeze {
     entries_count: u64,
     executed_transaction_count: u64,
     parent_slot: Slot,
-    parent_blockhash: Option<[u8; HASH_BYTES]>,
+    parent_blockhash: [u8; HASH_BYTES],
     block_time: u64,
 }
 
@@ -68,7 +68,7 @@ pub struct BankBuffer {
     entry_count: u64,
     executed_transaction_count: u64,
     parent_slot: Slot,
-    parent_blockhash: Option<[u8; HASH_BYTES]>,
+    parent_blockhash: [u8; HASH_BYTES],
     blocktime_unix_ts: u64,
 }
 
@@ -117,7 +117,7 @@ impl BankBuffer {
             entry_count: 0,
             executed_transaction_count: 0,
             parent_slot: 0,
-            parent_blockhash: None,
+            parent_blockhash: [0; HASH_BYTES],
             blocktime_unix_ts: 0,
         }
     }
@@ -293,7 +293,7 @@ impl BlockAccumulator for DragonsmouthBlockCumulator {
             entries_count: frozen_block_info.entries_count,
             executed_transaction_count: frozen_block_info.executed_transaction_count,
             parent_slot: frozen_block_info.parent_slot,
-            parent_blockhash: frozen_block_info.parent_blockhash.map(|h| h.to_bytes()),
+            parent_blockhash: frozen_block_info.parent_blockhash.to_bytes(),
             block_time: frozen_block_info.block_time,
         });
         self.try_seal(frozen_block_info.bank_id);
@@ -414,7 +414,7 @@ mod tests {
             blockhash: Hash::default(),
             entries_count,
             executed_transaction_count: 0,
-            parent_blockhash: None,
+            parent_blockhash: Hash::default(),
             block_time: 0,
         });
     }
