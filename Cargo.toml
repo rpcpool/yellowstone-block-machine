@@ -39,8 +39,8 @@ tokio-util = "0.7.16"
 tonic = "0.14.0"
 tracing = "0.1.0"
 tracing-subscriber = "0.3.0"
-yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc", tag = "v16.0.0-rc6+solana.4.3.0.beta.3" }
-yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc", tag = "v16.0.0-rc6+solana.4.3.0.beta.3" }
+yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc", branch = "4.3-transition" }
+yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc", branch = "4.3-transition" }
 yellowstone-block-machine = { path = "crates/yellowstone-block-machine" }
 
 [workspace.lints.clippy]

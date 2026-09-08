@@ -2212,7 +2212,7 @@ dependencies = [
 [[package]]
 name = "yellowstone-grpc-client"
 version = "13.5.0"
-source = "git+https://github.com/rpcpool/yellowstone-grpc?tag=v16.0.0-rc6%2Bsolana.4.3.0.beta.3#1314a20255851e32ff5b55d7554a42cab7524735"
+source = "git+https://github.com/rpcpool/yellowstone-grpc?branch=4.3-transition#862c03bd6c3089d7bddd5a968a9be87bae2af152"
 dependencies = [
  "arc-swap",
  "bytes",
@@ -2232,7 +2232,7 @@ dependencies = [
 [[package]]
 name = "yellowstone-grpc-proto"
 version = "13.0.0-rc3"
-source = "git+https://github.com/rpcpool/yellowstone-grpc?tag=v16.0.0-rc6%2Bsolana.4.3.0.beta.3#1314a20255851e32ff5b55d7554a42cab7524735"
+source = "git+https://github.com/rpcpool/yellowstone-grpc?branch=4.3-transition#862c03bd6c3089d7bddd5a968a9be87bae2af152"
 dependencies = [
  "anyhow",
  "prost",
