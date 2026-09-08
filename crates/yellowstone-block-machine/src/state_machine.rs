@@ -52,7 +52,7 @@ pub struct BlockSummary {
     /// also what the optimistic-freeze path forges, since it has no wire `BlockMeta` to draw
     /// this from).
     ///
-    pub block_time: i64,
+    pub block_time: u64,
 }
 
 // #[derive(Debug, From)]
@@ -113,7 +113,7 @@ pub struct FrozenBlock {
     pub entries_count: u64,
     pub executed_transaction_count: u64,
     pub parent_blockhash: Hash,
-    pub block_time: i64,
+    pub block_time: u64,
 }
 
 // Avg 2k tx + 2k account update

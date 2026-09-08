@@ -649,7 +649,7 @@ impl<E> BlockAccumulator for SimpleBlockAccumulator<E> {
         block.executed_transaction_count = frozen_block_info.executed_transaction_count;
         block.parent_slot = frozen_block_info.parent_slot;
         block.parent_blockhash = frozen_block_info.parent_blockhash.to_bytes();
-        block.blocktime_unix_ts = frozen_block_info.block_time.max(0) as u64;
+        block.blocktime_unix_ts = frozen_block_info.block_time;
         self.frozen_block_map.insert(frozen_block_info.slot, block);
     }
 

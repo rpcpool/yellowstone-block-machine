@@ -51,7 +51,7 @@ impl GeyserEventAdapter for SubscribeUpdate {
                     block_time: block_meta
                         .block_time
                         .as_ref()
-                        .map(|t| t.timestamp)
+                        .map(|t| t.timestamp.max(0) as u64)
                         .unwrap_or(0),
                 }))
             }

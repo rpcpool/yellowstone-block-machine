@@ -44,7 +44,7 @@ pub struct BlockMetaEvInfo {
     ///
     /// Unix timestamp the block was produced at. `0` if the wire didn't report one.
     ///
-    pub block_time: i64,
+    pub block_time: u64,
 }
 
 ///
