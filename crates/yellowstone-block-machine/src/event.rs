@@ -40,7 +40,7 @@ pub struct BlockMetaEvInfo {
     pub entries_count: u64,
     pub executed_transaction_count: u64,
     pub blockhash: [u8; HASH_BYTES],
-    pub parent_blockhash: Option<[u8; HASH_BYTES]>,
+    pub parent_blockhash: [u8; HASH_BYTES],
     ///
     /// Unix timestamp the block was produced at. `0` if the wire didn't report one.
     ///

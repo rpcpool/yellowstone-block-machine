@@ -50,7 +50,7 @@ impl DragonsmouthBlock {
         self.inner.parent_slot
     }
 
-    pub fn parent_blockhash(&self) -> Option<[u8; solana_hash::HASH_BYTES]> {
+    pub fn parent_blockhash(&self) -> [u8; solana_hash::HASH_BYTES] {
         self.inner.parent_blockhash
     }
 
