@@ -10,20 +10,12 @@ use {
     futures_util::Stream,
     solana_clock::{BankId, Slot},
     solana_commitment_config::CommitmentLevel,
-    std::{
-        any::{Any, TypeId},
-        task::ready,
-    },
+    std::task::ready,
     tonic::async_trait,
     yellowstone_grpc_client::{GeyserGrpcClient, GeyserGrpcClientError, GeyserStream},
-    yellowstone_grpc_proto::{
-        geyser::{
-            CommitmentLevel as ProtoCommitmentLevel, SubscribeRequest,
-            SubscribeRequestFilterAccounts, SubscribeRequestFilterSlots, SubscribeUpdate,
-            SubscribeUpdateAccount, SubscribeUpdateEntry, SubscribeUpdateTransaction,
-            SubscribeUpdateTransactionStatus,
-        },
-        prost_types::Type,
+    yellowstone_grpc_proto::geyser::{
+        CommitmentLevel as ProtoCommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
+        SubscribeRequestFilterSlots, SubscribeUpdate,
     },
 };
 
@@ -42,7 +34,7 @@ impl DragonsmouthBlock {
         self.inner.slot
     }
 
-    pub fn bank_id(&self) -> BankId {
+    pub const fn bank_id(&self) -> BankId {
         self.inner.bank_id
     }
 
@@ -50,26 +42,26 @@ impl DragonsmouthBlock {
     /// The entry count reported by the wire's `BlockMeta` itself -- independent of however many
     /// `Entry` events this crate's own sans-io core happened to buffer.
     ///
-    pub fn entry_count(&self) -> u64 {
+    pub const fn entry_count(&self) -> u64 {
         self.inner.entry_count
     }
 
-    pub fn executed_transaction_count(&self) -> u64 {
+    pub const fn executed_transaction_count(&self) -> u64 {
         self.inner.executed_transaction_count
     }
 
-    pub fn parent_slot(&self) -> Slot {
+    pub const fn parent_slot(&self) -> Slot {
         self.inner.parent_slot
     }
 
-    pub fn parent_blockhash(&self) -> [u8; solana_hash::HASH_BYTES] {
+    pub const fn parent_blockhash(&self) -> [u8; solana_hash::HASH_BYTES] {
         self.inner.parent_blockhash
     }
 
     ///
     /// Unix timestamp the block was produced at. `0` if the wire didn't report one.
     ///
-    pub fn blocktime_unix_ts(&self) -> u64 {
+    pub const fn blocktime_unix_ts(&self) -> u64 {
         self.inner.blocktime_unix_ts
     }
 
@@ -77,6 +69,7 @@ impl DragonsmouthBlock {
         self.inner.events.iter()
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn into_iter(self) -> impl IntoIterator<Item = SubscribeUpdate> {
         self.inner.events.into_iter()
     }
@@ -88,15 +81,7 @@ impl From<Block<BankBuffer>> for DragonsmouthBlock {
     }
 }
 
-impl DragonsmouthBlock {
-    const SUPPORTED_VARIANTS: &'static [std::any::TypeId] = &[
-        TypeId::of::<SubscribeUpdateAccount>(),
-        TypeId::of::<SubscribeUpdateEntry>(),
-        TypeId::of::<SubscribeUpdateTransaction>(),
-        TypeId::of::<SubscribeUpdateTransactionStatus>(),
-    ];
-}
-
+#[allow(clippy::large_enum_variant)]
 pub enum BlockStreamEvent {
     ///
     /// A fully reconstructed block, ready for processing.

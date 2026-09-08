@@ -8,10 +8,8 @@ use {
         path::PathBuf,
     },
     tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt},
-    yellowstone_block_machine::{
-        dragonsmouth::client_ext::{
-            BlockStreamEvent, DragonsmouthBlock, DragonsmouthBlockStream, GeyserGrpcExt,
-        },
+    yellowstone_block_machine::dragonsmouth::client_ext::{
+        BlockStreamEvent, DragonsmouthBlock, DragonsmouthBlockStream, GeyserGrpcExt,
     },
     yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcBuilder},
     yellowstone_grpc_proto::geyser::{
@@ -160,7 +158,7 @@ async fn process_block<W>(
                                 let sig = txn.transaction.as_ref().unwrap().signature.clone();
                                 let sig = Signature::try_from(sig).expect("sig");
                                 unique_sig_set.insert(sig);
-                            },
+                            }
                             Some(UpdateOneof::TransactionStatus(txn)) => {
                                 let sig = txn.signature.as_ref();
                                 let sig = Signature::try_from(sig).expect("sig");
@@ -174,9 +172,12 @@ async fn process_block<W>(
                         }
                     }
                     assert_eq!(
-                        entry_txn_cnt as usize, unique_sig_set.len(),
+                        entry_txn_cnt as usize,
+                        unique_sig_set.len(),
                         "slot {}: sum of transaction count across entries ({}) must equal transactions received ({})",
-                        slot, entry_txn_cnt as usize, unique_sig_set.len()
+                        slot,
+                        entry_txn_cnt as usize,
+                        unique_sig_set.len()
                     );
                     let parent_slot = block.parent_slot();
                     let parent_blockhash = bs58::encode(block.parent_blockhash()).into_string();

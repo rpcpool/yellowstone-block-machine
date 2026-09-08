@@ -51,6 +51,7 @@ struct PendingFreeze {
 #[derive(Debug)]
 pub struct BankBuffer {
     slot: Slot,
+    #[allow(dead_code)]
     bank_id: BankId,
     blockhash: [u8; HASH_BYTES],
     events: Vec<SubscribeUpdate>,
@@ -100,7 +101,7 @@ impl BlockEventStore for BankBuffer {
 }
 
 impl BankBuffer {
-    fn new(bank_id: BankId, slot: Slot) -> Self {
+    const fn new(bank_id: BankId, slot: Slot) -> Self {
         Self {
             slot,
             bank_id,
@@ -127,7 +128,7 @@ impl BankBuffer {
     /// sysvar account was observed, BlockMeta arrived, and at least as many entries were
     /// observed as BlockMeta itself reports.
     ///
-    fn is_complete(&self) -> bool {
+    const fn is_complete(&self) -> bool {
         let Some(pending) = self.pending_freeze.as_ref() else {
             return false;
         };

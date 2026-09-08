@@ -114,7 +114,7 @@ impl GeyserEventInfo {
     /// (`FirstShredReceived`/`Completed`), startup accounts, and event kinds not used by block
     /// reconstruction.
     ///
-    pub fn bank_id(&self) -> Option<BankId> {
+    pub const fn bank_id(&self) -> Option<BankId> {
         match self {
             GeyserEventInfo::Slot(ev) => ev.bank_id,
             GeyserEventInfo::BlockMeta(ev) => Some(ev.bank_id),

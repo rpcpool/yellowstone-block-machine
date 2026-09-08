@@ -404,7 +404,7 @@ struct BlockBuffer<E> {
 }
 
 impl<E> BlockBuffer<E> {
-    fn new(bank_id: BankId, slot: Slot) -> Self {
+    const fn new(bank_id: BankId, slot: Slot) -> Self {
         Self {
             slot,
             bank_id,

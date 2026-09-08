@@ -287,7 +287,7 @@ const fn cmp_commitment_level(a: CommitmentLevel, b: CommitmentLevel) -> std::cm
     }
 }
 
-fn commitment_rank(level: CommitmentLevel) -> u8 {
+const fn commitment_rank(level: CommitmentLevel) -> u8 {
     match level {
         CommitmentLevel::Processed => 0,
         CommitmentLevel::Confirmed => 1,
