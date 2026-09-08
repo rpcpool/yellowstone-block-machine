@@ -46,7 +46,12 @@ pub struct BlockSummary {
     pub parent_slot: Slot,
     pub executed_transaction_count: u64,
     pub blockhash: Hash,
-    pub parent_blockhash: Hash,
+    ///
+    /// `None` if the wire's `BlockMeta` didn't report one (e.g. genesis, or a producer that
+    /// doesn't send it), or if this summary was forged by the optimistic-freeze path, which has
+    /// no wire `BlockMeta` to draw this from.
+    ///
+    pub parent_blockhash: Option<Hash>,
     ///
     /// Unix timestamp the block was produced at. `0` if the wire didn't report one (this is
     /// also what the optimistic-freeze path forges, since it has no wire `BlockMeta` to draw
@@ -112,7 +117,7 @@ pub struct FrozenBlock {
     ///
     pub entries_count: u64,
     pub executed_transaction_count: u64,
-    pub parent_blockhash: Hash,
+    pub parent_blockhash: Option<Hash>,
     pub block_time: i64,
 }
 
@@ -181,7 +186,7 @@ impl Block {
             blockhash: self.last_entry_hash().expect("last entry hash"),
             // Not derivable without a wire `BlockMeta` -- this path forges a summary before one
             // has arrived, so these are left at their "not reported" defaults.
-            parent_blockhash: Hash::default(),
+            parent_blockhash: None,
             block_time: 0,
         }
     }
@@ -1032,7 +1037,7 @@ mod tests {
             entry_count: NUM_DATA_ENTRIES + DEFAULT_TICKS_PER_SLOT,
             executed_transaction_count: NUM_DATA_ENTRIES * 10,
             blockhash: last_entry_hash,
-            parent_blockhash: Hash::default(),
+            parent_blockhash: None,
             block_time: 0,
         };
 
@@ -1121,7 +1126,7 @@ mod tests {
             entry_count: NUM_DATA_ENTRIES + DEFAULT_TICKS_PER_SLOT,
             executed_transaction_count: NUM_DATA_ENTRIES * 10,
             blockhash: last_entry_hash,
-            parent_blockhash: Hash::default(),
+            parent_blockhash: None,
             block_time: 0,
         };
 
@@ -1219,7 +1224,7 @@ mod tests {
             entry_count: NUM_DATA_ENTRIES + DEFAULT_TICKS_PER_SLOT,
             executed_transaction_count: NUM_DATA_ENTRIES * 10,
             blockhash: last_entry_hash1,
-            parent_blockhash: Hash::default(),
+            parent_blockhash: None,
             block_time: 0,
         };
 
@@ -1229,7 +1234,7 @@ mod tests {
             entry_count: NUM_DATA_ENTRIES + DEFAULT_TICKS_PER_SLOT,
             executed_transaction_count: NUM_DATA_ENTRIES * 10,
             blockhash: last_entry_hash2,
-            parent_blockhash: Hash::default(),
+            parent_blockhash: None,
             block_time: 0,
         };
 
@@ -1337,7 +1342,7 @@ mod tests {
             entry_count: NUM_DATA_ENTRIES + DEFAULT_TICKS_PER_SLOT,
             executed_transaction_count: NUM_DATA_ENTRIES * 10,
             blockhash: last_entry_hash,
-            parent_blockhash: Hash::default(),
+            parent_blockhash: None,
             block_time: 0,
         };
 

@@ -43,11 +43,10 @@ impl GeyserEventAdapter for SubscribeUpdate {
                         .expect("blockhash format")
                         .to_bytes(),
                     // Unlike `blockhash`, `parent_blockhash` may legitimately be absent from the
-                    // wire (e.g. genesis, or a producer that doesn't report it) -- default to
-                    // the zero hash rather than panicking.
+                    // wire (e.g. genesis, or a producer that doesn't report it).
                     parent_blockhash: solana_hash::Hash::from_str(&block_meta.parent_blockhash)
-                        .unwrap_or_default()
-                        .to_bytes(),
+                        .ok()
+                        .map(|h| h.to_bytes()),
                     block_time: block_meta
                         .block_time
                         .as_ref()
