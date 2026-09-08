@@ -46,8 +46,8 @@ impl GeyserEventAdapter for SubscribeUpdate {
                     // Lenient, unlike `blockhash` above -- genesis's parent_blockhash is empty,
                     // not a valid base58 hash.
                     parent_blockhash: solana_hash::Hash::from_str(&block_meta.parent_blockhash)
-                        .map(|h| h.to_bytes())
-                        .unwrap_or([0; solana_hash::HASH_BYTES]),
+                        .ok()
+                        .map(|h| h.to_bytes()),
                     block_time: block_meta
                         .block_time
                         .map_or(0, |t| t.timestamp.max(0) as u64),

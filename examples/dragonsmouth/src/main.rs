@@ -170,7 +170,10 @@ async fn process_block<W>(
                         slot, entry_txn_cnt, txn_cnt
                     );
                     let parent_slot = block.parent_slot();
-                    let parent_blockhash = bs58::encode(block.parent_blockhash()).into_string();
+                    let parent_blockhash = block
+                        .parent_blockhash()
+                        .map(|h| bs58::encode(h).into_string())
+                        .unwrap_or_default();
 
                     writeln!(out, "Block ({i}) {slot}, bank_id: {bank_id}, txn: {txn_cnt}, account: {account_cnt}, entry: {entry_cnt}, parent_slot: {parent_slot}, parent hash: {parent_blockhash}").expect("write");
                     cross_check_account_txn_join(block);

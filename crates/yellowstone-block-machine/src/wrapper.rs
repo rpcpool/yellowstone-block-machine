@@ -149,7 +149,7 @@ impl BlocksStateMachineWrapper {
             parent_slot: block_meta.parent_slot,
             executed_transaction_count: block_meta.executed_transaction_count,
             blockhash: Hash::new_from_array(block_meta.blockhash),
-            parent_blockhash: Hash::new_from_array(block_meta.parent_blockhash),
+            parent_blockhash: block_meta.parent_blockhash.map(Hash::new_from_array),
             block_time: block_meta.block_time,
             bank_id: block_meta.bank_id,
         };
