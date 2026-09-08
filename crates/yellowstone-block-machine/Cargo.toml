@@ -1,6 +1,6 @@
 [package]
 name = "yellowstone-block-machine"
-version = "0.9.0"
+version = "0.10.0"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -49,3 +49,7 @@ yellowstone-grpc-proto = { workspace = true, optional = true }
 [dev-dependencies]
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+
+
+[lints]
+workspace = true

@@ -40,6 +40,11 @@ pub struct BlockMetaEvInfo {
     pub entries_count: u64,
     pub executed_transaction_count: u64,
     pub blockhash: [u8; HASH_BYTES],
+    pub parent_blockhash: [u8; HASH_BYTES],
+    ///
+    /// Unix timestamp the block was produced at. `0` if the wire didn't report one.
+    ///
+    pub block_time: u64,
 }
 
 ///
@@ -82,7 +87,7 @@ pub enum GeyserEventInfo {
 }
 
 impl GeyserEventInfo {
-    pub fn slot(&self) -> Slot {
+    pub const fn slot(&self) -> Slot {
         match self {
             GeyserEventInfo::Slot(ev) => ev.slot,
             GeyserEventInfo::BlockMeta(ev) => ev.slot,

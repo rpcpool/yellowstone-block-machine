@@ -24,6 +24,18 @@ pub struct Block<Storage> {
     pub slot: Slot,
     pub blockhash: [u8; HASH_BYTES],
     pub events: Storage,
+    ///
+    /// The entry count reported by the wire's `BlockMeta` itself -- see
+    /// [`FrozenBlock::entries_count`].
+    ///
+    pub entry_count: u64,
+    pub executed_transaction_count: u64,
+    pub parent_slot: Slot,
+    pub parent_blockhash: [u8; HASH_BYTES],
+    ///
+    /// Unix timestamp the block was produced at. `0` if the wire didn't report one.
+    ///
+    pub blocktime_unix_ts: u64,
 }
 
 impl<Storage> AsRef<Storage> for Block<Storage> {
@@ -257,7 +269,7 @@ where
 {
 }
 
-fn compare_commitment(cl1: CommitmentLevel, cl2: CommitmentLevel) -> Ordering {
+const fn compare_commitment(cl1: CommitmentLevel, cl2: CommitmentLevel) -> Ordering {
     match (cl1, cl2) {
         (CommitmentLevel::Processed, CommitmentLevel::Processed) => Ordering::Equal,
         (CommitmentLevel::Confirmed, CommitmentLevel::Confirmed) => Ordering::Equal,
@@ -429,6 +441,11 @@ struct BlockBuffer<E> {
     transaction_idx_map: Vec<usize>,
     entry_idx_map: Vec<usize>,
     other_idx_map: Vec<usize>,
+    entry_count: u64,
+    executed_transaction_count: u64,
+    parent_slot: Slot,
+    parent_blockhash: [u8; HASH_BYTES],
+    blocktime_unix_ts: u64,
 }
 
 impl<E> Default for BlockBuffer<E> {
@@ -440,6 +457,11 @@ impl<E> Default for BlockBuffer<E> {
             transaction_idx_map: Vec::new(),
             entry_idx_map: Vec::new(),
             other_idx_map: Vec::new(),
+            entry_count: 0,
+            executed_transaction_count: 0,
+            parent_slot: 0,
+            parent_blockhash: [0; HASH_BYTES],
+            blocktime_unix_ts: 0,
         }
     }
 }
@@ -563,6 +585,11 @@ impl<E> BlockBuffer<E> {
         Block {
             slot,
             blockhash: self.blockhash,
+            entry_count: self.entry_count,
+            executed_transaction_count: self.executed_transaction_count,
+            parent_slot: self.parent_slot,
+            parent_blockhash: self.parent_blockhash,
+            blocktime_unix_ts: self.blocktime_unix_ts,
             events: SimpleBlockStore {
                 slot,
                 events: self.events,
@@ -618,6 +645,11 @@ impl<E> BlockAccumulator for SimpleBlockAccumulator<E> {
             return;
         };
         block.blockhash = frozen_block_info.blockhash.to_bytes();
+        block.entry_count = frozen_block_info.entries_count;
+        block.executed_transaction_count = frozen_block_info.executed_transaction_count;
+        block.parent_slot = frozen_block_info.parent_slot;
+        block.parent_blockhash = frozen_block_info.parent_blockhash.to_bytes();
+        block.blocktime_unix_ts = frozen_block_info.block_time;
         self.frozen_block_map.insert(frozen_block_info.slot, block);
     }
 
@@ -655,7 +687,7 @@ mod tests {
         },
     };
 
-    fn update(oneof: UpdateOneof, filters: Vec<String>) -> SubscribeUpdate {
+    const fn update(oneof: UpdateOneof, filters: Vec<String>) -> SubscribeUpdate {
         SubscribeUpdate {
             filters,
             created_at: None,
@@ -724,6 +756,7 @@ mod tests {
         )
     }
 
+    #[allow(clippy::type_complexity)]
     fn feed(
         stream: &mut BlockStream<
             stream::Iter<std::vec::IntoIter<Result<SubscribeUpdate, io::Error>>>,
@@ -743,6 +776,7 @@ mod tests {
         stream.process_state_machine_output();
     }
 
+    #[allow(clippy::type_complexity)]
     fn empty_source_stream(
         min_commitment_level: CommitmentLevel,
     ) -> BlockStream<

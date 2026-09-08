@@ -34,7 +34,7 @@ where
         }
     }
 
-    fn next_version(&mut self) -> u64 {
+    const fn next_version(&mut self) -> u64 {
         let version = self.version;
         self.version += 1;
         version
@@ -123,14 +123,14 @@ where
     ///
     /// Returns an iterator over the keys in the set.
     ///
-    pub fn iter(&self) -> OrderedSetIter<'_, K> {
+    pub const fn iter(&self) -> OrderedSetIter<'_, K> {
         OrderedSetIter {
             ordered_set: self,
             next_index: 0,
         }
     }
 
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.len
     }
 }
@@ -586,13 +586,12 @@ where
                     indireclty_rooted,
                 )
             }
-            (false, false) => {
-                if self.forked_slots.contains(&parent) {
-                    if self.forked_slots.insert(slot.clone()) {
-                        newly_forked_slot_out.insert(slot);
-                    }
+            (false, false) if self.forked_slots.contains(&parent) => {
+                if self.forked_slots.insert(slot.clone()) {
+                    newly_forked_slot_out.insert(slot);
                 }
             }
+
             _ => {}
         }
         true
@@ -626,7 +625,7 @@ where
 
 #[cfg(test)]
 #[allow(dead_code)]
-fn module_path_for_test() -> &'static str {
+const fn module_path_for_test() -> &'static str {
     module_path!()
 }
 
