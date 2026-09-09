@@ -1,21 +1,21 @@
 use {
     crate::{
-        dragonsmouth::{RESERVED_FILTER_NAME, block_accumulator::DragonsmouthBlockCumulator},
-        state_machine::{DeadBlockDetected, ForkDetected, SlotCommitmentStatusUpdate},
-        stream::{
-            Block, BlockEventStore, BlockMachineOutput, BlockStream, SimpleBlockStore,
-            SimpleBlockStoreIter,
+        dragonsmouth::{
+            RESERVED_FILTER_NAME,
+            block_accumulator::{BankBuffer, DragonsmouthBlockCumulator, SYSVAR_PROGRAM_ID},
         },
+        state_machine::{DeadBlockDetected, ForkDetected, SlotCommitmentStatusUpdate},
+        stream::{Block, BlockEventStore, BlockMachineOutput, BlockStream},
     },
     futures_util::Stream,
-    solana_clock::Slot,
+    solana_clock::{BankId, Slot},
     solana_commitment_config::CommitmentLevel,
     std::task::ready,
     tonic::async_trait,
     yellowstone_grpc_client::{GeyserGrpcClient, GeyserGrpcClientError, GeyserStream},
     yellowstone_grpc_proto::geyser::{
-        CommitmentLevel as ProtoCommitmentLevel, SubscribeRequest, SubscribeRequestFilterSlots,
-        SubscribeUpdate,
+        CommitmentLevel as ProtoCommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
+        SubscribeRequestFilterSlots, SubscribeUpdate,
     },
 };
 
@@ -26,12 +26,16 @@ pub struct DragonsmouthBlockStream {
 }
 
 pub struct DragonsmouthBlock {
-    inner: Block<SimpleBlockStore<SubscribeUpdate>>,
+    inner: Block<BankBuffer>,
 }
 
 impl DragonsmouthBlock {
     pub const fn slot(&self) -> Slot {
         self.inner.slot
+    }
+
+    pub const fn bank_id(&self) -> BankId {
+        self.inner.bank_id
     }
 
     ///
@@ -60,50 +64,24 @@ impl DragonsmouthBlock {
     pub const fn blocktime_unix_ts(&self) -> u64 {
         self.inner.blocktime_unix_ts
     }
-}
 
-impl From<Block<SimpleBlockStore<SubscribeUpdate>>> for DragonsmouthBlock {
-    fn from(block: Block<SimpleBlockStore<SubscribeUpdate>>) -> Self {
-        Self { inner: block }
-    }
-}
-
-impl BlockEventStore for DragonsmouthBlock {
-    type EventT = SubscribeUpdate;
-
-    type Iter<'a> = SimpleBlockStoreIter<'a, SubscribeUpdate>;
-
-    type IntoIter = std::vec::IntoIter<SubscribeUpdate>;
-
-    fn len(&self) -> usize {
-        self.inner.as_ref().len()
+    pub fn iter(&self) -> impl Iterator<Item = &SubscribeUpdate> {
+        self.inner.events.iter()
     }
 
-    fn iter(&self) -> Self::Iter<'_> {
-        self.inner.as_ref().iter()
-    }
-
-    fn account_iter(&self) -> Self::Iter<'_> {
-        self.inner.as_ref().account_iter()
-    }
-
-    fn transaction_iter(&self) -> Self::Iter<'_> {
-        self.inner.as_ref().transaction_iter()
-    }
-
-    fn entry_iter(&self) -> Self::Iter<'_> {
-        self.inner.as_ref().entry_iter()
-    }
-
-    fn other_iter(&self) -> Self::Iter<'_> {
-        self.inner.as_ref().other_iter()
-    }
-
-    fn into_iter(self) -> Self::IntoIter {
+    #[allow(clippy::should_implement_trait)]
+    pub fn into_iter(self) -> impl IntoIterator<Item = SubscribeUpdate> {
         self.inner.events.into_iter()
     }
 }
 
+impl From<Block<BankBuffer>> for DragonsmouthBlock {
+    fn from(block: Block<BankBuffer>) -> Self {
+        Self { inner: block }
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
 pub enum BlockStreamEvent {
     ///
     /// A fully reconstructed block, ready for processing.
@@ -223,6 +201,19 @@ impl GeyserGrpcExt for GeyserGrpcClient {
         subscribe_request
             .entry
             .insert(RESERVED_FILTER_NAME.to_owned(), Default::default());
+
+        // Force-subscribe to every sysvar account (by owner, which covers all of them in one
+        // filter -- including MUST_HAVE_SYSVAR_ACCOUNTS), the same way as slots/blocks_meta/
+        // entry above -- `DragonsmouthBlockCumulator` won't consider a block complete without
+        // having observed all the must-have ones (see its module doc comment), whether or not
+        // the caller's own request asked for any accounts at all.
+        subscribe_request.accounts.insert(
+            RESERVED_FILTER_NAME.to_owned(),
+            SubscribeRequestFilterAccounts {
+                owner: vec![SYSVAR_PROGRAM_ID.to_string()],
+                ..Default::default()
+            },
+        );
 
         subscribe_request.commitment = Some(0); // Processed
 

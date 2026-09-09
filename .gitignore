@@ -9,3 +9,4 @@ target
 *.swo
 *.bak
 *.old
+.claude

@@ -7,7 +7,7 @@ use {
             SlotCommitmentStatusUpdate, SlotLifecycle, SlotLifecycleUpdate, UntrackedSlot,
         },
     },
-    solana_clock::Slot,
+    solana_clock::{BankId, Slot},
     solana_commitment_config::CommitmentLevel,
     solana_hash::Hash,
 };
@@ -23,7 +23,7 @@ const STATE_MACHINE_GC_EVERY_COMPLETED_SLOTS: usize = 10;
 pub struct BlocksStateMachineWrapper {
     pub sm: BlocksStateMachine,
     completed_slots_since_last_gc: usize,
-    slot_gc_tracer: Option<Vec<Slot>>,
+    bank_gc_tracer: Option<Vec<BankId>>,
 }
 
 impl From<EntryEvInfo> for EntryInfo {
@@ -34,6 +34,7 @@ impl From<EntryEvInfo> for EntryInfo {
             entry_index: value.index,
             starting_txn_index: value.starting_transaction_index,
             executed_txn_count: value.executed_transaction_count,
+            bank_id: value.bank_id,
         }
     }
 }
@@ -43,7 +44,7 @@ impl BlocksStateMachineWrapper {
         Self {
             sm: BlocksStateMachine::default(),
             completed_slots_since_last_gc: 0,
-            slot_gc_tracer: None,
+            bank_gc_tracer: None,
         }
     }
 
@@ -51,23 +52,24 @@ impl BlocksStateMachineWrapper {
         Self {
             sm: BlocksStateMachine::default(),
             completed_slots_since_last_gc: 0,
-            slot_gc_tracer: Some(Vec::with_capacity(10)),
+            bank_gc_tracer: Some(Vec::with_capacity(10)),
         }
     }
 
     ///
-    /// Pops the next slot that has been garbage collected by the state machine, if slot GC tracing is enabled.
+    /// Pops the next bank_id that has been garbage collected by the state machine, if GC
+    /// tracing is enabled.
     ///
     #[inline]
-    pub fn pop_slot_gc_trace(&mut self) -> Option<Slot> {
-        let tracer = self.slot_gc_tracer.as_mut()?;
+    pub fn pop_bank_gc_trace(&mut self) -> Option<BankId> {
+        let tracer = self.bank_gc_tracer.as_mut()?;
         tracer.pop()
     }
 
     fn maybe_run_gc_after_completed_slot(&mut self) {
         self.completed_slots_since_last_gc += 1;
         if self.completed_slots_since_last_gc >= STATE_MACHINE_GC_EVERY_COMPLETED_SLOTS {
-            self.sm.gc(self.slot_gc_tracer.as_mut());
+            self.sm.gc(self.bank_gc_tracer.as_mut());
             self.completed_slots_since_last_gc = 0;
         }
     }
@@ -100,6 +102,7 @@ impl BlocksStateMachineWrapper {
                     SlotStatusKind::Dead => SlotLifecycle::Dead,
                     _ => unreachable!(),
                 },
+                bank_id: slot_update.bank_id,
             };
             self.sm.process_replay_event(lifecycle_update.into())?;
         } else {
@@ -109,12 +112,21 @@ impl BlocksStateMachineWrapper {
                     slot: slot_update.slot,
                     parent_slot: slot_update.parent,
                     stage: SlotLifecycle::Dead,
+                    bank_id: None,
                 };
                 self.sm.process_replay_event(lifecycle_update.into())?;
             } else {
+                let Some(bank_id) = slot_update.bank_id else {
+                    tracing::warn!(
+                        "commitment status for slot {} carries no bank_id; ignoring",
+                        slot_update.slot
+                    );
+                    return Err(UntrackedSlot);
+                };
                 let commitment_level_update = SlotCommitmentStatusUpdate {
                     parent_slot: slot_update.parent,
                     slot: slot_update.slot,
+                    bank_id,
                     commitment: match slot_update.status {
                         SlotStatusKind::Processed => CommitmentLevel::Processed,
                         SlotStatusKind::Confirmed => CommitmentLevel::Confirmed,
@@ -139,6 +151,7 @@ impl BlocksStateMachineWrapper {
             blockhash: Hash::new_from_array(block_meta.blockhash),
             parent_blockhash: Hash::new_from_array(block_meta.parent_blockhash),
             block_time: block_meta.block_time,
+            bank_id: block_meta.bank_id,
         };
         self.sm.process_replay_event(block_summary.into())
         // Currently not used in block reconstruction
@@ -166,13 +179,13 @@ impl BlocksStateMachineWrapper {
             GeyserEventInfo::Slot(slot_update) => self.handle_slot_update(slot_update),
             GeyserEventInfo::BlockMeta(block_meta) => self.handle_block_meta(block_meta),
             GeyserEventInfo::Entry(entry) => self.handle_block_entry(entry),
-            GeyserEventInfo::Transaction { slot }
-            | GeyserEventInfo::Account { slot }
-            | GeyserEventInfo::Other { slot } => {
-                if !self.sm.is_slot_tracked(slot) {
-                    return Err(UntrackedSlot);
+            GeyserEventInfo::BankData { bank_id, .. }
+            | GeyserEventInfo::SysvarAccount { bank_id, .. } => {
+                if self.sm.is_bank_trackable(bank_id) {
+                    Ok(())
+                } else {
+                    Err(UntrackedSlot)
                 }
-                Ok(())
             }
         }
     }

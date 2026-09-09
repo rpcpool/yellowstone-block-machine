@@ -48,10 +48,7 @@
 //!
 //! ```no_run
 //! use futures_util::StreamExt;
-//! use yellowstone_block_machine::{
-//!     dragonsmouth::client_ext::{BlockStreamEvent, GeyserGrpcExt},
-//!     stream::BlockEventStore,
-//! };
+//! use yellowstone_block_machine::dragonsmouth::client_ext::{BlockStreamEvent, GeyserGrpcExt};
 //! use yellowstone_grpc_client::GeyserGrpcBuilder;
 //! use yellowstone_grpc_proto::geyser::{CommitmentLevel, SubscribeRequest};
 //!
@@ -67,9 +64,7 @@
 //!             BlockStreamEvent::FrozenBlock(block) => {
 //!                 let _ = (
 //!                     block.slot(),
-//!                     block.transaction_len(),
-//!                     block.account_len(),
-//!                     block.entry_len(),
+//!                     block.bank_id(),
 //!                     block.entry_count(),
 //!                     block.parent_slot(),
 //!                     block.parent_blockhash(),

@@ -12,6 +12,7 @@ description = "Example application using yellowstone-block-machine to connect to
 
 
 [dependencies]
+bs58 = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 common_macros = { workspace = true }
 futures-util = { workspace = true }
