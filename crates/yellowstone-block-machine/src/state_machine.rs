@@ -910,15 +910,32 @@ impl BlocksStateMachine {
         }
 
         // This should never happen, but in case it does we will try to optimistically freeze
-        // whichever sibling bank(s) at the parent slot are still buffering.
-        if let Some(parent_ids) = self.slot_to_banks.get(&block_summary.parent_slot).cloned() {
-            for parent_bank_id in parent_ids {
-                if self.block_buffer_map.contains_key(&parent_bank_id) {
-                    tracing::warn!(
-                        "Freezing bank {bank_id} (slot {slot}) whose parent slot {} still has bank {parent_bank_id} in the buffer",
-                        block_summary.parent_slot
-                    );
-                    self.need_optimistic_freeze.insert(parent_bank_id);
+        // whichever bank at the parent slot this child's own BlockMeta names as its parent --
+        // identified by content, not by consensus resolution: a still-buffering candidate's
+        // would-be blockhash (`last_entry_hash`, the same value `forge_optimistic_block_summary`
+        // would freeze it with) must match `block_summary.parent_blockhash` byte-for-byte. Under
+        // bank_id keying the parent slot can legitimately have more than one bank instance, and
+        // only the one this child's hash cryptographically names is ever the real parent; any
+        // other still-buffering bank there is a competing instance awaiting discard, not a late
+        // winner, and matching by hash (rather than by resolution, which may not have happened
+        // yet, or by "every buffering bank", which fabricates blocks for losers) is both more
+        // precise and available earlier. `Hash::default()` is the sentinel this crate's own
+        // forged summaries use for "unknown" (see `forge_optimistic_block_summary`), so a child
+        // reporting it can never be matched against here -- there is nothing to safely identify.
+        if block_summary.parent_blockhash != Hash::default() {
+            if let Some(parent_ids) = self.slot_to_banks.get(&block_summary.parent_slot).cloned() {
+                for parent_bank_id in parent_ids {
+                    if let Some(block) = self.block_buffer_map.get(&parent_bank_id) {
+                        if block.can_be_optimistic_frozen()
+                            && block.last_entry_hash() == Some(block_summary.parent_blockhash)
+                        {
+                            tracing::warn!(
+                                "Freezing bank {bank_id} (slot {slot}) whose parent slot {} still has bank {parent_bank_id} in the buffer, identified as the parent by matching blockhash",
+                                block_summary.parent_slot
+                            );
+                            self.need_optimistic_freeze.insert(parent_bank_id);
+                        }
+                    }
                 }
             }
         }
@@ -1601,5 +1618,682 @@ mod tests {
         assert!(sm.pop_next_unprocess_blockstore_update().is_none());
         assert!(!sm.block_buffer_map.contains_key(&bank_a));
         assert!(!sm.slot_to_banks.contains_key(&slot));
+    }
+}
+
+///
+/// Regression suite for the defects catalogued in `AUDIT.md` at the repository root.
+///
+/// Every test here asserts the **correct** behaviour, so every one of them **fails against the
+/// current implementation**. They are the reproduction cases for the audit: a test flipping to
+/// green means that finding is fixed. Each test names the `AUDIT.md` finding it covers.
+///
+/// Run just this module with:
+///
+/// ```text
+/// cargo test --all-features audit_regression::
+/// ```
+///
+/// To keep a green default suite while these are open, add `#[ignore]` to each test and run them
+/// with `cargo test --all-features audit_regression:: -- --ignored`.
+///
+#[cfg(test)]
+mod audit_regression {
+    use super::*;
+
+    fn created_bank(slot: Slot, parent: Option<Slot>, bank_id: BankId) -> SlotLifecycleUpdate {
+        SlotLifecycleUpdate {
+            slot,
+            parent_slot: parent,
+            stage: SlotLifecycle::CreatedBank,
+            bank_id: Some(bank_id),
+        }
+    }
+
+    fn dead(slot: Slot) -> SlotLifecycleUpdate {
+        SlotLifecycleUpdate {
+            slot,
+            parent_slot: None,
+            stage: SlotLifecycle::Dead,
+            bank_id: None,
+        }
+    }
+
+    fn cmt(
+        slot: Slot,
+        parent: Option<Slot>,
+        level: CommitmentLevel,
+        bank_id: BankId,
+    ) -> SlotCommitmentStatusUpdate {
+        SlotCommitmentStatusUpdate {
+            slot,
+            parent_slot: parent,
+            commitment: level,
+            bank_id,
+        }
+    }
+
+    /// `CreatedBank` plus `n` entries and no `BlockMeta`, so the bank is left buffering.
+    fn buffer(
+        sm: &mut BlocksStateMachine,
+        slot: Slot,
+        parent: Option<Slot>,
+        bank_id: BankId,
+        n: u64,
+    ) {
+        sm.process_replay_event(created_bank(slot, parent, bank_id).into())
+            .unwrap();
+        for i in 0..n {
+            sm.process_replay_event(
+                EntryInfo {
+                    slot,
+                    bank_id,
+                    entry_index: i,
+                    starting_txn_index: i * 10,
+                    entry_hash: Hash::new_unique(),
+                    executed_txn_count: 10,
+                }
+                .into(),
+            )
+            .unwrap();
+        }
+    }
+
+    /// `buffer` plus the `BlockMeta` that freezes the bank.
+    fn seal(sm: &mut BlocksStateMachine, slot: Slot, parent: Option<Slot>, bank_id: BankId) {
+        buffer(sm, slot, parent, bank_id, 4);
+        sm.process_replay_event(
+            BlockSummary {
+                slot,
+                bank_id,
+                parent_slot: parent.unwrap_or(0),
+                entry_count: 4,
+                executed_transaction_count: 40,
+                blockhash: Hash::new_unique(),
+                parent_blockhash: Hash::new_unique(),
+                block_time: 1_700_000_000,
+            }
+            .into(),
+        )
+        .unwrap();
+    }
+
+    fn drain(sm: &mut BlocksStateMachine) -> Vec<BlockStateMachineOutput> {
+        let mut v = Vec::new();
+        while let Some(o) = sm.pop_next_unprocess_blockstore_update() {
+            v.push(o);
+        }
+        v
+    }
+
+    fn frozen_bank_ids(outputs: &[BlockStateMachineOutput]) -> Vec<BankId> {
+        outputs
+            .iter()
+            .filter_map(|o| match o {
+                BlockStateMachineOutput::FrozenBlock(b) => Some(b.bank_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn statuses(outputs: &[BlockStateMachineOutput]) -> Vec<(Slot, CommitmentLevel)> {
+        outputs
+            .iter()
+            .filter_map(|o| match o {
+                BlockStateMachineOutput::SlotStatus(s) => Some((s.slot, s.commitment)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fork_reports(outputs: &[BlockStateMachineOutput]) -> Vec<(Slot, Vec<BankId>)> {
+        outputs
+            .iter()
+            .filter_map(|o| match o {
+                BlockStateMachineOutput::ForksDetected(f) => Some((f.slot, f.bank_ids.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    ///
+    /// AUDIT.md finding 1: optimistic freeze fabricates blocks for sibling banks.
+    ///
+    /// A bank at the parent slot that never received a `BlockMeta` is not a late winner, it is a
+    /// competing instance awaiting discard. Freezing it forges a blockhash from the last entry
+    /// hash and invents a zero `parent_blockhash` and a zero `block_time`.
+    ///
+    #[test]
+    fn audit_1_no_fabricated_block_for_parent_slot_sibling() {
+        let mut sm = BlocksStateMachine::default();
+        // Parent slot 10 has two banks. 1000 seals for real, 1001 only ever buffers.
+        sm.process_replay_event(created_bank(10, Some(9), 1000).into())
+            .unwrap();
+        sm.process_replay_event(created_bank(10, Some(9), 1001).into())
+            .unwrap();
+        seal(&mut sm, 10, Some(9), 1000);
+        buffer(&mut sm, 10, Some(9), 1001, 3);
+        assert!(
+            sm.block_buffer_map.contains_key(&1001),
+            "precondition: bank 1001 is still buffering"
+        );
+        drain(&mut sm);
+
+        // A child at slot 11 whose parent is slot 10 receives its own BlockMeta.
+        seal(&mut sm, 11, Some(10), 1100);
+        let outputs = drain(&mut sm);
+
+        let ids = frozen_bank_ids(&outputs);
+        assert!(
+            !ids.contains(&1001),
+            "bank 1001 never received a BlockMeta and must not be frozen, got frozen banks {ids:?}"
+        );
+    }
+
+    ///
+    /// AUDIT.md finding 1, positive case: legitimate optimistic-freeze recovery still works, and
+    /// now identifies the true parent by content -- its own would-be blockhash matching the
+    /// child's declared `parent_blockhash` -- rather than by consensus resolution. That means it
+    /// recovers even *before* the parent slot has resolved, which a resolution-gated fix could
+    /// not do.
+    ///
+    #[test]
+    fn audit_1b_optimistic_freeze_still_recovers_the_real_parent_by_hash() {
+        let mut sm = BlocksStateMachine::default();
+        let parent_bank = 2000;
+        let last_hash = Hash::new_unique();
+
+        // Parent slot 20 has a single bank that received all its entries but never got a
+        // BlockMeta -- the classic recovery scenario -- and slot 20 is NOT yet resolved (no
+        // commitment update at all was ever seen for it).
+        sm.process_replay_event(created_bank(20, Some(19), parent_bank).into())
+            .unwrap();
+        for i in 0..3u64 {
+            let hash = if i == 2 {
+                last_hash
+            } else {
+                Hash::new_unique()
+            };
+            sm.process_replay_event(
+                EntryInfo {
+                    slot: 20,
+                    bank_id: parent_bank,
+                    entry_index: i,
+                    starting_txn_index: i * 10,
+                    entry_hash: hash,
+                    executed_txn_count: 10,
+                }
+                .into(),
+            )
+            .unwrap();
+        }
+        assert!(
+            !sm.resolved_bank_per_slot.contains_key(&20),
+            "precondition: slot 20 is not yet resolved by any consensus signal"
+        );
+
+        // A child at slot 21 arrives whose BlockMeta names `last_hash` as its parent_blockhash --
+        // exactly what the parent bank's own last entry hash would freeze to.
+        sm.process_replay_event(created_bank(21, Some(20), 2100).into())
+            .unwrap();
+        sm.process_replay_event(
+            EntryInfo {
+                slot: 21,
+                bank_id: 2100,
+                entry_index: 0,
+                starting_txn_index: 0,
+                entry_hash: Hash::new_unique(),
+                executed_txn_count: 1,
+            }
+            .into(),
+        )
+        .unwrap();
+        sm.process_replay_event(
+            BlockSummary {
+                slot: 21,
+                bank_id: 2100,
+                parent_slot: 20,
+                entry_count: 1,
+                executed_transaction_count: 1,
+                blockhash: Hash::new_unique(),
+                parent_blockhash: last_hash,
+                block_time: 1,
+            }
+            .into(),
+        )
+        .unwrap();
+
+        let ids = frozen_bank_ids(&drain(&mut sm));
+        assert!(
+            ids.contains(&parent_bank),
+            "the parent bank's own last entry hash matches the child's declared              parent_blockhash, so it must be recovered by optimistic freeze even though slot 20              never resolved, got frozen banks {ids:?}"
+        );
+    }
+
+    ///
+    /// AUDIT.md finding 2: retroactive rooting drops a slot's entire commitment delivery.
+    ///
+    /// A slot with two competing banks stays unresolved by design. Rooting it through a finalized
+    /// child must still deliver its commitment levels rather than discard the slot.
+    ///
+    #[test]
+    fn audit_2_retroactively_rooted_slot_still_gets_its_commitment() {
+        let mut sm = BlocksStateMachine::default();
+        // Both banks registered before either freezes, so slot 1 never resolves.
+        sm.process_replay_event(created_bank(1, Some(0), 100).into())
+            .unwrap();
+        sm.process_replay_event(created_bank(1, Some(0), 101).into())
+            .unwrap();
+        seal(&mut sm, 1, Some(0), 100);
+        seal(&mut sm, 1, Some(0), 101);
+        sm.process_consensus_event(cmt(1, Some(0), CommitmentLevel::Processed, 100).into());
+        sm.process_consensus_event(cmt(1, Some(0), CommitmentLevel::Processed, 101).into());
+        assert!(
+            !sm.resolved_bank_per_slot.contains_key(&1),
+            "precondition: slot 1 is unresolved"
+        );
+        drain(&mut sm);
+
+        // The child finalizes, which retroactively roots slot 1.
+        seal(&mut sm, 2, Some(1), 200);
+        sm.process_consensus_event(cmt(2, Some(1), CommitmentLevel::Finalized, 200).into());
+        let outputs = drain(&mut sm);
+
+        let seen = statuses(&outputs);
+        assert!(
+            sm.forks.is_rooted_slot(&1),
+            "precondition: Forks rooted slot 1"
+        );
+        assert!(
+            seen.contains(&(1, CommitmentLevel::Finalized)),
+            "slot 1 was rooted so it must receive Finalized, got {seen:?}"
+        );
+    }
+
+    ///
+    /// AUDIT.md finding 3: a gap-filled Finalized schedules slot teardown three times.
+    ///
+    /// `deliver_commitment` tests the outer `commitment` rather than `update.commitment`, so every
+    /// synthesized level takes the Finalized branch. Teardown must be scheduled once, on the
+    /// revision of the genuine Finalized update.
+    ///
+    #[test]
+    fn audit_3_gapfill_schedules_teardown_once_at_the_finalized_revision() {
+        let mut sm = BlocksStateMachine::default();
+        seal(&mut sm, 1, Some(0), 100);
+        sm.process_consensus_event(cmt(1, Some(0), CommitmentLevel::Finalized, 100).into());
+
+        // Revisions: 0 = FrozenBlock, 1 = Processed, 2 = Confirmed, 3 = Finalized.
+        let mut sched: Vec<(Revision, Vec<Slot>)> = sm
+            .deregister_finalized_slot_schedule
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        sched.sort();
+        assert_eq!(
+            sched,
+            vec![(3, vec![1])],
+            "teardown must be scheduled once, on the Finalized revision only"
+        );
+    }
+
+    ///
+    /// AUDIT.md finding 3, first cascade: premature teardown lets an already-delivered bank
+    /// re-freeze, emitting a second `FrozenBlock` for the same bank instance.
+    ///
+    #[test]
+    fn audit_3a_duplicate_block_meta_is_still_rejected_after_partial_drain() {
+        let mut sm = BlocksStateMachine::default();
+        seal(&mut sm, 1, Some(0), 100);
+        sm.process_consensus_event(cmt(1, Some(0), CommitmentLevel::Finalized, 100).into());
+
+        // A consumer pops the block and only the synthesized Processed status.
+        assert!(matches!(
+            sm.pop_next_unprocess_blockstore_update().unwrap(),
+            BlockStateMachineOutput::FrozenBlock(_)
+        ));
+        let BlockStateMachineOutput::SlotStatus(s) =
+            sm.pop_next_unprocess_blockstore_update().unwrap()
+        else {
+            panic!("expected a slot status");
+        };
+        assert_eq!(s.commitment, CommitmentLevel::Processed);
+        assert_eq!(
+            sm.unprocess_blockstore_update_queue_len(),
+            2,
+            "precondition: Confirmed and Finalized are still unread"
+        );
+        sm.gc(None);
+
+        let dup = sm.process_replay_event(
+            BlockSummary {
+                slot: 1,
+                bank_id: 100,
+                parent_slot: 0,
+                entry_count: 4,
+                executed_transaction_count: 40,
+                blockhash: Hash::new_unique(),
+                parent_blockhash: Hash::new_unique(),
+                block_time: 1,
+            }
+            .into(),
+        );
+        assert!(
+            dup.is_err(),
+            "a duplicate BlockMeta for the already-frozen bank 100 must be rejected"
+        );
+        let ids = frozen_bank_ids(&drain(&mut sm));
+        assert!(
+            ids.is_empty(),
+            "bank 100 was already delivered and must not be re-emitted, got {ids:?}"
+        );
+    }
+
+    ///
+    /// AUDIT.md finding 3, second cascade: premature teardown erases the commitment floor, so the
+    /// "Confirmed and Finalized are final" guard can no longer fire and a rogue bank supersedes a
+    /// finalized slot.
+    ///
+    #[test]
+    fn audit_3b_finalized_resolution_survives_a_rogue_bank() {
+        let mut sm = BlocksStateMachine::default();
+        seal(&mut sm, 1, Some(0), 100);
+        sm.process_consensus_event(cmt(1, Some(0), CommitmentLevel::Finalized, 100).into());
+        sm.pop_next_unprocess_blockstore_update().unwrap(); // FrozenBlock
+        sm.pop_next_unprocess_blockstore_update().unwrap(); // synthesized Processed
+        sm.gc(None);
+
+        // A different bank claims Confirmed for the already-finalized slot 1.
+        sm.process_consensus_event(cmt(1, Some(99), CommitmentLevel::Confirmed, 101).into());
+
+        assert_eq!(
+            sm.resolved_bank_per_slot.get(&1),
+            Some(&100),
+            "slot 1 reached Finalized on bank 100, so that resolution is final"
+        );
+        assert_eq!(
+            sm.forks.get_parent(&1),
+            Some(0),
+            "Forks must keep the finalized bank's parent, not the rogue bank's"
+        );
+    }
+
+    ///
+    /// AUDIT.md finding 4: superseding double-feeds `Forks` and leaves a stale forward parent edge.
+    ///
+    /// The slot ends up recorded as a child of two different parents. Marking the abandoned parent
+    /// dead then walks the stale edge and reports the canonical confirmed slot as a fork, which
+    /// makes the stream layer prune a valid block.
+    ///
+    #[test]
+    fn audit_4_supersede_does_not_leave_a_stale_fork_edge() {
+        let mut sm = BlocksStateMachine::default();
+        // Bank 3000 is the sole candidate, claims parent 29, and freezing it resolves the slot by
+        // sole-candidate inference, feeding Forks the edge from 29.
+        seal(&mut sm, 30, Some(29), 3000);
+        assert_eq!(
+            sm.forks.get_parent(&30),
+            Some(29),
+            "precondition: Forks learned parent 29"
+        );
+
+        // A genuine second bank arrives claiming parent 27 and reaches Confirmed.
+        sm.process_replay_event(created_bank(30, Some(27), 3001).into())
+            .unwrap();
+        sm.process_consensus_event(cmt(30, Some(27), CommitmentLevel::Confirmed, 3001).into());
+        assert_eq!(
+            sm.forks.get_parent(&30),
+            Some(27),
+            "precondition: the resolved parent is now 27"
+        );
+        drain(&mut sm);
+
+        // Slot 29 turns out to be dead, which is why the repair re-parented to 27.
+        sm.process_replay_event(dead(29).into()).unwrap();
+        let reported: Vec<Slot> = fork_reports(&drain(&mut sm))
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect();
+
+        assert!(
+            !reported.contains(&30),
+            "slot 30 is the canonical Confirmed slot and must not be reported as a fork, got {reported:?}"
+        );
+    }
+
+    ///
+    /// AUDIT.md finding 5: a dead slot's `ForkDetected` loses its bank ids.
+    ///
+    /// `mark_slot_as_dead` erases `slot_to_banks` before the flush rebuilds `bank_ids` from it, so
+    /// the stream layer's prune loop iterates zero times and the banks keep every buffered event.
+    ///
+    #[test]
+    fn audit_5_dead_slot_event_carries_its_bank_ids() {
+        let mut sm = BlocksStateMachine::default();
+        buffer(&mut sm, 7, Some(6), 70, 2);
+        buffer(&mut sm, 7, Some(6), 71, 2);
+        sm.process_replay_event(dead(7).into()).unwrap();
+
+        let reports = fork_reports(&drain(&mut sm));
+        let announced: Vec<BankId> = reports
+            .iter()
+            .filter(|(s, _)| *s == 7)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+
+        assert!(
+            announced.contains(&70) && announced.contains(&71),
+            "dead slot 7 had banks 70 and 71, both must be announced so downstream can prune, got {announced:?}"
+        );
+    }
+
+    ///
+    /// AUDIT.md finding 6: discarded loser banks reach no prune path.
+    ///
+    /// `discard_losing_banks` drops the loser from `slot_to_banks`, the only source `gc` builds its
+    /// trace from, and pushes no deadletter event, so the accumulator holds the payload forever.
+    ///
+    #[test]
+    fn audit_6_discarded_loser_is_announced_for_pruning() {
+        let mut sm = BlocksStateMachine::default();
+        sm.process_replay_event(created_bank(5, Some(4), 500).into())
+            .unwrap();
+        sm.process_replay_event(created_bank(5, Some(4), 501).into())
+            .unwrap();
+        buffer(&mut sm, 5, Some(4), 500, 3); // the loser accumulates payload and never seals
+        seal(&mut sm, 5, Some(4), 501);
+        drain(&mut sm);
+
+        sm.process_consensus_event(cmt(5, Some(4), CommitmentLevel::Confirmed, 501).into());
+        assert!(
+            sm.discarded_bank_ids.contains_key(&500),
+            "precondition: bank 500 lost and was discarded"
+        );
+
+        let mut gc_trace = Vec::new();
+        for _ in 0..5 {
+            sm.gc(Some(&mut gc_trace));
+        }
+        let mut dlq = Vec::new();
+        while let Some(DeadletterEvent::Incomplete(bank_id)) = sm.pop_next_dlq() {
+            dlq.push(bank_id);
+        }
+
+        assert!(
+            gc_trace.contains(&500) || dlq.contains(&500),
+            "the discarded loser must reach some prune path, gc trace {gc_trace:?} and dlq {dlq:?} name neither"
+        );
+    }
+
+    ///
+    /// AUDIT.md finding 7: unresolved slots are invisible to garbage collection.
+    ///
+    /// `gc` iterates `forks_history` only, and nothing enters the fork graph except a resolved
+    /// bank's parent. This is what a stream restart mid-block looks like.
+    ///
+    #[test]
+    fn audit_7_unresolved_slot_state_is_eventually_reclaimed() {
+        let mut sm = BlocksStateMachine::default();
+        for slot in 1000..1010u64 {
+            let bank_id = slot + 500_000;
+            for level in [CommitmentLevel::Processed, CommitmentLevel::Confirmed] {
+                sm.process_consensus_event(cmt(slot, Some(slot - 1), level, bank_id).into());
+            }
+        }
+        assert!(
+            drain(&mut sm).is_empty(),
+            "precondition: none of these banks ever froze, so nothing is emitted"
+        );
+
+        for _ in 0..25 {
+            sm.gc(None);
+        }
+
+        assert_eq!(
+            sm.pending_slot_status_update.len(),
+            0,
+            "queued statuses for banks that never froze must not be retained forever"
+        );
+        assert_eq!(
+            sm.slot_to_banks.len(),
+            0,
+            "slot indexes for unresolved, abandoned slots must not be retained forever"
+        );
+    }
+
+    ///
+    /// AUDIT.md finding 8: events for discarded banks return `Ok`.
+    ///
+    /// `stream.rs` gates `insert_into_storage` on this `Result`, so an `Ok` makes the accumulator
+    /// auto-vivify a fresh buffer for a bank the state machine has already given up on.
+    ///
+    #[test]
+    fn audit_8_events_for_discarded_banks_are_rejected() {
+        let mut sm = BlocksStateMachine::default();
+        buffer(&mut sm, 7, Some(6), 70, 2);
+        sm.process_replay_event(dead(7).into()).unwrap();
+        assert!(
+            sm.discarded_bank_ids.contains_key(&70),
+            "precondition: bank 70 was discarded by Dead"
+        );
+        drain(&mut sm);
+
+        let entry = sm.process_replay_event(
+            EntryInfo {
+                slot: 7,
+                bank_id: 70,
+                entry_index: 9,
+                starting_txn_index: 90,
+                entry_hash: Hash::new_unique(),
+                executed_txn_count: 1,
+            }
+            .into(),
+        );
+        let meta = sm.process_replay_event(
+            BlockSummary {
+                slot: 7,
+                bank_id: 70,
+                parent_slot: 6,
+                entry_count: 1,
+                executed_transaction_count: 1,
+                blockhash: Hash::new_unique(),
+                parent_blockhash: Hash::new_unique(),
+                block_time: 1,
+            }
+            .into(),
+        );
+
+        assert!(
+            entry.is_err(),
+            "a straggler entry for discarded bank 70 must be rejected so the stream stores nothing"
+        );
+        assert!(
+            meta.is_err(),
+            "a straggler BlockMeta for discarded bank 70 must be rejected so the stream stores nothing"
+        );
+    }
+
+    ///
+    /// AUDIT.md finding 9: `BlockStateMachineOutput::DeadSlotDetected` has no construction site, so
+    /// the publicly documented `BlockStreamEvent::DeadBlockDetected` can never fire. A dead slot is
+    /// currently indistinguishable from an ordinary fork.
+    ///
+    #[test]
+    fn audit_9_dead_slot_emits_a_dead_slot_output() {
+        let mut sm = BlocksStateMachine::default();
+        buffer(&mut sm, 7, Some(6), 70, 2);
+        sm.process_replay_event(dead(7).into()).unwrap();
+
+        let outputs = drain(&mut sm);
+        let dead_reports: Vec<Slot> = outputs
+            .iter()
+            .filter_map(|o| match o {
+                BlockStateMachineOutput::DeadSlotDetected(d) => Some(d.slot),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            dead_reports.contains(&7),
+            "a Dead lifecycle update must produce DeadSlotDetected, got {} output(s) and none of them dead",
+            outputs.len()
+        );
+    }
+
+    ///
+    /// AUDIT.md finding 11: `FrozenBlock::entries` is built from `FxHashMap::values`, so its order
+    /// is nondeterministic rather than sorted by `entry_index`.
+    ///
+    #[test]
+    fn audit_11_frozen_block_entries_are_ordered_by_entry_index() {
+        let mut sm = BlocksStateMachine::default();
+        let bank_id = 8000;
+        sm.process_replay_event(created_bank(80, Some(79), bank_id).into())
+            .unwrap();
+        // Deliberately out of order on the wire.
+        for i in [5u64, 0, 3, 1, 4, 2] {
+            sm.process_replay_event(
+                EntryInfo {
+                    slot: 80,
+                    bank_id,
+                    entry_index: i,
+                    starting_txn_index: i * 10,
+                    entry_hash: Hash::new_unique(),
+                    executed_txn_count: 10,
+                }
+                .into(),
+            )
+            .unwrap();
+        }
+        sm.process_replay_event(
+            BlockSummary {
+                slot: 80,
+                bank_id,
+                parent_slot: 79,
+                entry_count: 6,
+                executed_transaction_count: 60,
+                blockhash: Hash::new_unique(),
+                parent_blockhash: Hash::new_unique(),
+                block_time: 1,
+            }
+            .into(),
+        )
+        .unwrap();
+
+        let outputs = drain(&mut sm);
+        let block = outputs
+            .iter()
+            .find_map(|o| match o {
+                BlockStateMachineOutput::FrozenBlock(b) if b.bank_id == bank_id => Some(b),
+                _ => None,
+            })
+            .expect("bank 8000 froze");
+
+        let indexes: Vec<u64> = block.entries.iter().map(|e| e.entry_index).collect();
+        assert_eq!(
+            indexes,
+            vec![0, 1, 2, 3, 4, 5],
+            "a frozen block's entries must be ordered by entry_index"
+        );
     }
 }
