@@ -467,6 +467,16 @@ pub struct BlocksStateMachine {
     /// frozen before them.
     ///
     need_optimistic_freeze: FxHashSet<BankId>,
+
+    ///
+    /// Bank ids snapshotted for a slot marked dead this same tick, taken *before*
+    /// [`Self::remove_slot_references_in_state`] wipes its `slot_to_banks` entry. Only populated
+    /// when the slot is confirmed to be newly forked (about to be flushed by
+    /// [`Self::flush_forks_detected_in_current_tick`] in this same tick), so it never lingers.
+    /// Read (and removed) by that flush so a dead slot's own `ForksDetected` doesn't lose its
+    /// bank_ids to the very teardown its own detection triggered -- see `mark_slot_as_dead`.
+    ///
+    dead_slot_bank_ids_snapshot: FxHashMap<Slot, Vec<BankId>>,
 }
 
 impl BlocksStateMachine {
@@ -495,6 +505,7 @@ impl BlocksStateMachine {
             retroactively_rooted_slots: Default::default(),
             forks_detected_in_current_tick: Default::default(),
             need_optimistic_freeze: Default::default(),
+            dead_slot_bank_ids_snapshot: Default::default(),
         }
     }
 
@@ -820,6 +831,17 @@ impl BlocksStateMachine {
         // this slot ever had must be marked discarded so a late straggler event can never
         // resurrect a fresh buffer for it (see `discard_losing_banks` for the same pattern).
         let bank_ids = self.slot_to_banks.get(&slot).cloned().unwrap_or_default();
+        // `remove_slot_references_in_state` below wipes `slot_to_banks[slot]`, but
+        // `flush_forks_detected_in_current_tick` (later in this same tick) re-derives
+        // `ForkDetected::bank_ids` from that very map. Snapshot now, before the wipe, so the dead
+        // slot's own fork notification doesn't lose the bank_ids it exists to report. Only worth
+        // doing when this slot was actually just newly forked (i.e. it's really about to be
+        // flushed this tick) -- `mark_slot_as_forked` above already recorded that in
+        // `forks_detected_in_current_tick`; nothing to snapshot otherwise.
+        if self.forks_detected_in_current_tick.contains(&slot) {
+            self.dead_slot_bank_ids_snapshot
+                .insert(slot, bank_ids.clone());
+        }
         self.remove_slot_references_in_state(slot);
         for bank_id in bank_ids {
             self.discarded_bank_ids.insert(bank_id, slot);
@@ -894,7 +916,14 @@ impl BlocksStateMachine {
         let forks_detected = std::mem::take(&mut self.forks_detected_in_current_tick);
         for slot in forks_detected {
             tracing::warn!("Forks detected for slot {}", slot);
-            let bank_ids = self.slot_to_banks.get(&slot).cloned().unwrap_or_default();
+            // A slot marked dead this same tick left its bank_ids here before its own
+            // `slot_to_banks` entry got wiped -- prefer that snapshot; every other slot (forked
+            // via the ordinary resolve/supersede path, or as a live descendant) still has a
+            // current `slot_to_banks` entry to fall back on.
+            let bank_ids = self
+                .dead_slot_bank_ids_snapshot
+                .remove(&slot)
+                .unwrap_or_else(|| self.slot_to_banks.get(&slot).cloned().unwrap_or_default());
             self.push_new_update(BlockStateMachineOutput::ForksDetected(ForkDetected {
                 slot,
                 bank_ids,
@@ -2185,6 +2214,46 @@ mod audit_regression {
         assert!(
             announced.contains(&70) && announced.contains(&71),
             "dead slot 7 had banks 70 and 71, both must be announced so downstream can prune, got {announced:?}"
+        );
+    }
+
+    ///
+    /// AUDIT.md finding 5, companion case: when marking a slot dead forks a *descendant* slot too
+    /// (via `Forks::mark_slot_as_forked`'s own child-walk, all within the same tick), the
+    /// snapshot taken for the directly-dead slot must not interfere with the descendant's own
+    /// `ForkDetected`, which was never wiped and should just report its own live bank_ids.
+    ///
+    #[test]
+    fn audit_5b_descendant_fork_in_the_same_tick_still_reports_its_own_live_bank_ids() {
+        let mut sm = BlocksStateMachine::default();
+        // Slot 10 (bank 1000) resolves with no parent of its own; slot 11 (bank 1100) resolves
+        // with slot 10 as its parent, so Forks learns the edge 10 -> 11.
+        seal(&mut sm, 10, None, 1000);
+        seal(&mut sm, 11, Some(10), 1100);
+        drain(&mut sm);
+
+        // Marking slot 10 dead forks both slot 10 itself and its child, slot 11, in one tick.
+        sm.process_replay_event(dead(10).into()).unwrap();
+        let reports = fork_reports(&drain(&mut sm));
+
+        let slot_10_banks: Vec<BankId> = reports
+            .iter()
+            .filter(|(s, _)| *s == 10)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+        let slot_11_banks: Vec<BankId> = reports
+            .iter()
+            .filter(|(s, _)| *s == 11)
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .collect();
+
+        assert!(
+            slot_10_banks.contains(&1000),
+            "the directly-dead slot 10 must report its own (snapshotted) bank_ids, got {slot_10_banks:?}"
+        );
+        assert!(
+            slot_11_banks.contains(&1100),
+            "the descendant slot 11, forked as a side effect, must still report its own live bank_ids, got {slot_11_banks:?}"
         );
     }
 

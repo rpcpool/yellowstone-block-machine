@@ -15,10 +15,11 @@ None of these are visible to the existing suite. All 36 pre-existing tests pass 
 findings below are fixed, because the failing behaviours all sit in orderings that suite does not
 construct.
 
-**Status: 5 of 12 fixed.** Finding 1 (optimistic freeze fabricating blocks), finding 2
+**Status: 6 of 12 fixed.** Finding 1 (optimistic freeze fabricating blocks), finding 2
 (retroactive rooting dropping commitment delivery), finding 3 (gap-filled Finalized scheduling
-premature teardown), finding 4 (superseding leaving a stale fork edge), and finding 6 (discarded
-losers reaching no prune path) are fixed as of this revision. The other seven are open.
+premature teardown), finding 4 (superseding leaving a stale fork edge), finding 5 (dead-slot fork
+events losing their bank_ids), and finding 6 (discarded losers reaching no prune path) are fixed as
+of this revision. The other six are open.
 
 ## Verification legend
 
@@ -218,7 +219,7 @@ level, three focused unit tests exercise the new method directly:
 
 ## 5. Dead-slot fork events lose their bank_ids
 
-**Severity:** high &nbsp;&nbsp; **Status:** `TEST` &nbsp;&nbsp; **Location:** `state_machine.rs:794`
+**Severity:** high &nbsp;&nbsp; **Status:** `FIXED` &nbsp;&nbsp; **Location:** `state_machine.rs:794`
 
 `mark_slot_as_dead` snapshots the slot's bank ids on line 793, uses the snapshot only to mark them
 discarded, then calls `remove_slot_references_in_state`, which deletes the `slot_to_banks` entry.
@@ -231,8 +232,20 @@ misses.
 prune loop in `stream.rs` iterates zero times, so both banks keep every buffered event they hold.
 `gc` cannot recover them either, because its own trace reads the same erased map.
 
-**Fix.** Pass the snapshot taken on line 793 through to the emitted event instead of re-deriving it
-after the teardown.
+**Fix.** Applied: a new field, `dead_slot_bank_ids_snapshot: FxHashMap<Slot, Vec<BankId>>`, carries
+the bank ids across the same tick. `mark_slot_as_dead` snapshots into it *before* the teardown --
+but only when the slot was actually just newly forked (checked via
+`forks_detected_in_current_tick.contains(&slot)`), so nothing is stored for a slot that won't be
+flushed this tick, and the entry never lingers. `flush_forks_detected_in_current_tick` now checks
+this snapshot first (removing the entry as it consumes it) before falling back to the live
+`slot_to_banks` lookup used by every other slot passing through the same flush -- a slot forked only
+as a side effect of the dead slot's own descendants (via `Forks::mark_slot_as_forked`'s child-walk)
+was never wiped and correctly keeps using the live path unchanged.
+
+Covered by two tests: `audit_5_dead_slot_event_carries_its_bank_ids` (the direct case) and
+`audit_5b_descendant_fork_in_the_same_tick_still_reports_its_own_live_bank_ids` (proving the
+snapshot mechanism doesn't cross-contaminate a descendant slot forked in the very same tick). Both
+pass.
 
 ## 6. Discarded loser banks reach no prune path
 
@@ -398,7 +411,7 @@ fail" test at that level before the method existed.
 cargo test --all-features audit_regression::
 ```
 
-Expect five failures (findings 1 through 4 and 6 are fixed; all nine of their `state_machine.rs`-level tests now pass, plus three new `forks.rs`-level unit tests for finding 4). The pre-existing suite is unaffected:
+Expect four failures (findings 7, 8, 9, and 11 remain open). Findings 1 through 6 are fixed; all eleven of their `state_machine.rs`-level tests now pass, plus three new `forks.rs`-level unit tests for finding 4. The pre-existing suite is unaffected:
 
 ```text
 cargo test --all-features -- --skip audit_regression    # 39 passed (36 pre-existing + 3 new forks.rs tests)
@@ -417,7 +430,8 @@ cargo test --all-features -- --skip audit_regression    # 39 passed (36 pre-exis
 | (forks.rs) `reparent_retracts_the_stale_forward_edge` | 4 | **FIXED (added).** Reparenting removes the old forward edge and installs the new one. |
 | (forks.rs) `reparent_to_the_same_parent_is_a_pure_shortcut` | 4 | **FIXED (added).** Reparenting to an unchanged parent is a no-op, matching `add`'s shortcut. |
 | (forks.rs) `reparent_prevents_the_old_parents_death_from_wrongly_forking_the_child` | 4 | **FIXED (added).** The old parent's later death no longer forks the reparented child. |
-| `audit_5_dead_slot_event_carries_its_bank_ids` | 5 | The dead slot's event must name banks 70 and 71. It names none. |
+| `audit_5_dead_slot_event_carries_its_bank_ids` | 5 | **FIXED.** The dead slot's event now names banks 70 and 71 via a same-tick snapshot. |
+| `audit_5b_descendant_fork_in_the_same_tick_still_reports_its_own_live_bank_ids` | 5 | **FIXED (added).** A descendant forked in the same tick still reports its own live bank_ids, unaffected. |
 | `audit_6_discarded_loser_is_announced_for_pruning` | 6 | **FIXED.** Bank 500 now reaches the deadletter queue via a new `DeadletterEvent::Discarded` variant. |
 | `audit_7_unresolved_slot_state_is_eventually_reclaimed` | 7 | Ten abandoned slots must be reclaimed. All ten survive 25 gc passes. |
 | `audit_8_events_for_discarded_banks_are_rejected` | 8 | Stragglers for discarded bank 70 must return `Err`. Both return `Ok`. |
