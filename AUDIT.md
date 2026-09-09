@@ -15,13 +15,13 @@ None of these are visible to the existing suite. All 36 pre-existing tests pass 
 findings below are fixed, because the failing behaviours all sit in orderings that suite does not
 construct.
 
-**Status: 8 of 12 fixed.** Finding 1 (optimistic freeze fabricating blocks), finding 2
+**Status: 9 of 12 fixed.** Finding 1 (optimistic freeze fabricating blocks), finding 2
 (retroactive rooting dropping commitment delivery), finding 3 (gap-filled Finalized scheduling
 premature teardown), finding 4 (superseding leaving a stale fork edge), finding 5 (dead-slot fork
 events losing their bank_ids), finding 6 (discarded losers reaching no prune path), finding 8
-(events for discarded banks returning `Ok`, including a third call site found while fixing it), and
-finding 11 (`FrozenBlock::entries` in hash-map order) are fixed as of this revision. Findings 7 and
-9 are open.
+(events for discarded banks returning `Ok`, including a third call site found while fixing it),
+finding 9 (`DeadSlotDetected` never constructed), and finding 11 (`FrozenBlock::entries` in hash-map
+order) are fixed as of this revision. Only finding 7 is open.
 
 ## Verification legend
 
@@ -321,21 +321,34 @@ rejected, alongside the entry and `BlockMeta` cases it already covered. All thre
 
 ## 9. `DeadSlotDetected` is never constructed
 
-**Severity:** medium &nbsp;&nbsp; **Status:** `READ` &nbsp;&nbsp; **Location:** `state_machine.rs:245`
+**Severity:** medium &nbsp;&nbsp; **Status:** `FIXED` &nbsp;&nbsp; **Location:** `state_machine.rs:245`
 
-`BlockStateMachineOutput::DeadSlotDetected` has zero construction sites in the workspace. It is only
-declared, matched in `slot()`, and matched in `stream.rs:297`.
+`BlockStateMachineOutput::DeadSlotDetected` had zero construction sites in the workspace. It was
+only declared, matched in `slot()`, and matched in `stream.rs:297`.
 
-Everything downstream of it is therefore unreachable: `PendingEvent::DeadBlockDetect`,
+Everything downstream of it was therefore unreachable: `PendingEvent::DeadBlockDetect`,
 `BlockMachineOutput::DeadBlockDetected`, and the public `BlockStreamEvent::DeadBlockDetected` that
 `lib.rs:45` advertises as one of four stream outputs and that the example handles.
 
-Dead slots currently surface as `ForksDetected`, via `mark_slot_as_dead` calling
-`mark_slot_as_forked`. That is indistinguishable from an ordinary fork, and per finding 5 it arrives
-with no bank ids.
+Dead slots surfaced as `ForksDetected`, via `mark_slot_as_dead` calling `mark_slot_as_forked`. That
+was indistinguishable from an ordinary fork, and (before finding 5's fix) arrived with no bank ids.
 
-**Fix.** Emit `DeadSlotDetected` from `mark_slot_as_dead` with the bank id snapshot, or delete the
-variant and its documented event so the public surface stops promising it.
+**Fix.** Applied, by extending finding 5's own snapshot mechanism rather than adding a new one:
+`dead_slot_bank_ids_snapshot` is populated by `mark_slot_as_dead`, and only by it, for the exact
+slot the wire declared `Dead` this tick -- so its presence at flush time is already a precise
+signal that this specific slot (not a descendant forked only as a side effect of walking its
+children) was the direct cause. `flush_forks_detected_in_current_tick` now branches on that: the
+directly-dead slot gets the dedicated `DeadSlotDetected` output, using the already-snapshotted bank
+ids; every other slot in the same flush (an ordinary fork, or a live descendant forked alongside
+the dead one) still falls back to a fresh `slot_to_banks` lookup and gets `ForksDetected` exactly as
+before. No changes were needed in `stream.rs`, `client_ext.rs`, or the example -- that plumbing
+already existed correctly, it was simply never reachable.
+
+This changes what a directly-dead slot emits, from `ForksDetected` to `DeadSlotDetected`, so three
+tests that asserted the old (incorrect) output needed updating to match: the pre-existing
+`dead_slot_discards_every_bank_registered_for_it`, and `audit_5`/`audit_5b` (a new `dead_reports`
+helper mirrors the existing `fork_reports` one). All three now pass, along with the new
+`audit_9_dead_slot_emits_a_dead_slot_output`.
 
 ## 10. `dead_blocks_queue` is never written
 
@@ -430,7 +443,7 @@ fail" test at that level before the method existed.
 cargo test --all-features audit_regression::
 ```
 
-Expect two failures (findings 7 and 9 remain open). Findings 1 through 6, 8, and 11 are fixed; all thirteen of their `state_machine.rs`-level tests now pass, plus three new `forks.rs`-level unit tests for finding 4. The pre-existing suite is unaffected:
+Expect one failure (finding 7 remains open). Findings 1 through 6, 8, 9, and 11 are fixed; all fourteen of their `state_machine.rs`-level tests now pass, plus three new `forks.rs`-level unit tests for finding 4. The pre-existing suite is unaffected (one of its own tests, `dead_slot_discards_every_bank_registered_for_it`, was updated to expect the now-correct `DeadSlotDetected` output instead of `ForksDetected`):
 
 ```text
 cargo test --all-features -- --skip audit_regression    # 39 passed (36 pre-existing + 3 new forks.rs tests)
@@ -449,12 +462,13 @@ cargo test --all-features -- --skip audit_regression    # 39 passed (36 pre-exis
 | (forks.rs) `reparent_retracts_the_stale_forward_edge` | 4 | **FIXED (added).** Reparenting removes the old forward edge and installs the new one. |
 | (forks.rs) `reparent_to_the_same_parent_is_a_pure_shortcut` | 4 | **FIXED (added).** Reparenting to an unchanged parent is a no-op, matching `add`'s shortcut. |
 | (forks.rs) `reparent_prevents_the_old_parents_death_from_wrongly_forking_the_child` | 4 | **FIXED (added).** The old parent's later death no longer forks the reparented child. |
-| `audit_5_dead_slot_event_carries_its_bank_ids` | 5 | **FIXED.** The dead slot's event now names banks 70 and 71 via a same-tick snapshot. |
-| `audit_5b_descendant_fork_in_the_same_tick_still_reports_its_own_live_bank_ids` | 5 | **FIXED (added).** A descendant forked in the same tick still reports its own live bank_ids, unaffected. |
+| `audit_5_dead_slot_event_carries_its_bank_ids` | 5 | **FIXED.** The dead slot's event now names banks 70 and 71 via a same-tick snapshot, delivered as `DeadSlotDetected` (finding 9). |
+| `audit_5b_descendant_fork_in_the_same_tick_still_reports_its_own_live_bank_ids` | 5 | **FIXED (added).** A descendant forked in the same tick still reports its own live bank_ids via `ForksDetected`, unaffected. |
 | `audit_6_discarded_loser_is_announced_for_pruning` | 6 | **FIXED.** Bank 500 now reaches the deadletter queue via a new `DeadletterEvent::Discarded` variant. |
 | `audit_7_unresolved_slot_state_is_eventually_reclaimed` | 7 | Ten abandoned slots must be reclaimed. All ten survive 25 gc passes. |
 | `audit_8_events_for_discarded_banks_are_rejected` | 8 | **FIXED.** Entry, BlockMeta, and CreatedBank stragglers for discarded bank 70 all now return `Err`. |
 | `audit_9_dead_slot_emits_a_dead_slot_output` | 9 | A `Dead` update must produce `DeadSlotDetected`. It produces `ForksDetected`. |
+| `audit_9_dead_slot_emits_a_dead_slot_output` | 9 | **FIXED.** A Dead lifecycle update now produces `DeadSlotDetected`, not `ForksDetected`. |
 | `audit_11_frozen_block_entries_are_ordered_by_entry_index` | 11 | **FIXED.** Entries now come out sorted by `entry_index`. |
 
 Findings 10 and 12 are absence-of-code defects with nothing to assert at runtime. Confirm them with:

@@ -937,15 +937,24 @@ impl BlocksStateMachine {
         }
         let forks_detected = std::mem::take(&mut self.forks_detected_in_current_tick);
         for slot in forks_detected {
+            // `dead_slot_bank_ids_snapshot` is populated by `mark_slot_as_dead`, and only by it,
+            // for the exact slot the wire itself declared `Dead` this tick -- its presence here is
+            // therefore a precise signal that this specific slot (not a descendant forked only as
+            // a side effect of walking its children) was the direct cause. That slot gets the
+            // dedicated `DeadSlotDetected` output instead of the generic `ForksDetected`, using the
+            // bank_ids snapshotted before `remove_slot_references_in_state` wiped them. Every
+            // other slot in this same flush (an ordinary fork from the resolve/supersede path, or
+            // a live descendant forked alongside the dead one) still falls back to a fresh
+            // `slot_to_banks` lookup and gets `ForksDetected` exactly as before.
+            if let Some(bank_ids) = self.dead_slot_bank_ids_snapshot.remove(&slot) {
+                tracing::warn!("Slot {} marked dead", slot);
+                self.push_new_update(BlockStateMachineOutput::DeadSlotDetected(
+                    DeadBlockDetected { slot, bank_ids },
+                ));
+                continue;
+            }
             tracing::warn!("Forks detected for slot {}", slot);
-            // A slot marked dead this same tick left its bank_ids here before its own
-            // `slot_to_banks` entry got wiped -- prefer that snapshot; every other slot (forked
-            // via the ordinary resolve/supersede path, or as a live descendant) still has a
-            // current `slot_to_banks` entry to fall back on.
-            let bank_ids = self
-                .dead_slot_bank_ids_snapshot
-                .remove(&slot)
-                .unwrap_or_else(|| self.slot_to_banks.get(&slot).cloned().unwrap_or_default());
+            let bank_ids = self.slot_to_banks.get(&slot).cloned().unwrap_or_default();
             self.push_new_update(BlockStateMachineOutput::ForksDetected(ForkDetected {
                 slot,
                 bank_ids,
@@ -1700,12 +1709,12 @@ mod tests {
         assert_eq!(sm.discarded_bank_ids.get(&bank_a), Some(&slot));
         assert_eq!(sm.discarded_bank_ids.get(&bank_b), Some(&slot));
 
-        // Marking the slot dead legitimately emits a ForksDetected for it -- drain that before
-        // checking that nothing further is produced.
+        // Marking the slot dead legitimately emits a DeadSlotDetected for it (see AUDIT.md
+        // finding 9) -- drain that before checking that nothing further is produced.
         let update = sm.pop_next_unprocess_blockstore_update().unwrap();
         assert!(matches!(
             update,
-            super::BlockStateMachineOutput::ForksDetected(ref f) if f.slot == slot
+            super::BlockStateMachineOutput::DeadSlotDetected(ref d) if d.slot == slot
         ));
         assert!(sm.pop_next_unprocess_blockstore_update().is_none());
 
@@ -1849,6 +1858,16 @@ mod audit_regression {
             .iter()
             .filter_map(|o| match o {
                 BlockStateMachineOutput::ForksDetected(f) => Some((f.slot, f.bank_ids.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn dead_reports(outputs: &[BlockStateMachineOutput]) -> Vec<(Slot, Vec<BankId>)> {
+        outputs
+            .iter()
+            .filter_map(|o| match o {
+                BlockStateMachineOutput::DeadSlotDetected(d) => Some((d.slot, d.bank_ids.clone())),
                 _ => None,
             })
             .collect()
@@ -2216,10 +2235,13 @@ mod audit_regression {
     }
 
     ///
-    /// AUDIT.md finding 5: a dead slot's `ForkDetected` loses its bank ids.
+    /// AUDIT.md finding 5: a dead slot's fork/dead event loses its bank ids.
     ///
     /// `mark_slot_as_dead` erases `slot_to_banks` before the flush rebuilds `bank_ids` from it, so
     /// the stream layer's prune loop iterates zero times and the banks keep every buffered event.
+    ///
+    /// Note: since AUDIT.md finding 9 was fixed, a directly-dead slot emits `DeadSlotDetected`,
+    /// not `ForksDetected` -- see `dead_reports` rather than `fork_reports` below.
     ///
     #[test]
     fn audit_5_dead_slot_event_carries_its_bank_ids() {
@@ -2228,7 +2250,7 @@ mod audit_regression {
         buffer(&mut sm, 7, Some(6), 71, 2);
         sm.process_replay_event(dead(7).into()).unwrap();
 
-        let reports = fork_reports(&drain(&mut sm));
+        let reports = dead_reports(&drain(&mut sm));
         let announced: Vec<BankId> = reports
             .iter()
             .filter(|(s, _)| *s == 7)
@@ -2258,14 +2280,17 @@ mod audit_regression {
 
         // Marking slot 10 dead forks both slot 10 itself and its child, slot 11, in one tick.
         sm.process_replay_event(dead(10).into()).unwrap();
-        let reports = fork_reports(&drain(&mut sm));
+        let outputs = drain(&mut sm);
 
-        let slot_10_banks: Vec<BankId> = reports
+        // Slot 10 was the direct cause -- since finding 9's fix, that's `DeadSlotDetected`, not
+        // `ForksDetected`. Slot 11 is a descendant, forked only as a side effect: it's still an
+        // ordinary `ForksDetected`.
+        let slot_10_banks: Vec<BankId> = dead_reports(&outputs)
             .iter()
             .filter(|(s, _)| *s == 10)
             .flat_map(|(_, ids)| ids.iter().copied())
             .collect();
-        let slot_11_banks: Vec<BankId> = reports
+        let slot_11_banks: Vec<BankId> = fork_reports(&outputs)
             .iter()
             .filter(|(s, _)| *s == 11)
             .flat_map(|(_, ids)| ids.iter().copied())
@@ -2273,11 +2298,11 @@ mod audit_regression {
 
         assert!(
             slot_10_banks.contains(&1000),
-            "the directly-dead slot 10 must report its own (snapshotted) bank_ids, got {slot_10_banks:?}"
+            "the directly-dead slot 10 must report its own (snapshotted) bank_ids via DeadSlotDetected, got {slot_10_banks:?}"
         );
         assert!(
             slot_11_banks.contains(&1100),
-            "the descendant slot 11, forked as a side effect, must still report its own live bank_ids, got {slot_11_banks:?}"
+            "the descendant slot 11, forked as a side effect, must still report its own live bank_ids via ForksDetected, got {slot_11_banks:?}"
         );
     }
 
