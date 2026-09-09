@@ -1,7 +1,10 @@
 use {
-    crate::event::{
-        BlockMetaEvInfo, EntryEvInfo, GeyserEventAdapter, GeyserEventInfo, SlotStatusKind,
-        SlotUpdateEvInfo,
+    crate::{
+        dragonsmouth::block_accumulator::SYSVAR_PROGRAM_ID,
+        event::{
+            BlockMetaEvInfo, EntryEvInfo, GeyserEventAdapter, GeyserEventInfo, SlotStatusKind,
+            SlotUpdateEvInfo,
+        },
     },
     std::str::FromStr,
     yellowstone_grpc_proto::geyser::{SlotStatus, SubscribeUpdate, subscribe_update::UpdateOneof},
@@ -67,15 +70,34 @@ impl GeyserEventAdapter for SubscribeUpdate {
                 slot: tx.slot,
                 bank_id: tx.bank_id,
             }),
-            UpdateOneof::Account(account) => Some(GeyserEventInfo::SysvarAccount {
-                slot: account.slot,
-                bank_id: account.bank_id?,
-                pubkey: account
+            UpdateOneof::Account(account) => {
+                let bank_id = account.bank_id?;
+                // `subscribe_block` forces a subscription to every sysvar-owned account (see
+                // `SYSVAR_PROGRAM_ID`), but the caller's own request can also ask for arbitrary
+                // non-sysvar accounts -- those must not be treated as sysvars here, or they'd be
+                // silently checked against `MUST_HAVE_SYSVAR_ACCOUNTS`'s pubkeys for nothing and,
+                // worse, be excluded from `account_idx_map`'s ordinary account-event handling.
+                let is_sysvar = account
                     .account
                     .as_ref()
-                    .and_then(|a| a.pubkey.as_slice().try_into().ok())
-                    .unwrap_or([0; 32]),
-            }),
+                    .is_some_and(|a| a.owner == SYSVAR_PROGRAM_ID.to_bytes());
+                if is_sysvar {
+                    Some(GeyserEventInfo::SysvarAccount {
+                        slot: account.slot,
+                        bank_id,
+                        pubkey: account
+                            .account
+                            .as_ref()
+                            .and_then(|a| a.pubkey.as_slice().try_into().ok())
+                            .unwrap_or([0; 32]),
+                    })
+                } else {
+                    Some(GeyserEventInfo::BankData {
+                        slot: account.slot,
+                        bank_id,
+                    })
+                }
+            }
             UpdateOneof::TransactionStatus(tx) => Some(GeyserEventInfo::BankData {
                 slot: tx.slot,
                 bank_id: tx.bank_id,

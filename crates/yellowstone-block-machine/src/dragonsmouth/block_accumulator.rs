@@ -18,6 +18,13 @@ use {
 // itself fires; SlotHistory and RecentBlockhashes are written later, as the block freezes, which
 // is exactly why BlockMeta arriving isn't by itself sufficient evidence that the bank's content
 // is all in: BlockMeta and these late Account writes are independent messages that can reorder.
+//
+// These four are deliberately the ones written on *every* slot. Other sysvars -- e.g.
+// SysvarRent/SysvarEpochRewards, which are only rewritten on an epoch boundary -- can arrive
+// before `CreatedBank` too (same reordering as Clock/SlotHashes above), but they must never be
+// added here: `is_complete` would then never be satisfiable on the vast majority of slots that
+// don't rewrite them at all. Auto-vivify (see `add_event`) already handles their arrival at any
+// bank_id/order regardless; they just don't count toward this mask.
 pub(crate) const MUST_HAVE_SYSVAR_ACCOUNTS: [Pubkey; 4] = [
     Pubkey::from_str_const("SysvarC1ock11111111111111111111111111111111"),
     Pubkey::from_str_const("SysvarS1otHashes111111111111111111111111111"),
@@ -370,7 +377,7 @@ mod tests {
                 account: Some(SubscribeUpdateAccountInfo {
                     pubkey: pubkey.to_bytes().to_vec(),
                     lamports: 1,
-                    owner: vec![0; 32],
+                    owner: SYSVAR_PROGRAM_ID.to_bytes().to_vec(),
                     executable: false,
                     rent_epoch: 0,
                     data: vec![],
@@ -535,6 +542,62 @@ mod tests {
             block.events.account_idx_map.len(),
             1,
             "only the sysvar the client actually subscribed to should be delivered"
+        );
+    }
+
+    #[test]
+    fn non_sysvar_account_does_not_count_toward_the_must_have_mask() {
+        let mut acc = DragonsmouthBlockCumulator::default();
+        let (slot, bank_id) = (40, 4000);
+
+        feed(&mut acc, created_bank_update(slot, bank_id));
+        for sysvar in MUST_HAVE_SYSVAR_ACCOUNTS {
+            feed(
+                &mut acc,
+                sysvar_account_update(
+                    slot,
+                    bank_id,
+                    sysvar,
+                    vec![RESERVED_FILTER_NAME.to_string()],
+                ),
+            );
+        }
+        feed(&mut acc, entry_update(slot, 0, bank_id));
+
+        // A non-sysvar account the client subscribed to on its own -- must never be treated as
+        // one of MUST_HAVE_SYSVAR_ACCOUNTS just because it happens to arrive as an Account
+        // update, and must still be delivered like any other client-visible event.
+        feed(
+            &mut acc,
+            update(
+                UpdateOneof::Account(SubscribeUpdateAccount {
+                    account: Some(SubscribeUpdateAccountInfo {
+                        pubkey: Pubkey::new_unique().to_bytes().to_vec(),
+                        lamports: 1,
+                        owner: Pubkey::new_unique().to_bytes().to_vec(),
+                        executable: false,
+                        rent_epoch: 0,
+                        data: vec![],
+                        write_version: 1,
+                        txn_signature: None,
+                    }),
+                    slot,
+                    is_startup: false,
+                    bank_id: Some(bank_id),
+                }),
+                vec!["client-account-filter".to_string()],
+            ),
+        );
+
+        freeze(&mut acc, slot, bank_id, 1);
+
+        let block = acc
+            .finish_block(bank_id)
+            .expect("must-have sysvars are unaffected by the extra non-sysvar account");
+        assert_eq!(
+            block.events.account_idx_map.len(),
+            1,
+            "the non-sysvar account should still be delivered like any other client-visible event"
         );
     }
 }

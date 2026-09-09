@@ -73,6 +73,10 @@ fn cross_check_account_txn_join(block: DragonsmouthBlock) {
                 let sig = Signature::try_from(txn.signature.as_slice()).expect("signature");
                 txn_sig_index_map.insert(sig, txn.index);
             }
+            UpdateOneof::TransactionStatus(txn) => {
+                let sig = Signature::try_from(txn.signature.as_slice()).expect("signature");
+                txn_sig_index_map.insert(sig, txn.index);
+            }
             _ => {}
         }
     }
@@ -253,7 +257,7 @@ async fn main() {
         accounts: hash_map! {
             "test".to_string() => Default::default(),
         },
-        transactions: hash_map! {
+        transactions_status: hash_map! {
             "test".to_string() => Default::default(),
         },
         entry: hash_map! {

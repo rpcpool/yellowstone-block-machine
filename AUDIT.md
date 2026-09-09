@@ -7,21 +7,22 @@ Primary target: `crates/yellowstone-block-machine/src/state_machine.rs`.
 
 ## Summary
 
-Twelve defects are confirmed, each backed by a test (see the reproduction suite section). Six
+Thirteen defects are confirmed, each backed by a test (see the reproduction suite section). Six
 further defects were reported by the audit but have not been verified and are listed separately.
 
 None of these are visible to the existing suite. All 36 pre-existing tests pass regardless of which
 findings below are fixed, because the failing behaviours all sit in orderings that suite does not
 construct.
 
-**Status: 10 of 12 fixed.** All findings except 10 and 12 are fixed as of this revision: finding 1
+**Status: 11 of 13 fixed.** All findings except 10 and 12 are fixed as of this revision: finding 1
 (optimistic freeze fabricating blocks), finding 2 (retroactive rooting dropping commitment
 delivery), finding 3 (gap-filled Finalized scheduling premature teardown), finding 4 (superseding
 leaving a stale fork edge), finding 5 (dead-slot fork events losing their bank_ids), finding 6
 (discarded losers reaching no prune path), finding 7 (unresolved/never-finalized slots invisible to
 garbage collection), finding 8 (events for discarded banks returning `Ok`, including a third call
-site found while fixing it), finding 9 (`DeadSlotDetected` never constructed), and finding 11
-(`FrozenBlock::entries` in hash-map order).
+site found while fixing it), finding 9 (`DeadSlotDetected` never constructed), finding 11
+(`FrozenBlock::entries` in hash-map order), and finding 19 (every `Account` update misclassified as
+a sysvar, found after this audit's own Coverage section flagged `proto_adapter.rs` as unreviewed).
 
 Findings 10 and 12 were never assigned a `TEST`/`READ` status meant to be flipped to `FIXED` -- they
 are dead-code observations (an unused queue, a handful of unused declarations) rather than logic
@@ -437,6 +438,37 @@ Each is individually harmless. Together with findings 9 and 10 they suggest the 
 scaffolding behind, which makes it hard for a reader to tell intended-but-unfinished from
 deliberately-removed.
 
+## 19. Every `Account` update was classified as a sysvar, regardless of its owner
+
+**Severity:** high &nbsp;&nbsp; **Status:** `FIXED` &nbsp;&nbsp; **Location:** `proto_adapter.rs:70`
+(`extract_geyser_ev_info`)
+
+`GeyserEventAdapter::extract_geyser_ev_info` mapped `UpdateOneof::Account(_)` to
+`GeyserEventInfo::SysvarAccount` unconditionally, regardless of the account's actual `owner`.
+`subscribe_block` force-subscribes only sysvar-owned accounts via the crate's own reserved filter,
+but a caller's own `SubscribeRequest.accounts` can legitimately ask for arbitrary non-sysvar
+accounts too -- every one of those was misrouted through the sysvar path instead of `BankData`.
+
+Two independent effects followed from the misrouting, both silent: (1) `add_event`'s must-have
+bitmask check (`MUST_HAVE_SYSVAR_ACCOUNTS.iter().position(...)`) ran needlessly on every non-sysvar
+account, which happened to be harmless since none of them could ever match one of the four
+sysvar pubkeys; (2) the mismatch was purely representational, not yet correctness-affecting for a
+client that only asked for sysvars -- but any client whose own `accounts` filter named non-sysvar
+program-owned accounts would have every one of them tagged as `GeyserEventInfo::SysvarAccount`,
+which is the wrong event kind for downstream consumers of `GeyserEventInfo` to reason about (e.g.
+anything matching on `SysvarAccount` vs `BankData` by variant, expecting the variant itself to mean
+"this is a sysvar").
+
+**Fix.** Applied: `extract_geyser_ev_info` now checks `account.account.owner` against
+`SYSVAR_PROGRAM_ID` and only produces `GeyserEventInfo::SysvarAccount` when it matches; otherwise it
+produces `GeyserEventInfo::BankData`, same as `Transaction`/`TransactionStatus`. The three
+pre-existing `block_accumulator.rs` tests were relying on their `sysvar_account_update` test helper
+hardcoding `owner: vec![0; 32]` instead of the real sysvar program ID -- fixed to use
+`SYSVAR_PROGRAM_ID` so they still exercise what they claim to. A new test,
+`non_sysvar_account_does_not_count_toward_the_must_have_mask`, feeds a non-sysvar account (random
+owner) alongside a complete set of real sysvars and asserts the block still seals and the extra
+account is still delivered via the ordinary `BankData`/`account_idx_map` path.
+
 ---
 
 ## Reported but not verified
@@ -460,8 +492,10 @@ limits. Findings 1 through 18 come from the three that completed, plus independe
 
 Areas still unreviewed:
 
-- Wire adaptation in `dragonsmouth/proto_adapter.rs` and `wrapper.rs`, including the reachable
-  `expect` calls on wire-supplied hash strings and the `dead_error` downgrade path.
+- Wire adaptation in `dragonsmouth/proto_adapter.rs` and `wrapper.rs` -- partially reviewed since
+  the above: finding 19 (every `Account` update misclassified as a sysvar) was found and fixed here.
+  Still open: the reachable `expect` calls on wire-supplied hash strings and the `dead_error`
+  downgrade path.
 - The async driver in `stream.rs`, including the ordering of `on_new_frozen_block` against
   `freeze_block`, and the `unsafe` projection in `client_ext.rs`.
 - Entry bookkeeping and the `Block` counters, including whether `entry_cnt` is safe to use as an
@@ -489,21 +523,25 @@ The findings above are backed by two things:
   that is where the actual defect lived. These were always ordinary passing tests for the new
   method, not inverted -- there was no way to write a "must currently fail" test at that level
   before the method existed.
+- `crates/yellowstone-block-machine/src/dragonsmouth/block_accumulator.rs`, `mod tests` -- one
+  additional test, `non_sysvar_account_does_not_count_toward_the_must_have_mask`, for finding 19.
+  Also an ordinary passing test for the same reason as the `forks.rs` ones above.
 
 ```text
 cargo test --all-features audit_          # the 15 audit_* tests, by name prefix
 ```
 
-Expect zero failures. Every finding with a regression test (1 through 9 and 11) is fixed; all
+Expect zero failures. Every finding with a regression test (1 through 9, 11, and 19) is fixed; all
 fifteen `audit_*` tests pass, alongside the crate's other pre-existing tests in the same module,
 plus three `forks.rs`-level unit tests for finding 4 (one of the pre-existing tests,
 `dead_slot_discards_every_bank_registered_for_it`, was itself updated to expect the now-correct
 `DeadSlotDetected` output instead of `ForksDetected`, since finding 9 changed what a directly-dead
-slot emits):
+slot emits) and one `block_accumulator.rs`-level unit test for finding 19:
 
 ```text
-cargo test --all-features    # 54 passed in the lib target (state_machine.rs's mod tests holds
-                              # 23 -- 8 pre-existing plus these 15 -- and forks.rs holds the rest)
+cargo test --all-features    # 55 passed in the lib target (state_machine.rs's mod tests holds
+                              # 23 -- 8 pre-existing plus the 15 audit_* -- forks.rs holds 22, and
+                              # dragonsmouth::block_accumulator::tests holds 4)
 ```
 
 | Test | Finding | Assertion (originally failing, now passing unless marked otherwise) |
@@ -526,6 +564,7 @@ cargo test --all-features    # 54 passed in the lib target (state_machine.rs's m
 | `audit_8_events_for_discarded_banks_are_rejected` | 8 | **FIXED.** Entry, BlockMeta, and CreatedBank stragglers for discarded bank 70 all now return `Err`. |
 | `audit_9_dead_slot_emits_a_dead_slot_output` | 9 | **FIXED.** A Dead lifecycle update now produces `DeadSlotDetected`, not `ForksDetected`. |
 | `audit_11_frozen_block_entries_are_ordered_by_entry_index` | 11 | **FIXED.** Entries now come out sorted by `entry_index`. |
+| (block_accumulator.rs) `non_sysvar_account_does_not_count_toward_the_must_have_mask` | 19 | **FIXED.** A non-sysvar account is classified `BankData`, not `SysvarAccount`, and is still delivered normally. Not named `audit_*` -- it lives in `block_accumulator.rs`'s own test module, not `state_machine.rs`'s, so it isn't selected by the `audit_` prefix filter above. |
 
 Findings 10 and 12 are absence-of-code observations with nothing to assert at runtime. Confirm
 they are still just dead code, not fixed into something new, with:
