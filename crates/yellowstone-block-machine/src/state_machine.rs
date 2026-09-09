@@ -126,6 +126,22 @@ pub const AVG_BLOCK_LEN: usize = 4000;
 pub const AVG_TPB: usize = 2000;
 
 ///
+/// How long a slot's index bookkeeping (`slot_to_banks`, `pending_slot_status_update`,
+/// `resolved_bank_per_slot`, `slot_min_commitment`, `bank_parent_slot`) may sit past its first
+/// sighting before [`BlocksStateMachine::gc`] ages it out on its own, independent of whether the
+/// slot ever entered [`Forks`]'s history.
+///
+/// [`gc`](BlocksStateMachine::gc)'s ordinary sweep only ever reclaims a slot that was, at some
+/// point, detected as a fork -- which is exactly the wrong test for a perfectly healthy, resolved
+/// slot that simply never receives its own `Finalized` commitment update (a stream reconnect or a
+/// fumarole boot leaving some slots' tracking permanently stuck below `Finalized`; see the
+/// `dead_blocks_queue` doc comment for the same anticipated scenario). Under normal operation a
+/// slot reaches `Finalized` within tens of seconds; this is set generously above that so nothing
+/// healthy is ever mistaken for stuck.
+///
+pub const MAX_UNRESOLVED_SLOT_AGE: Duration = Duration::from_secs(300);
+
+///
 ///
 /// State machine for buffering blockstore events based on linger and other buffering limits.
 ///
@@ -405,6 +421,15 @@ pub struct BlocksStateMachine {
     /// Every bank_id ever seen for a slot, so the losers can be found once a winner is known.
     slot_to_banks: FxHashMap<Slot, Vec<BankId>>,
 
+    ///
+    /// When a slot was first registered into `slot_to_banks` -- set once, alongside it, in
+    /// `register_bank_for_slot`, and cleared alongside it in `remove_slot_references_in_state`.
+    /// The only reason this exists is [`Self::gc`]'s age-based sweep, for a slot that never
+    /// enters [`Forks`]'s history and so is otherwise invisible to garbage collection (see
+    /// [`MAX_UNRESOLVED_SLOT_AGE`]).
+    ///
+    slot_first_seen_at: FxHashMap<Slot, Instant>,
+
     /// The bank_id currently believed to be a slot's canonical bank. Only ever set/changed by a
     /// Confirmed/Finalized commitment update, or by single-candidate inference when a slot has
     /// only ever had one bank_id at all (`try_infer_sole_candidate_winner`). Once a slot reaches
@@ -495,6 +520,7 @@ impl BlocksStateMachine {
             block_buffer_map: Default::default(),
             frozen_commitment_index: Default::default(),
             slot_to_banks: Default::default(),
+            slot_first_seen_at: Default::default(),
             resolved_bank_per_slot: Default::default(),
             slot_min_commitment: Default::default(),
             discarded_bank_ids: Default::default(),
@@ -539,6 +565,9 @@ impl BlocksStateMachine {
     }
 
     fn register_bank_for_slot(&mut self, slot: Slot, bank_id: BankId) {
+        self.slot_first_seen_at
+            .entry(slot)
+            .or_insert_with(Instant::now);
         let ids = self.slot_to_banks.entry(slot).or_default();
         if !ids.contains(&bank_id) {
             ids.push(bank_id);
@@ -1164,6 +1193,7 @@ impl BlocksStateMachine {
                 self.remove_bank_references(bank_id);
             }
         }
+        self.slot_first_seen_at.remove(&slot);
         self.resolved_bank_per_slot.remove(&slot);
         self.slot_min_commitment.remove(&slot);
     }
@@ -1194,20 +1224,37 @@ impl BlocksStateMachine {
     /// Stuff to "deindex" are :
     /// metadata about slot that are finalized -- Since they are finalized we don't need to keep them around anymore.
     /// Forked Slot -- Slot that are forked and we know we will never reach finalized status for them.
-    ///
+    /// Slots that never resolved and never reached `Finalized` -- see [`MAX_UNRESOLVED_SLOT_AGE`].
     ///
     /// `deleted`, if provided, is extended with every `bank_id` purged by this pass (not the
     /// slots themselves) -- this is what a downstream payload accumulator (keyed by `bank_id`,
     /// not `Slot`) needs in order to prune content for banks that were never delivered.
     ///
-    pub fn gc(&mut self, mut deleted: Option<&mut Vec<BankId>>) -> BlockstoreGCStats {
+    pub fn gc(&mut self, deleted: Option<&mut Vec<BankId>>) -> BlockstoreGCStats {
+        self.gc_with_now(deleted, Instant::now())
+    }
+
+    ///
+    /// [`Self::gc`]'s real implementation, parameterized on `now` so tests can simulate the
+    /// passage of time (computing a synthetic future `Instant` needs no actual sleep) without
+    /// making `gc` itself take a clock parameter publicly.
+    ///
+    fn gc_with_now(
+        &mut self,
+        mut deleted: Option<&mut Vec<BankId>>,
+        now: Instant,
+    ) -> BlockstoreGCStats {
         self.process_deregister_finalized_block_queue();
         let mut stats = BlockstoreGCStats::default();
-        let mut elligible_for_deletion = Vec::with_capacity(self.forks_history.len());
+        let mut elligible_for_deletion: FxHashSet<Slot> = FxHashSet::default();
         let mut forks_to_remove = FxHashSet::default();
         self.forks
             .truncate_excess_rooted_slots(&mut forks_to_remove);
         let oldest_rooted_slot = self.forks.oldest_rooted_slot().unwrap_or(0);
+
+        // Pass 1: the ordinary sweep -- slots that entered `Forks`'s history (detected as a fork,
+        // or an ancestor of one) and are old enough, by slot number, that they should already have
+        // reached `Finalized` if they ever would.
         for slot in self.forks_history.iter() {
             // If the oldest rooted slot that we have is bigger than current slot that we are processing than we should
             // have received Finalized status for this slot by now.
@@ -1238,11 +1285,45 @@ impl BlocksStateMachine {
                 stats.slot_blocked_count += 1;
                 continue;
             }
-            elligible_for_deletion.push(*slot);
+            elligible_for_deletion.insert(*slot);
         }
+
+        // Pass 2: the age-based sweep (AUDIT.md finding 7) -- a slot that never entered `Forks`'s
+        // history at all is invisible to pass 1 no matter how long it has sat around, which is
+        // exactly what happens to a perfectly healthy, resolved slot that simply never receives
+        // its own `Finalized` commitment update. Age it out once it has been around longer than
+        // `MAX_UNRESOLVED_SLOT_AGE`, deliberately WITHOUT pass 1's two safety gates:
+        // - The pending-Processed gate exists to protect a slot that is likely about to resolve
+        //   normally very soon from being evicted out from under that delivery. That reasoning
+        //   does not apply here: a slot only reaches this pass after sitting for the *entire*
+        //   age threshold with no progress, at which point a still-queued Processed status is
+        //   not "about to be delivered" -- it is exactly the leaked state this sweep exists to
+        //   reclaim, and gating on its presence would make this sweep unable to ever fire for the
+        //   scenario it was built for.
+        // - The `oldest_rooted_slot` comparison compares slot *numbers* against the fork graph's
+        //   rooted window, which is meaningless for a slot that may not be in that graph at all.
+        //
+        // A late straggler event for an evicted bank_id afterwards restarts a fresh, small
+        // buffer for it rather than being rejected outright (it was never marked `discarded`,
+        // only aged out) -- the same accepted bounded edge case as pass 1's ordinary sweep.
+        for (&slot, &first_seen) in &self.slot_first_seen_at {
+            if elligible_for_deletion.contains(&slot) {
+                continue;
+            }
+            if now.saturating_duration_since(first_seen) < MAX_UNRESOLVED_SLOT_AGE {
+                continue;
+            }
+            tracing::warn!(
+                "Slot {} aged out after {:?} without ever reaching Finalized -- evicting stale index state",
+                slot,
+                now.saturating_duration_since(first_seen)
+            );
+            elligible_for_deletion.insert(slot);
+        }
+
         stats.slot_purge_count = elligible_for_deletion.len();
-        let purged: FxHashSet<Slot> = elligible_for_deletion.iter().copied().collect();
-        for slot in elligible_for_deletion {
+        let purged = elligible_for_deletion;
+        for &slot in &purged {
             self.forks_history.remove(&slot);
             if let Some(trace) = deleted.as_mut() {
                 if let Some(bank_ids) = self.slot_to_banks.get(&slot) {
@@ -1299,7 +1380,8 @@ pub const fn module_path_for_test() -> &'static str {
 mod tests {
     use {
         crate::state_machine::{
-            BlockSummary, BlocksStateMachine, EntryInfo, SlotCommitmentStatusUpdate, SlotLifecycle,
+            BlockStateMachineOutput, BlockSummary, BlocksStateMachine, DeadletterEvent, EntryInfo,
+            MAX_UNRESOLVED_SLOT_AGE, Revision, SlotCommitmentStatusUpdate, SlotLifecycle,
             SlotLifecycleUpdate,
         },
         solana_clock::{BankId, DEFAULT_TICKS_PER_SLOT, Slot},
@@ -1726,59 +1808,6 @@ mod tests {
         assert!(!sm.block_buffer_map.contains_key(&bank_a));
         assert!(!sm.slot_to_banks.contains_key(&slot));
     }
-}
-
-///
-/// Regression suite for the defects catalogued in `AUDIT.md` at the repository root.
-///
-/// Every test here asserts the **correct** behaviour, so every one of them **fails against the
-/// current implementation**. They are the reproduction cases for the audit: a test flipping to
-/// green means that finding is fixed. Each test names the `AUDIT.md` finding it covers.
-///
-/// Run just this module with:
-///
-/// ```text
-/// cargo test --all-features audit_regression::
-/// ```
-///
-/// To keep a green default suite while these are open, add `#[ignore]` to each test and run them
-/// with `cargo test --all-features audit_regression:: -- --ignored`.
-///
-#[cfg(test)]
-mod audit_regression {
-    use super::*;
-
-    fn created_bank(slot: Slot, parent: Option<Slot>, bank_id: BankId) -> SlotLifecycleUpdate {
-        SlotLifecycleUpdate {
-            slot,
-            parent_slot: parent,
-            stage: SlotLifecycle::CreatedBank,
-            bank_id: Some(bank_id),
-        }
-    }
-
-    fn dead(slot: Slot) -> SlotLifecycleUpdate {
-        SlotLifecycleUpdate {
-            slot,
-            parent_slot: None,
-            stage: SlotLifecycle::Dead,
-            bank_id: None,
-        }
-    }
-
-    fn cmt(
-        slot: Slot,
-        parent: Option<Slot>,
-        level: CommitmentLevel,
-        bank_id: BankId,
-    ) -> SlotCommitmentStatusUpdate {
-        SlotCommitmentStatusUpdate {
-            slot,
-            parent_slot: parent,
-            commitment: level,
-            bank_id,
-        }
-    }
 
     /// `CreatedBank` plus `n` entries and no `BlockMeta`, so the bank is left buffering.
     fn buffer(
@@ -2005,7 +2034,7 @@ mod audit_regression {
 
         // The child finalizes, which retroactively roots slot 1.
         seal(&mut sm, 2, Some(1), 200);
-        sm.process_consensus_event(cmt(2, Some(1), CommitmentLevel::Finalized, 200).into());
+        sm.process_consensus_event(commitment(2, Some(1), CommitmentLevel::Finalized, 200).into());
         drain(&mut sm);
 
         assert_eq!(
@@ -2055,8 +2084,8 @@ mod audit_regression {
             .unwrap();
         seal(&mut sm, 1, Some(0), 100);
         seal(&mut sm, 1, Some(0), 101);
-        sm.process_consensus_event(cmt(1, Some(0), CommitmentLevel::Processed, 100).into());
-        sm.process_consensus_event(cmt(1, Some(0), CommitmentLevel::Processed, 101).into());
+        sm.process_consensus_event(commitment(1, Some(0), CommitmentLevel::Processed, 100).into());
+        sm.process_consensus_event(commitment(1, Some(0), CommitmentLevel::Processed, 101).into());
         assert!(
             !sm.resolved_bank_per_slot.contains_key(&1),
             "precondition: slot 1 is genuinely ambiguous between two real competitors"
@@ -2065,7 +2094,7 @@ mod audit_regression {
 
         // The child finalizes, retroactively rooting slot 1 while it is still ambiguous.
         seal(&mut sm, 2, Some(1), 200);
-        sm.process_consensus_event(cmt(2, Some(1), CommitmentLevel::Finalized, 200).into());
+        sm.process_consensus_event(commitment(2, Some(1), CommitmentLevel::Finalized, 200).into());
         let seen_before = statuses(&drain(&mut sm));
         assert!(
             !seen_before.iter().any(|(s, _)| *s == 1),
@@ -2073,7 +2102,7 @@ mod audit_regression {
         );
 
         // A real, direct Confirmed update for bank 100 arrives afterwards, resolving it for real.
-        sm.process_consensus_event(cmt(1, Some(0), CommitmentLevel::Confirmed, 100).into());
+        sm.process_consensus_event(commitment(1, Some(0), CommitmentLevel::Confirmed, 100).into());
         let seen_after = statuses(&drain(&mut sm));
 
         assert_eq!(sm.resolved_bank_per_slot.get(&1), Some(&100));
@@ -2094,7 +2123,7 @@ mod audit_regression {
     fn audit_3_gapfill_schedules_teardown_once_at_the_finalized_revision() {
         let mut sm = BlocksStateMachine::default();
         seal(&mut sm, 1, Some(0), 100);
-        sm.process_consensus_event(cmt(1, Some(0), CommitmentLevel::Finalized, 100).into());
+        sm.process_consensus_event(commitment(1, Some(0), CommitmentLevel::Finalized, 100).into());
 
         // Revisions: 0 = FrozenBlock, 1 = Processed, 2 = Confirmed, 3 = Finalized.
         let mut sched: Vec<(Revision, Vec<Slot>)> = sm
@@ -2118,7 +2147,7 @@ mod audit_regression {
     fn audit_3a_duplicate_block_meta_is_still_rejected_after_partial_drain() {
         let mut sm = BlocksStateMachine::default();
         seal(&mut sm, 1, Some(0), 100);
-        sm.process_consensus_event(cmt(1, Some(0), CommitmentLevel::Finalized, 100).into());
+        sm.process_consensus_event(commitment(1, Some(0), CommitmentLevel::Finalized, 100).into());
 
         // A consumer pops the block and only the synthesized Processed status.
         assert!(matches!(
@@ -2171,13 +2200,13 @@ mod audit_regression {
     fn audit_3b_finalized_resolution_survives_a_rogue_bank() {
         let mut sm = BlocksStateMachine::default();
         seal(&mut sm, 1, Some(0), 100);
-        sm.process_consensus_event(cmt(1, Some(0), CommitmentLevel::Finalized, 100).into());
+        sm.process_consensus_event(commitment(1, Some(0), CommitmentLevel::Finalized, 100).into());
         sm.pop_next_unprocess_blockstore_update().unwrap(); // FrozenBlock
         sm.pop_next_unprocess_blockstore_update().unwrap(); // synthesized Processed
         sm.gc(None);
 
         // A different bank claims Confirmed for the already-finalized slot 1.
-        sm.process_consensus_event(cmt(1, Some(99), CommitmentLevel::Confirmed, 101).into());
+        sm.process_consensus_event(commitment(1, Some(99), CommitmentLevel::Confirmed, 101).into());
 
         assert_eq!(
             sm.resolved_bank_per_slot.get(&1),
@@ -2213,7 +2242,9 @@ mod audit_regression {
         // A genuine second bank arrives claiming parent 27 and reaches Confirmed.
         sm.process_replay_event(created_bank(30, Some(27), 3001).into())
             .unwrap();
-        sm.process_consensus_event(cmt(30, Some(27), CommitmentLevel::Confirmed, 3001).into());
+        sm.process_consensus_event(
+            commitment(30, Some(27), CommitmentLevel::Confirmed, 3001).into(),
+        );
         assert_eq!(
             sm.forks.get_parent(&30),
             Some(27),
@@ -2323,7 +2354,7 @@ mod audit_regression {
         seal(&mut sm, 5, Some(4), 501);
         drain(&mut sm);
 
-        sm.process_consensus_event(cmt(5, Some(4), CommitmentLevel::Confirmed, 501).into());
+        sm.process_consensus_event(commitment(5, Some(4), CommitmentLevel::Confirmed, 501).into());
         assert!(
             sm.discarded_bank_ids.contains_key(&500),
             "precondition: bank 500 lost and was discarded"
@@ -2358,17 +2389,35 @@ mod audit_regression {
         for slot in 1000..1010u64 {
             let bank_id = slot + 500_000;
             for level in [CommitmentLevel::Processed, CommitmentLevel::Confirmed] {
-                sm.process_consensus_event(cmt(slot, Some(slot - 1), level, bank_id).into());
+                sm.process_consensus_event(commitment(slot, Some(slot - 1), level, bank_id).into());
             }
         }
         assert!(
             drain(&mut sm).is_empty(),
             "precondition: none of these banks ever froze, so nothing is emitted"
         );
+        assert_eq!(
+            sm.slot_first_seen_at.len(),
+            10,
+            "precondition: every slot was registered and timestamped"
+        );
 
+        // None of these slots ever entered Forks's history (nothing here was ever detected as a
+        // fork), so ordinary `gc()` calls -- with no time elapsed -- can never reclaim them no
+        // matter how many passes run.
         for _ in 0..25 {
             sm.gc(None);
         }
+        assert_eq!(
+            sm.slot_to_banks.len(),
+            10,
+            "precondition: gc() alone, with no time elapsed, does not reclaim these slots"
+        );
+
+        // Simulate MAX_UNRESOLVED_SLOT_AGE having passed -- computing a future Instant needs no
+        // actual sleep.
+        let far_future = std::time::Instant::now() + MAX_UNRESOLVED_SLOT_AGE * 2;
+        sm.gc_with_now(None, far_future);
 
         assert_eq!(
             sm.pending_slot_status_update.len(),

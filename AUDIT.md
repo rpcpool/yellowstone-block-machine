@@ -7,28 +7,41 @@ Primary target: `crates/yellowstone-block-machine/src/state_machine.rs`.
 
 ## Summary
 
-Twelve defects are confirmed, each backed by a test in `audit_regression` (see the reproduction
-suite section). Six further defects were reported by the audit but have not been verified and are
-listed separately.
+Twelve defects are confirmed, each backed by a test (see the reproduction suite section). Six
+further defects were reported by the audit but have not been verified and are listed separately.
 
 None of these are visible to the existing suite. All 36 pre-existing tests pass regardless of which
 findings below are fixed, because the failing behaviours all sit in orderings that suite does not
 construct.
 
-**Status: 9 of 12 fixed.** Finding 1 (optimistic freeze fabricating blocks), finding 2
-(retroactive rooting dropping commitment delivery), finding 3 (gap-filled Finalized scheduling
-premature teardown), finding 4 (superseding leaving a stale fork edge), finding 5 (dead-slot fork
-events losing their bank_ids), finding 6 (discarded losers reaching no prune path), finding 8
-(events for discarded banks returning `Ok`, including a third call site found while fixing it),
-finding 9 (`DeadSlotDetected` never constructed), and finding 11 (`FrozenBlock::entries` in hash-map
-order) are fixed as of this revision. Only finding 7 is open.
+**Status: 10 of 12 fixed.** All findings except 10 and 12 are fixed as of this revision: finding 1
+(optimistic freeze fabricating blocks), finding 2 (retroactive rooting dropping commitment
+delivery), finding 3 (gap-filled Finalized scheduling premature teardown), finding 4 (superseding
+leaving a stale fork edge), finding 5 (dead-slot fork events losing their bank_ids), finding 6
+(discarded losers reaching no prune path), finding 7 (unresolved/never-finalized slots invisible to
+garbage collection), finding 8 (events for discarded banks returning `Ok`, including a third call
+site found while fixing it), finding 9 (`DeadSlotDetected` never constructed), and finding 11
+(`FrozenBlock::entries` in hash-map order).
+
+Findings 10 and 12 were never assigned a `TEST`/`READ` status meant to be flipped to `FIXED` -- they
+are dead-code observations (an unused queue, a handful of unused declarations) rather than logic
+bugs, and remain exactly as documented in their own sections below unless the crate owner wants
+them cleaned up separately.
+
+The regression tests for findings 1 through 9 and 11 originally lived in a standalone
+`audit_regression` module, one test per finding, each asserting the *correct* behaviour so it would
+fail until its finding was fixed. Now that every one of them is fixed, they have been merged
+directly into the crate's own pre-existing `mod tests` alongside the tests that were already there
+-- there is no longer a reason to keep them separate, since a passing `audit_*` test is no longer
+distinguishable in spirit from any other regression test in the suite. Their doc comments (each
+still naming the `AUDIT.md` finding it covers) were kept intact through the merge.
 
 ## Verification legend
 
 | Mark | Meaning |
 |---|---|
 | `FIXED` | Verified defect, fix applied, its regression test now passes |
-| `TEST` | Reproduced by a test in `audit_regression`, still open |
+| `TEST` | Reproduced by a test, not yet fixed (no finding currently carries this mark) |
 | `READ` | Confirmed by code inspection and a workspace-wide search, still open |
 | `UNVERIFIED` | Reported by the audit, mechanism plausible, not yet reproduced |
 
@@ -276,7 +289,7 @@ matching on it. `audit_6_discarded_loser_is_announced_for_pruning` passes.
 
 ## 7. Unresolved slots are invisible to garbage collection
 
-**Severity:** high &nbsp;&nbsp; **Status:** `TEST` &nbsp;&nbsp; **Location:** `state_machine.rs:1087`
+**Severity:** high &nbsp;&nbsp; **Status:** `FIXED` &nbsp;&nbsp; **Location:** `state_machine.rs:1087`
 
 `gc`'s purge loop iterates `forks_history` only. After the rewrite the only thing that teaches
 `Forks` that a slot exists is `register_resolved_parent`, reachable solely from `set_resolved_bank`.
@@ -289,8 +302,43 @@ permanent.
 arrived, which is what a stream restart mid-block looks like. After 25 `gc` passes all ten were
 still held, with `forks_history` empty.
 
-**Fix.** Age unresolved slots out on a separate criterion, such as wall-clock age of the oldest
-buffered bank, rather than depending on fork-graph membership.
+Investigating further while implementing the fix turned up that the finding's own framing
+("unresolved slots") was narrower than the actual bug. A single bank with no competitor resolves
+immediately, by sole-candidate inference, on its very first `Processed` update -- `resolved_bank_per_slot`
+gets set and `Forks` does learn its parent edge. But `forks_history` (the set `gc` actually
+iterates) is only ever populated when something is *detected as forked*, never merely by being
+added to the fork graph's topology. So the real defect is broader: **any slot that is never
+detected as a fork and never reaches `Finalized`** is invisible to `gc`, resolved or not.
+
+**Fix.** Applied: a new field, `slot_first_seen_at: FxHashMap<Slot, Instant>`, records when a slot
+was first registered (set in `register_bank_for_slot`, the common choke point already used for
+`slot_to_banks`; cleared alongside it in `remove_slot_references_in_state`). `gc` is now split into
+a public `gc()` (unchanged signature, calls `Instant::now()`) and a private `gc_with_now(deleted,
+now)` that does the real work, parameterized on the clock so tests can simulate the passage of time
+without an actual sleep -- `Instant + Duration` arithmetic needs no waiting, mirroring the existing
+`Block::new_with_clock` pattern in this same file.
+
+`gc_with_now` runs two passes. Pass 1 is the original `forks_history`-based sweep, unchanged. Pass
+2 is new: any slot in `slot_first_seen_at`, not already purged by pass 1, older than a new constant
+`MAX_UNRESOLVED_SLOT_AGE` (300 seconds, generously above the tens of seconds a healthy slot normally
+takes to reach `Finalized`), is evicted -- deliberately *without* either of pass 1's two safety
+gates. The `oldest_rooted_slot` slot-number comparison is meaningless for a slot that may not be in
+the fork graph at all. The pending-Processed gate is actively wrong here: it exists to protect a
+slot that is likely about to resolve normally very soon, but a slot only reaches pass 2 after
+sitting for the *entire* age threshold with zero progress, at which point a still-queued Processed
+status is not "about to be delivered" -- it is exactly the leaked state this sweep exists to
+reclaim. Reusing that gate unmodified, which was my first attempt, made pass 2 permanently unable
+to evict the very slots `audit_7`'s scenario constructs, since every one of them has exactly such a
+queued Processed status.
+
+A late straggler event for a bank_id evicted this way restarts a fresh, small buffer rather than
+being rejected outright, since it was never marked `discarded`, only aged out -- the same accepted
+bounded edge case pass 1's ordinary sweep already has.
+
+`audit_7_unresolved_slot_state_is_eventually_reclaimed` now drives this precisely: it first confirms
+25 ordinary `gc()` passes, with no time elapsed, reclaim nothing (since `forks_history` stays
+empty), then calls `gc_with_now` with a synthetic far-future `Instant` and confirms everything is
+reclaimed. It passes.
 
 ## 8. Events for discarded banks return `Ok`
 
@@ -427,29 +475,38 @@ Areas still unreviewed:
 
 The findings above are backed by two things:
 
-- `crates/yellowstone-block-machine/src/state_machine.rs`, module `audit_regression` -- one test per
-  finding at the level `BlocksStateMachine` is actually used.
+- `crates/yellowstone-block-machine/src/state_machine.rs`, `mod tests` -- fifteen tests named
+  `audit_*`, one per finding (findings 1 through 9 and 11), living alongside the crate's own
+  pre-existing tests. They started out in a standalone `audit_regression` module, each asserting
+  the *correct* behaviour so it would fail until its finding was fixed; now that every one of them
+  passes, they were merged into `mod tests` since a fixed `audit_*` test is no longer meaningfully
+  different from any other regression test in the suite. Their doc comments, each naming the
+  `AUDIT.md` finding it covers, were kept intact through the merge. Two duplicate helpers
+  (`created_bank`, `dead`) and one renamed one (`cmt` -> `commitment`, reusing the pre-existing
+  helper of the same shape) were dropped in the merge; nothing else about the tests changed.
 - `crates/yellowstone-block-machine/src/forks.rs`, module `forks_tests` -- three additional unit
   tests (`reparent_*`) exercising finding 4's fix directly against the new `Forks` method, since
-  that is where the actual defect lived.
-
-Every `audit_regression` test asserts the **correct** behaviour, so every one of them **fails
-against the current implementation** until its finding is fixed. A test flipping to green means
-that finding is fixed. The three `forks.rs` tests are ordinary passing regression tests for the new
-method, not inverted like the `audit_regression` ones -- there was no way to write a "must currently
-fail" test at that level before the method existed.
+  that is where the actual defect lived. These were always ordinary passing tests for the new
+  method, not inverted -- there was no way to write a "must currently fail" test at that level
+  before the method existed.
 
 ```text
-cargo test --all-features audit_regression::
+cargo test --all-features audit_          # the 15 audit_* tests, by name prefix
 ```
 
-Expect one failure (finding 7 remains open). Findings 1 through 6, 8, 9, and 11 are fixed; all fourteen of their `state_machine.rs`-level tests now pass, plus three new `forks.rs`-level unit tests for finding 4. The pre-existing suite is unaffected (one of its own tests, `dead_slot_discards_every_bank_registered_for_it`, was updated to expect the now-correct `DeadSlotDetected` output instead of `ForksDetected`):
+Expect zero failures. Every finding with a regression test (1 through 9 and 11) is fixed; all
+fifteen `audit_*` tests pass, alongside the crate's other pre-existing tests in the same module,
+plus three `forks.rs`-level unit tests for finding 4 (one of the pre-existing tests,
+`dead_slot_discards_every_bank_registered_for_it`, was itself updated to expect the now-correct
+`DeadSlotDetected` output instead of `ForksDetected`, since finding 9 changed what a directly-dead
+slot emits):
 
 ```text
-cargo test --all-features -- --skip audit_regression    # 39 passed (36 pre-existing + 3 new forks.rs tests)
+cargo test --all-features    # 54 passed in the lib target (state_machine.rs's mod tests holds
+                              # 23 -- 8 pre-existing plus these 15 -- and forks.rs holds the rest)
 ```
 
-| Test | Finding | Assertion that currently fails |
+| Test | Finding | Assertion (originally failing, now passing unless marked otherwise) |
 |---|---|---|
 | `audit_1_no_fabricated_block_for_parent_slot_sibling` | 1 | **FIXED.** Bank 1001 never got a `BlockMeta`, its hash doesn't match the child's `parent_blockhash`, and it is no longer frozen. |
 | `audit_1b_optimistic_freeze_still_recovers_the_real_parent_by_hash` | 1 | **FIXED (added).** A genuine parent whose hash matches is still recovered, even before the slot resolves. |
@@ -465,18 +522,14 @@ cargo test --all-features -- --skip audit_regression    # 39 passed (36 pre-exis
 | `audit_5_dead_slot_event_carries_its_bank_ids` | 5 | **FIXED.** The dead slot's event now names banks 70 and 71 via a same-tick snapshot, delivered as `DeadSlotDetected` (finding 9). |
 | `audit_5b_descendant_fork_in_the_same_tick_still_reports_its_own_live_bank_ids` | 5 | **FIXED (added).** A descendant forked in the same tick still reports its own live bank_ids via `ForksDetected`, unaffected. |
 | `audit_6_discarded_loser_is_announced_for_pruning` | 6 | **FIXED.** Bank 500 now reaches the deadletter queue via a new `DeadletterEvent::Discarded` variant. |
-| `audit_7_unresolved_slot_state_is_eventually_reclaimed` | 7 | Ten abandoned slots must be reclaimed. All ten survive 25 gc passes. |
+| `audit_7_unresolved_slot_state_is_eventually_reclaimed` | 7 | **FIXED.** Ten abandoned slots survive 25 ordinary `gc()` passes, then are reclaimed by `gc_with_now` once `MAX_UNRESOLVED_SLOT_AGE` has passed. |
 | `audit_8_events_for_discarded_banks_are_rejected` | 8 | **FIXED.** Entry, BlockMeta, and CreatedBank stragglers for discarded bank 70 all now return `Err`. |
-| `audit_9_dead_slot_emits_a_dead_slot_output` | 9 | A `Dead` update must produce `DeadSlotDetected`. It produces `ForksDetected`. |
 | `audit_9_dead_slot_emits_a_dead_slot_output` | 9 | **FIXED.** A Dead lifecycle update now produces `DeadSlotDetected`, not `ForksDetected`. |
 | `audit_11_frozen_block_entries_are_ordered_by_entry_index` | 11 | **FIXED.** Entries now come out sorted by `entry_index`. |
 
-Findings 10 and 12 are absence-of-code defects with nothing to assert at runtime. Confirm them with:
+Findings 10 and 12 are absence-of-code observations with nothing to assert at runtime. Confirm
+they are still just dead code, not fixed into something new, with:
 
 ```text
 rg 'dead_blocks_queue|tick_entry_cnt|min_history_revision_in_queue' crates/
-rg 'BlockStateMachineOutput::DeadSlotDetected' crates/ examples/
 ```
-
-To keep a green default suite while these stay open, add `#[ignore]` to each test and run them with
-`cargo test --all-features audit_regression:: -- --ignored`.
