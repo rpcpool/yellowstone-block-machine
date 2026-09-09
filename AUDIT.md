@@ -15,12 +15,13 @@ None of these are visible to the existing suite. All 36 pre-existing tests pass 
 findings below are fixed, because the failing behaviours all sit in orderings that suite does not
 construct.
 
-**Status: 7 of 12 fixed.** Finding 1 (optimistic freeze fabricating blocks), finding 2
+**Status: 8 of 12 fixed.** Finding 1 (optimistic freeze fabricating blocks), finding 2
 (retroactive rooting dropping commitment delivery), finding 3 (gap-filled Finalized scheduling
 premature teardown), finding 4 (superseding leaving a stale fork edge), finding 5 (dead-slot fork
-events losing their bank_ids), finding 6 (discarded losers reaching no prune path), and finding 8
-(events for discarded banks returning `Ok`, including a third call site found while fixing it) are
-fixed as of this revision. Findings 7, 9, and 11 are open.
+events losing their bank_ids), finding 6 (discarded losers reaching no prune path), finding 8
+(events for discarded banks returning `Ok`, including a third call site found while fixing it), and
+finding 11 (`FrozenBlock::entries` in hash-map order) are fixed as of this revision. Findings 7 and
+9 are open.
 
 ## Verification legend
 
@@ -347,14 +348,21 @@ dead blocks regardless of how many occur.
 
 ## 11. `FrozenBlock::entries` is emitted in hash-map order
 
-**Severity:** low &nbsp;&nbsp; **Status:** `READ` &nbsp;&nbsp; **Location:** `state_machine.rs:164`
+**Severity:** low &nbsp;&nbsp; **Status:** `FIXED` &nbsp;&nbsp; **Location:** `state_machine.rs:164`
 
-`Block::freeze` builds the vector with `self.entries.values().cloned().collect()` over an
-`FxHashMap<u64, EntryInfo>`, so entry order is nondeterministic rather than sorted by `entry_index`.
+`Block::freeze` built the vector with `self.entries.values().cloned().collect()` over an
+`FxHashMap<u64, EntryInfo>`, so entry order was nondeterministic rather than sorted by
+`entry_index`.
 
-Neither accumulator in this crate reads that field, so there is no live data loss here. It remains a
+Neither accumulator in this crate read that field, so there was no live data loss. It remained a
 hazard on a public, `Serialize`/`Deserialize` type: an external consumer would reasonably assume
-block order. Sorting by `entry_index` in `freeze` costs nothing.
+block order.
+
+**Fix.** Applied: `freeze` now collects `self.entries.into_values()` into a `Vec` and sorts it with
+`sort_unstable_by_key(|entry| entry.entry_index)` before building `FrozenBlock`.
+`audit_11_frozen_block_entries_are_ordered_by_entry_index`, which feeds entries in a deliberately
+scrambled order (`[5, 0, 3, 1, 4, 2]`) and checks the frozen output comes back as `[0, 1, 2, 3, 4,
+5]`, passes.
 
 ## 12. Declared but unused items
 
@@ -422,7 +430,7 @@ fail" test at that level before the method existed.
 cargo test --all-features audit_regression::
 ```
 
-Expect three failures (findings 7, 9, and 11 remain open). Findings 1 through 6 and 8 are fixed; all twelve of their `state_machine.rs`-level tests now pass, plus three new `forks.rs`-level unit tests for finding 4. The pre-existing suite is unaffected:
+Expect two failures (findings 7 and 9 remain open). Findings 1 through 6, 8, and 11 are fixed; all thirteen of their `state_machine.rs`-level tests now pass, plus three new `forks.rs`-level unit tests for finding 4. The pre-existing suite is unaffected:
 
 ```text
 cargo test --all-features -- --skip audit_regression    # 39 passed (36 pre-existing + 3 new forks.rs tests)
@@ -447,7 +455,7 @@ cargo test --all-features -- --skip audit_regression    # 39 passed (36 pre-exis
 | `audit_7_unresolved_slot_state_is_eventually_reclaimed` | 7 | Ten abandoned slots must be reclaimed. All ten survive 25 gc passes. |
 | `audit_8_events_for_discarded_banks_are_rejected` | 8 | **FIXED.** Entry, BlockMeta, and CreatedBank stragglers for discarded bank 70 all now return `Err`. |
 | `audit_9_dead_slot_emits_a_dead_slot_output` | 9 | A `Dead` update must produce `DeadSlotDetected`. It produces `ForksDetected`. |
-| `audit_11_frozen_block_entries_are_ordered_by_entry_index` | 11 | Entries must come out in index order. They come out in hash order. |
+| `audit_11_frozen_block_entries_are_ordered_by_entry_index` | 11 | **FIXED.** Entries now come out sorted by `entry_index`. |
 
 Findings 10 and 12 are absence-of-code defects with nothing to assert at runtime. Confirm them with:
 

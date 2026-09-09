@@ -158,10 +158,17 @@ impl Block {
     }
 
     fn freeze(self, summary: &BlockSummary) -> FrozenBlock {
+        // `self.entries` is an `FxHashMap`, so collecting its values directly would hand
+        // `FrozenBlock::entries` out in nondeterministic hash order rather than by
+        // `entry_index` -- a hazard on a public, `Serialize`/`Deserialize` type whose field name
+        // reasonably implies block order. Sort explicitly.
+        let mut entries: Vec<EntryInfo> = self.entries.into_values().collect();
+        entries.sort_unstable_by_key(|entry| entry.entry_index);
+
         FrozenBlock {
             slot: self.slot,
             bank_id: self.bank_id,
-            entries: self.entries.values().cloned().collect(),
+            entries,
             blockhash: summary.blockhash,
             parent_slot: summary.parent_slot,
             entries_count: summary.entry_count,
