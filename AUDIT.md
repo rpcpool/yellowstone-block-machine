@@ -15,11 +15,12 @@ None of these are visible to the existing suite. All 36 pre-existing tests pass 
 findings below are fixed, because the failing behaviours all sit in orderings that suite does not
 construct.
 
-**Status: 6 of 12 fixed.** Finding 1 (optimistic freeze fabricating blocks), finding 2
+**Status: 7 of 12 fixed.** Finding 1 (optimistic freeze fabricating blocks), finding 2
 (retroactive rooting dropping commitment delivery), finding 3 (gap-filled Finalized scheduling
 premature teardown), finding 4 (superseding leaving a stale fork edge), finding 5 (dead-slot fork
-events losing their bank_ids), and finding 6 (discarded losers reaching no prune path) are fixed as
-of this revision. The other six are open.
+events losing their bank_ids), finding 6 (discarded losers reaching no prune path), and finding 8
+(events for discarded banks returning `Ok`, including a third call site found while fixing it) are
+fixed as of this revision. Findings 7, 9, and 11 are open.
 
 ## Verification legend
 
@@ -292,7 +293,7 @@ buffered bank, rather than depending on fork-graph membership.
 
 ## 8. Events for discarded banks return `Ok`
 
-**Severity:** high &nbsp;&nbsp; **Status:** `TEST` &nbsp;&nbsp; **Location:** `state_machine.rs:802`, `state_machine.rs:870`
+**Severity:** high &nbsp;&nbsp; **Status:** `FIXED` &nbsp;&nbsp; **Location:** `state_machine.rs:802`, `state_machine.rs:870`, and `state_machine.rs:664` (found during the fix, see below)
 
 `handle_block_entry_insert` and `handle_block_summary` both return `Ok(())` when the bank is in
 `discarded_bank_ids`. The state machine correctly stores nothing.
@@ -304,8 +305,18 @@ Nothing will ever prune it, because the state machine has no record of it.
 **Observed.** After a slot was marked `Dead`, a straggler entry and a straggler `BlockMeta` for one
 of its banks both returned `Ok`.
 
-**Fix.** Return `Err(UntrackedSlot)` for discarded banks, matching what `is_bank_trackable` already
-tells the caller for account and transaction events.
+**Fix.** Applied: both sites now return `Err(UntrackedSlot)` for a discarded bank, matching what
+`is_bank_trackable` already tells the caller for Account/Transaction events.
+
+While implementing this, a third call site with the identical defect turned up:
+`handle_slot_lifecyle_status`'s `CreatedBank` branch also returned `Ok(())` for an already-discarded
+bank, which is exactly the same problem -- a straggler `CreatedBank` for a discarded bank auto-
+vivifies an unprunable buffer the same way a straggler entry or `BlockMeta` would. This wasn't in
+the original finding, since the regression test only exercised Entry and BlockMeta, but it's the
+same bug, so it's fixed here too rather than left as a known gap.
+
+`audit_8_events_for_discarded_banks_are_rejected` now also asserts a straggler `CreatedBank` is
+rejected, alongside the entry and `BlockMeta` cases it already covered. All three pass.
 
 ## 9. `DeadSlotDetected` is never constructed
 
@@ -411,7 +422,7 @@ fail" test at that level before the method existed.
 cargo test --all-features audit_regression::
 ```
 
-Expect four failures (findings 7, 8, 9, and 11 remain open). Findings 1 through 6 are fixed; all eleven of their `state_machine.rs`-level tests now pass, plus three new `forks.rs`-level unit tests for finding 4. The pre-existing suite is unaffected:
+Expect three failures (findings 7, 9, and 11 remain open). Findings 1 through 6 and 8 are fixed; all twelve of their `state_machine.rs`-level tests now pass, plus three new `forks.rs`-level unit tests for finding 4. The pre-existing suite is unaffected:
 
 ```text
 cargo test --all-features -- --skip audit_regression    # 39 passed (36 pre-existing + 3 new forks.rs tests)
@@ -434,7 +445,7 @@ cargo test --all-features -- --skip audit_regression    # 39 passed (36 pre-exis
 | `audit_5b_descendant_fork_in_the_same_tick_still_reports_its_own_live_bank_ids` | 5 | **FIXED (added).** A descendant forked in the same tick still reports its own live bank_ids, unaffected. |
 | `audit_6_discarded_loser_is_announced_for_pruning` | 6 | **FIXED.** Bank 500 now reaches the deadletter queue via a new `DeadletterEvent::Discarded` variant. |
 | `audit_7_unresolved_slot_state_is_eventually_reclaimed` | 7 | Ten abandoned slots must be reclaimed. All ten survive 25 gc passes. |
-| `audit_8_events_for_discarded_banks_are_rejected` | 8 | Stragglers for discarded bank 70 must return `Err`. Both return `Ok`. |
+| `audit_8_events_for_discarded_banks_are_rejected` | 8 | **FIXED.** Entry, BlockMeta, and CreatedBank stragglers for discarded bank 70 all now return `Err`. |
 | `audit_9_dead_slot_emits_a_dead_slot_output` | 9 | A `Dead` update must produce `DeadSlotDetected`. It produces `ForksDetected`. |
 | `audit_11_frozen_block_entries_are_ordered_by_entry_index` | 11 | Entries must come out in index order. They come out in hash order. |
 

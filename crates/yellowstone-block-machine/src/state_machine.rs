@@ -662,7 +662,14 @@ impl BlocksStateMachine {
                 };
                 tracing::trace!("Bank {bank_id} created for slot {slot}");
                 if self.discarded_bank_ids.contains_key(&bank_id) {
-                    return Ok(());
+                    // Same defect, same fix, as the two call sites above (see AUDIT.md finding
+                    // 8): a straggler CreatedBank for an already-discarded bank must also be
+                    // rejected, not silently accepted, or `stream.rs` will insert it into the
+                    // payload accumulator, auto-vivifying a buffer nothing will ever prune.
+                    tracing::debug!(
+                        "CreatedBank for slot {slot} targets already-discarded bank {bank_id}; dropping"
+                    );
+                    return Err(UntrackedSlot);
                 }
                 if let Some(parent) = slot_lifecycle_status.parent_slot {
                     self.bank_parent_slot.entry(bank_id).or_insert(parent);
@@ -851,7 +858,15 @@ impl BlocksStateMachine {
     fn handle_block_entry_insert(&mut self, data: EntryInfo) -> Result<(), UntrackedSlot> {
         let bank_id = data.bank_id;
         if self.discarded_bank_ids.contains_key(&bank_id) {
-            return Ok(());
+            // `Err`, not `Ok`: `stream.rs` uses this `Result` as the gate for inserting the raw
+            // wire event into its payload accumulator. An `Ok` here would auto-vivify a fresh,
+            // unprunable buffer for a bank this state machine has already given up on -- matching
+            // what `is_bank_trackable` already tells the caller for Account/Transaction events.
+            tracing::debug!(
+                "entry for slot {} targets already-discarded bank {bank_id}; dropping",
+                data.slot
+            );
+            return Err(UntrackedSlot);
         }
         if self.frozen_commitment_index.contains_key(&bank_id) {
             tracing::error!(
@@ -942,10 +957,12 @@ impl BlocksStateMachine {
         let bank_id = block_summary.bank_id;
 
         if self.discarded_bank_ids.contains_key(&bank_id) {
+            // See the matching comment in `handle_block_entry_insert`: this must be `Err`, not
+            // `Ok`, for the same reason.
             tracing::debug!(
                 "block summary for slot {slot} targets already-discarded bank {bank_id}; dropping"
             );
-            return Ok(());
+            return Err(UntrackedSlot);
         }
         if self.frozen_commitment_index.contains_key(&bank_id) {
             tracing::error!(
@@ -2382,6 +2399,15 @@ mod audit_regression {
         assert!(
             meta.is_err(),
             "a straggler BlockMeta for discarded bank 70 must be rejected so the stream stores nothing"
+        );
+
+        // A straggler CreatedBank has the exact same defect and the exact same fix -- found while
+        // implementing this finding, not originally documented, but it is the identical bug at a
+        // third call site (see AUDIT.md finding 8).
+        let created = sm.process_replay_event(created_bank(7, Some(6), 70).into());
+        assert!(
+            created.is_err(),
+            "a straggler CreatedBank for discarded bank 70 must be rejected so the stream stores nothing"
         );
     }
 
