@@ -614,6 +614,53 @@ where
         )
     }
 
+    ///
+    /// Records `slot`'s parent as `new_parent`, correctly retracting whatever parent claim was
+    /// previously active for `slot` (if any and if different) before installing the new one.
+    ///
+    /// Unlike [`Self::add_slot_with_parent_with_rooted_trace`], which only ever *adds* an edge and
+    /// leaves a prior one for the same child untouched, this is the operation to use whenever a
+    /// child's active parent claim can legitimately change after it was first recorded. Callers
+    /// with a fixed, append-only parent-child relationship should keep using
+    /// [`Self::add_slot_with_parent_with_rooted_trace`]; this method exists specifically for the
+    /// case where the caller's own notion of "the" parent for a given child can later be revised
+    /// (e.g. resolution to a different competing instance), which this generic tree structure
+    /// otherwise has no way to represent without leaving a stale forward edge under the old
+    /// parent -- fed only the reverse edge is corrected, the old parent's `children` set would go
+    /// on claiming a child it no longer has.
+    ///
+    /// Does not revisit any conclusion already drawn from the retracted edge: if `slot` (or one of
+    /// its descendants) was already marked forked while still attached to the old parent, it stays
+    /// marked forked. Un-marking it would require proving that conclusion depended on nothing but
+    /// the retracted edge, which this structure does not track -- so the safe direction is to
+    /// leave it as is rather than risk incorrectly clearing a real fork.
+    ///
+    pub fn reparent_with_rooted_trace<T1, T2>(
+        &mut self,
+        slot: T,
+        new_parent: T,
+        newly_forked_slot_out: &mut T1,
+        indirectly_rooted: &mut T2,
+    ) -> bool
+    where
+        T1: ForksMutationTracer<T>,
+        T2: ForksMutationTracer<T>,
+    {
+        if let Some(old_parent) = self.reverse_parent_children_map.get(&slot).cloned() {
+            if old_parent != new_parent {
+                if let Some(children) = self.parent_children_map.get_mut(&old_parent) {
+                    children.remove(&slot);
+                }
+            }
+        }
+        self.add_slot_with_parent_with_rooted_trace(
+            slot,
+            new_parent,
+            newly_forked_slot_out,
+            indirectly_rooted,
+        )
+    }
+
     pub fn len(&self) -> usize {
         self.parent_children_map.len()
     }
@@ -782,7 +829,10 @@ mod orderset_tests {
 
 #[cfg(test)]
 mod forks_tests {
-    use {crate::forks::Forks, rustc_hash::FxHashSet};
+    use {
+        crate::forks::{Forks, NoTrace},
+        rustc_hash::FxHashSet,
+    };
 
     #[test]
     fn adding_slot_with_parent_twice_should_shortcut() {
@@ -791,6 +841,68 @@ mod forks_tests {
         assert!(fd.add_slot_with_parent(2, 1, &mut forked_detected));
         assert!(!fd.add_slot_with_parent(2, 1, &mut forked_detected));
         assert!(forked_detected.is_empty());
+    }
+
+    #[test]
+    fn reparent_retracts_the_stale_forward_edge() {
+        let mut fd = Forks::default();
+        let mut forked_detected = FxHashSet::default();
+        fd.add_slot_with_parent(30, 29, &mut forked_detected);
+        assert_eq!(fd.get_parent(&30), Some(29));
+        assert!(fd.parent_children_map.get(&29).unwrap().contains(&30));
+
+        fd.reparent_with_rooted_trace(30, 27, &mut forked_detected, &mut NoTrace);
+
+        assert_eq!(
+            fd.get_parent(&30),
+            Some(27),
+            "the reverse edge must now point at the new parent"
+        );
+        assert!(
+            !fd.parent_children_map.get(&29).unwrap().contains(&30),
+            "the stale forward edge under the old parent must be retracted"
+        );
+        assert!(
+            fd.parent_children_map.get(&27).unwrap().contains(&30),
+            "the new forward edge must be installed under the new parent"
+        );
+    }
+
+    #[test]
+    fn reparent_to_the_same_parent_is_a_pure_shortcut() {
+        let mut fd = Forks::default();
+        let mut forked_detected = FxHashSet::default();
+        fd.add_slot_with_parent(30, 29, &mut forked_detected);
+
+        let changed = fd.reparent_with_rooted_trace(30, 29, &mut forked_detected, &mut NoTrace);
+
+        assert!(
+            !changed,
+            "reparenting to the same parent must shortcut, like add does"
+        );
+        assert_eq!(fd.get_parent(&30), Some(29));
+        assert!(fd.parent_children_map.get(&29).unwrap().contains(&30));
+        assert!(forked_detected.is_empty());
+    }
+
+    #[test]
+    fn reparent_prevents_the_old_parents_death_from_wrongly_forking_the_child() {
+        let mut fd = Forks::default();
+        let mut forked_detected = FxHashSet::default();
+        // slot 30 is first attached to 29 (e.g. a sole-candidate bank's own claim)...
+        fd.add_slot_with_parent(30, 29, &mut forked_detected);
+        // ...then superseded to 27 (e.g. a later Confirmed naming a different bank).
+        fd.reparent_with_rooted_trace(30, 27, &mut forked_detected, &mut NoTrace);
+        forked_detected.clear();
+
+        // 29 (the abandoned parent) is later marked dead. This must not fork 30, since 30 is no
+        // longer one of its children.
+        fd.mark_slot_as_forked(29, &mut forked_detected);
+
+        assert!(
+            !forked_detected.contains(&30),
+            "slot 30 was moved to parent 27 and must not be forked by 29's death, got {forked_detected:?}"
+        );
     }
 
     #[test]

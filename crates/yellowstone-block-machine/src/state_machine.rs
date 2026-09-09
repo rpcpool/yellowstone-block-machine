@@ -565,7 +565,12 @@ impl BlocksStateMachine {
             long: &mut self.forks_history,
             short: &mut self.forks_detected_in_current_tick,
         };
-        self.forks.add_slot_with_parent_with_rooted_trace(
+        // `reparent_with_rooted_trace`, not `add_slot_with_parent_with_rooted_trace`: this is the
+        // one call site allowed to correct a slot's active parent claim, since a resolution can
+        // later be superseded by a different bank naming a different parent (see the struct doc
+        // comment and `set_resolved_bank`). Using the plain add would leave a stale forward edge
+        // under the old parent, wrongly forking the resolved slot if that old parent later dies.
+        self.forks.reparent_with_rooted_trace(
             slot,
             parent,
             &mut multiset,

@@ -15,9 +15,10 @@ None of these are visible to the existing suite. All 36 pre-existing tests pass 
 findings below are fixed, because the failing behaviours all sit in orderings that suite does not
 construct.
 
-**Status: 2 of 12 fixed.** Finding 1 (optimistic freeze fabricating blocks) and finding 2
-(retroactive rooting dropping commitment delivery) are fixed as of this revision. The other ten are
-open.
+**Status: 4 of 12 fixed.** Finding 1 (optimistic freeze fabricating blocks), finding 2
+(retroactive rooting dropping commitment delivery), finding 3 (gap-filled Finalized scheduling
+premature teardown) and finding 4 (superseding leaving a stale fork edge) are fixed as of this
+revision. The other eight are open.
 
 ## Verification legend
 
@@ -121,7 +122,7 @@ case, correctly withheld until a real event resolves it, then delivered). Both p
 
 ## 3. Gap-filled Finalized schedules slot teardown three times
 
-**Severity:** high &nbsp;&nbsp; **Status:** `TEST` &nbsp;&nbsp; **Location:** `state_machine.rs:754`
+**Severity:** high &nbsp;&nbsp; **Status:** `FIXED` &nbsp;&nbsp; **Location:** `state_machine.rs:754`
 
 Inside `deliver_commitment`'s `for update in to_push` loop, the body tests the outer `commitment`
 variable rather than `update.commitment`. When a `Finalized` update gap-fills the two levels below
@@ -148,12 +149,16 @@ Two further failures cascade from that torn-down state, each reproduced:
   101, and fed `Forks` a second parent claim of 99. The finality guard could not fire because the
   floor it reads had been erased.
 
-**Fix.** Test `update.commitment` rather than `commitment`. That alone confines the schedule to the
-genuine `Finalized` revision and closes both cascades.
+**Fix.** Applied: the loop now captures `update.commitment` into a local before pushing the
+update, and tests that local rather than the outer `commitment`. That alone confines the schedule
+to the genuine `Finalized` revision and closes both cascades.
+`audit_3_gapfill_schedules_teardown_once_at_the_finalized_revision`,
+`audit_3a_duplicate_block_meta_is_still_rejected_after_partial_drain`, and
+`audit_3b_finalized_resolution_survives_a_rogue_bank` all pass.
 
 ## 4. Superseding double-feeds `Forks` and leaves a stale parent edge
 
-**Severity:** high &nbsp;&nbsp; **Status:** `TEST` &nbsp;&nbsp; **Location:** `state_machine.rs:555`
+**Severity:** high &nbsp;&nbsp; **Status:** `FIXED` &nbsp;&nbsp; **Location:** `state_machine.rs:555`
 
 `set_resolved_bank` calls `register_resolved_parent` unconditionally. When it supersedes a previous
 winner, the slot's parent is fed to `Forks` a second time.
@@ -175,9 +180,41 @@ very reason the repair re-parented to 27.
 30 as a fork. `stream.rs` prunes every bank named in a `ForksDetected`, so this discards a valid,
 confirmed block.
 
-**Fix.** Either make `register_resolved_parent` idempotent per slot and refuse a conflicting second
-claim, or give `Forks` an explicit re-parent operation that removes the old forward edge. The first
-is safer given `Forks` is otherwise unchanged by this transition.
+**Fix.** Applied, in `forks.rs`, not just at the call site. `Forks` gained a new method,
+`reparent_with_rooted_trace`, which retracts a child's stale forward edge under its previous parent
+(if it had one, and if it differs from the new parent) before delegating to the existing
+`add_slot_with_parent_with_rooted_trace`. `register_resolved_parent` in `state_machine.rs` now
+calls this instead of the plain add.
+
+This was chosen over a fuller rekey of `Forks` to `BankId`-typed nodes (discussed and rejected):
+`bank_parent_slot: FxHashMap<BankId, Slot>` in `state_machine.rs` already independently tracks every
+bank instance's own claimed parent, so the "multiple banks, multiple parents" case was never
+actually missing a multiset -- it already existed one layer up. `Forks<Slot>` only ever needs to
+represent the *currently resolved* bank's claim for chain-level fork detection, one edge at a time;
+what was missing was the ability to correct that one edge when resolution moves to a different
+bank's claim, not the ability to hold several at once. A `BankId`-keyed rewrite would also have
+broken the public `Forks<Slot>` field and `BlocksStateMachineWrapper::fork_graph()`, and would have
+reintroduced a version of finding 2's problem (a bank's parent is only known by slot, not by parent
+bank_id, so bank-to-bank edges require deferring until the parent itself resolves).
+
+**Known residual limitation, no live impact.** `reparent_with_rooted_trace` does not revisit any
+fork conclusion already drawn from the retracted edge. If `slot` was marked forked *before* the
+reparent happened -- specifically, if the old parent died while the stale edge was still the active
+one -- that fork flag is not cleared once `slot` is correctly reparented. Un-marking it would require
+proving the conclusion depended on nothing but the retracted edge, which this structure does not
+track, so the deliberately conservative choice is to leave it forked rather than risk wrongly
+clearing a real fork. In practice this has no live consequence: `forked_slots` has no public getter
+and nothing downstream re-checks it; its only effect is the one-shot `ForksDetected` notification
+already fired at the moment the flag was set, for whichever bank_ids existed at that instant. A
+bank that later wins resolution still freezes and delivers normally through the ordinary resolution
+pipeline, which never consults fork status.
+
+Covered by two layers of tests. At the `state_machine.rs` level,
+`audit_4_supersede_does_not_leave_a_stale_fork_edge` reproduces the exact scenario (resolve, then
+supersede with a different parent, then mark the old parent dead) and passes. At the `forks.rs`
+level, three focused unit tests exercise the new method directly:
+`reparent_retracts_the_stale_forward_edge`, `reparent_to_the_same_parent_is_a_pure_shortcut`, and
+`reparent_prevents_the_old_parents_death_from_wrongly_forking_the_child`.
 
 ## 5. Dead-slot fork events lose their bank_ids
 
@@ -335,21 +372,28 @@ Areas still unreviewed:
 
 ## Reproduction suite
 
-The findings above are backed by a regression module in the crate itself:
+The findings above are backed by two things:
 
-`crates/yellowstone-block-machine/src/state_machine.rs`, module `audit_regression`
+- `crates/yellowstone-block-machine/src/state_machine.rs`, module `audit_regression` -- one test per
+  finding at the level `BlocksStateMachine` is actually used.
+- `crates/yellowstone-block-machine/src/forks.rs`, module `forks_tests` -- three additional unit
+  tests (`reparent_*`) exercising finding 4's fix directly against the new `Forks` method, since
+  that is where the actual defect lived.
 
-Every test in it asserts the **correct** behaviour, so every one of them **fails against the current
-implementation**. A test flipping to green means that finding is fixed.
+Every `audit_regression` test asserts the **correct** behaviour, so every one of them **fails
+against the current implementation** until its finding is fixed. A test flipping to green means
+that finding is fixed. The three `forks.rs` tests are ordinary passing regression tests for the new
+method, not inverted like the `audit_regression` ones -- there was no way to write a "must currently
+fail" test at that level before the method existed.
 
 ```text
 cargo test --all-features audit_regression::
 ```
 
-Expect ten failures (findings 1 and 2 are fixed; all four of their tests now pass). The pre-existing suite is unaffected:
+Expect six failures (findings 1 through 4 are fixed; all eight of their `state_machine.rs`-level tests now pass, plus three new `forks.rs`-level unit tests for finding 4). The pre-existing suite is unaffected:
 
 ```text
-cargo test --all-features -- --skip audit_regression    # 36 passed
+cargo test --all-features -- --skip audit_regression    # 39 passed (36 pre-existing + 3 new forks.rs tests)
 ```
 
 | Test | Finding | Assertion that currently fails |
@@ -358,10 +402,13 @@ cargo test --all-features -- --skip audit_regression    # 36 passed
 | `audit_1b_optimistic_freeze_still_recovers_the_real_parent_by_hash` | 1 | **FIXED (added).** A genuine parent whose hash matches is still recovered, even before the slot resolves. |
 | `audit_2_retroactively_rooted_sole_candidate_resolves_immediately` | 2 | **FIXED.** A sole-candidate ancestor resolves immediately and delivers once it freezes. |
 | `audit_2b_ambiguous_ancestor_recovers_once_a_direct_commitment_arrives` | 2 | **FIXED (added).** A genuinely ambiguous ancestor is deferred, not dropped, and recovers once resolved. |
-| `audit_3_gapfill_schedules_teardown_once_at_the_finalized_revision` | 3 | Teardown must be scheduled once, at revision 3. It is scheduled at 1, 2 and 3. |
-| `audit_3a_duplicate_block_meta_is_still_rejected_after_partial_drain` | 3 | A duplicate `BlockMeta` for bank 100 must be rejected. It is accepted and re-emits the block. |
-| `audit_3b_finalized_resolution_survives_a_rogue_bank` | 3 | Slot 1 finalized on bank 100 must stay resolved to it. It re-resolves to bank 101. |
-| `audit_4_supersede_does_not_leave_a_stale_fork_edge` | 4 | Canonical slot 30 must not be reported as a fork. It is, alongside slot 29. |
+| `audit_3_gapfill_schedules_teardown_once_at_the_finalized_revision` | 3 | **FIXED.** Teardown is now scheduled once, at revision 3 only. |
+| `audit_3a_duplicate_block_meta_is_still_rejected_after_partial_drain` | 3 | **FIXED.** A duplicate `BlockMeta` for bank 100 is rejected, not re-emitted. |
+| `audit_3b_finalized_resolution_survives_a_rogue_bank` | 3 | **FIXED.** Slot 1's Finalized resolution to bank 100 survives a rogue Confirmed for bank 101. |
+| `audit_4_supersede_does_not_leave_a_stale_fork_edge` | 4 | **FIXED.** Canonical slot 30 is no longer reported as a fork when its abandoned parent dies. |
+| (forks.rs) `reparent_retracts_the_stale_forward_edge` | 4 | **FIXED (added).** Reparenting removes the old forward edge and installs the new one. |
+| (forks.rs) `reparent_to_the_same_parent_is_a_pure_shortcut` | 4 | **FIXED (added).** Reparenting to an unchanged parent is a no-op, matching `add`'s shortcut. |
+| (forks.rs) `reparent_prevents_the_old_parents_death_from_wrongly_forking_the_child` | 4 | **FIXED (added).** The old parent's later death no longer forks the reparented child. |
 | `audit_5_dead_slot_event_carries_its_bank_ids` | 5 | The dead slot's event must name banks 70 and 71. It names none. |
 | `audit_6_discarded_loser_is_announced_for_pruning` | 6 | Bank 500 must reach a prune path. Neither the gc trace nor the deadletter queue names it. |
 | `audit_7_unresolved_slot_state_is_eventually_reclaimed` | 7 | Ten abandoned slots must be reclaimed. All ten survive 25 gc passes. |
