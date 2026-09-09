@@ -15,10 +15,10 @@ None of these are visible to the existing suite. All 36 pre-existing tests pass 
 findings below are fixed, because the failing behaviours all sit in orderings that suite does not
 construct.
 
-**Status: 4 of 12 fixed.** Finding 1 (optimistic freeze fabricating blocks), finding 2
+**Status: 5 of 12 fixed.** Finding 1 (optimistic freeze fabricating blocks), finding 2
 (retroactive rooting dropping commitment delivery), finding 3 (gap-filled Finalized scheduling
-premature teardown) and finding 4 (superseding leaving a stale fork edge) are fixed as of this
-revision. The other eight are open.
+premature teardown), finding 4 (superseding leaving a stale fork edge), and finding 6 (discarded
+losers reaching no prune path) are fixed as of this revision. The other seven are open.
 
 ## Verification legend
 
@@ -236,7 +236,7 @@ after the teardown.
 
 ## 6. Discarded loser banks reach no prune path
 
-**Severity:** high &nbsp;&nbsp; **Status:** `TEST` &nbsp;&nbsp; **Location:** `state_machine.rs:581`
+**Severity:** high &nbsp;&nbsp; **Status:** `FIXED` &nbsp;&nbsp; **Location:** `state_machine.rs:581`
 
 `discard_losing_banks` retains only the winner in `slot_to_banks`. That map is the sole source `gc`
 builds its `deleted` bank id trace from. No deadletter event is pushed and no `ForksDetected` names
@@ -248,8 +248,16 @@ accounts, transactions and entries are held for the life of the process.
 **Observed.** After the loser was discarded, five `gc` passes produced an empty trace and the
 deadletter queue stayed empty.
 
-**Fix.** Emit the discarded bank ids on a channel the stream layer already drains. The existing
-`DeadletterEvent` path is the natural fit, since `stream.rs` already prunes on it.
+**Fix.** Applied: `DeadletterEvent` gained a new `Discarded(BankId)` variant, distinct from the
+existing `Incomplete(BankId)` (a bank this crate gave up trying to freeze -- no entries, no known
+parent -- which is a different situation from a fully valid bank that simply lost a resolution
+race). `discard_losing_banks` now pushes `DeadletterEvent::Discarded(loser)` for every bank it
+discards, using the same DLQ channel `execute_optimistic_freeze_for_needed_banks` already used for
+`Incomplete`. `stream.rs`'s `on_new_frozen_block` -- which already drained the DLQ and called
+`prune_block` for `Incomplete` -- now does the same for `Discarded` too, via one added match arm.
+
+No other consumer needed updating: `wrapper.rs::pop_next_dlq` forwards the enum opaquely without
+matching on it. `audit_6_discarded_loser_is_announced_for_pruning` passes.
 
 ## 7. Unresolved slots are invisible to garbage collection
 
@@ -390,7 +398,7 @@ fail" test at that level before the method existed.
 cargo test --all-features audit_regression::
 ```
 
-Expect six failures (findings 1 through 4 are fixed; all eight of their `state_machine.rs`-level tests now pass, plus three new `forks.rs`-level unit tests for finding 4). The pre-existing suite is unaffected:
+Expect five failures (findings 1 through 4 and 6 are fixed; all nine of their `state_machine.rs`-level tests now pass, plus three new `forks.rs`-level unit tests for finding 4). The pre-existing suite is unaffected:
 
 ```text
 cargo test --all-features -- --skip audit_regression    # 39 passed (36 pre-existing + 3 new forks.rs tests)
@@ -410,7 +418,7 @@ cargo test --all-features -- --skip audit_regression    # 39 passed (36 pre-exis
 | (forks.rs) `reparent_to_the_same_parent_is_a_pure_shortcut` | 4 | **FIXED (added).** Reparenting to an unchanged parent is a no-op, matching `add`'s shortcut. |
 | (forks.rs) `reparent_prevents_the_old_parents_death_from_wrongly_forking_the_child` | 4 | **FIXED (added).** The old parent's later death no longer forks the reparented child. |
 | `audit_5_dead_slot_event_carries_its_bank_ids` | 5 | The dead slot's event must name banks 70 and 71. It names none. |
-| `audit_6_discarded_loser_is_announced_for_pruning` | 6 | Bank 500 must reach a prune path. Neither the gc trace nor the deadletter queue names it. |
+| `audit_6_discarded_loser_is_announced_for_pruning` | 6 | **FIXED.** Bank 500 now reaches the deadletter queue via a new `DeadletterEvent::Discarded` variant. |
 | `audit_7_unresolved_slot_state_is_eventually_reclaimed` | 7 | Ten abandoned slots must be reclaimed. All ten survive 25 gc passes. |
 | `audit_8_events_for_discarded_banks_are_rejected` | 8 | Stragglers for discarded bank 70 must return `Err`. Both return `Ok`. |
 | `audit_9_dead_slot_emits_a_dead_slot_output` | 9 | A `Dead` update must produce `DeadSlotDetected`. It produces `ForksDetected`. |

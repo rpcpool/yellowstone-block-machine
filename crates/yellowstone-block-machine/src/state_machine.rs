@@ -211,7 +211,20 @@ type Revision = usize;
 
 #[derive(Debug)]
 pub enum DeadletterEvent {
+    ///
+    /// A bank instance the state machine gave up trying to freeze -- optimistic freeze found no
+    /// entries, or no known parent, to forge a summary from. Never resolved, never had valid
+    /// content. See [`BlocksStateMachine::execute_optimistic_freeze_for_needed_banks`].
+    ///
     Incomplete(BankId),
+    ///
+    /// A bank instance that was fully valid -- it may have already frozen and delivered a real
+    /// block -- but lost the slot's resolution to a sibling once `Confirmed`/`Finalized` named a
+    /// different bank as canonical. Its buffered payload (if any is still held downstream) is now
+    /// permanently unreachable through this bank_id and must be pruned.
+    /// See [`BlocksStateMachine::discard_losing_banks`].
+    ///
+    Discarded(BankId),
 }
 
 ///
@@ -578,6 +591,15 @@ impl BlocksStateMachine {
         );
     }
 
+    ///
+    /// Discards every bank_id registered for `slot` other than `winner`. Each loser's buffered
+    /// content (if any) is dropped from this state machine's own bookkeeping via
+    /// [`Self::remove_bank_references`], but a downstream payload accumulator (keyed by bank_id,
+    /// not `Slot`) has no way to learn that on its own -- it is never told a loser existed unless
+    /// this pushes a [`DeadletterEvent::Discarded`] for it, the same channel
+    /// [`Self::execute_optimistic_freeze_for_needed_banks`] already uses to report a bank this
+    /// crate gave up on.
+    ///
     fn discard_losing_banks(&mut self, slot: Slot, winner: BankId) {
         let Some(ids) = self.slot_to_banks.get_mut(&slot) else {
             return;
@@ -587,6 +609,7 @@ impl BlocksStateMachine {
         for loser in losers {
             self.remove_bank_references(loser);
             self.discarded_bank_ids.insert(loser, slot);
+            self.push_to_dlq(DeadletterEvent::Discarded(loser));
         }
     }
 
@@ -2193,7 +2216,9 @@ mod audit_regression {
             sm.gc(Some(&mut gc_trace));
         }
         let mut dlq = Vec::new();
-        while let Some(DeadletterEvent::Incomplete(bank_id)) = sm.pop_next_dlq() {
+        while let Some(event) = sm.pop_next_dlq() {
+            let (DeadletterEvent::Incomplete(bank_id) | DeadletterEvent::Discarded(bank_id)) =
+                event;
             dlq.push(bank_id);
         }
 
