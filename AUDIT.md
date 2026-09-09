@@ -15,8 +15,9 @@ None of these are visible to the existing suite. All 36 pre-existing tests pass 
 findings below are fixed, because the failing behaviours all sit in orderings that suite does not
 construct.
 
-**Status: 1 of 12 fixed.** Finding 1 (optimistic freeze fabricating blocks) is fixed as of this
-revision; `audit_1_no_fabricated_block_for_parent_slot_sibling` passes. The other eleven are open.
+**Status: 2 of 12 fixed.** Finding 1 (optimistic freeze fabricating blocks) and finding 2
+(retroactive rooting dropping commitment delivery) are fixed as of this revision. The other ten are
+open.
 
 ## Verification legend
 
@@ -69,7 +70,7 @@ recovery case, including pre-resolution, also passes).
 
 ## 2. Retroactive rooting drops a slot's entire commitment delivery
 
-**Severity:** critical &nbsp;&nbsp; **Status:** `TEST` &nbsp;&nbsp; **Location:** `state_machine.rs:829`
+**Severity:** critical &nbsp;&nbsp; **Status:** `FIXED` &nbsp;&nbsp; **Location:** `state_machine.rs:829`
 
 `process_retroactively_rooted_slots` iterates a set it has already consumed with `std::mem::take`,
 and `continue`s past any slot with no entry in `resolved_bank_per_slot`. That slot is then lost
@@ -85,8 +86,38 @@ reaches `Finalized`.
 **Observed.** `Forks` reported slot 1 as rooted. Exactly zero status updates were delivered for
 slot 1. Only slot 2's own three levels came out.
 
-**Fix.** Re-insert the unresolved slot into `retroactively_rooted_slots` instead of dropping it, so
-a later resolution can still deliver it. Alternatively resolve the slot before rooting it.
+**Fix.** Applied, in two parts, since "no resolved bank" actually covers two different situations:
+
+- **The slot only ever had one known bank.** It simply hasn't gone through freeze or a `Processed`
+  update yet, so `try_infer_sole_candidate_winner` was never triggered for it. This is safe to
+  resolve immediately: a retroactively rooted slot is, by construction, already known to be part
+  of a finalized chain, so a sole candidate for it cannot be anything but the canonical bank -- no
+  risk of the premature guess the crate's own design otherwise avoids (a genuine second competitor
+  could still be in flight in the general case; here there is external proof there isn't one).
+  `process_retroactively_rooted_slots` now calls `try_infer_sole_candidate_winner(slot)` before
+  checking `resolved_bank_per_slot`.
+- **The slot genuinely has two or more competing banks**, none of which any direct commitment
+  update has named as canonical. Nothing here can safely choose between them, and the fix does not
+  try to. Instead of dropping the notification (`continue` with no trace), the slot is re-queued
+  into `retroactively_rooted_slots` so this retries on every subsequent tick. The moment a real
+  commitment update *does* resolve it -- Solana guarantees exactly one bank per slot ever reaches
+  Confirmed/Finalized -- the deferred delivery fires instead of having been lost. The retry log was
+  dropped to `debug` rather than `warn`, since a persistently ambiguous slot would otherwise log on
+  every single replay/consensus event until it resolves.
+
+Note the residual limitation: a slot that is retroactively rooted while genuinely ambiguous, and
+that *never* receives a further direct commitment update for either candidate, stays deferred
+forever -- a small, bounded memory cost (one `Slot` in a set, rechecked each tick) rather than the
+previous silent, untraceable, permanent data loss. Resolving that residual case for good would
+require identifying the true parent by content (matching a candidate's own blockhash against the
+finalized descendant's `parent_blockhash` chain, the same technique finding 1's fix uses), which
+needs retaining frozen blockhashes per bank_id past their `Block` buffer's lifetime -- a larger
+structural change left for a follow-up if this residual case turns out to matter in practice.
+
+Covered by two tests: `audit_2_retroactively_rooted_sole_candidate_resolves_immediately` (the
+common case, immediate resolution, delivery still correctly gated on the bank's own freeze) and
+`audit_2b_ambiguous_ancestor_recovers_once_a_direct_commitment_arrives` (the genuinely ambiguous
+case, correctly withheld until a real event resolves it, then delivered). Both pass.
 
 ## 3. Gap-filled Finalized schedules slot teardown three times
 
@@ -315,7 +346,7 @@ implementation**. A test flipping to green means that finding is fixed.
 cargo test --all-features audit_regression::
 ```
 
-Expect eleven failures (finding 1 is fixed; both its tests now pass). The pre-existing suite is unaffected:
+Expect ten failures (findings 1 and 2 are fixed; all four of their tests now pass). The pre-existing suite is unaffected:
 
 ```text
 cargo test --all-features -- --skip audit_regression    # 36 passed
@@ -325,7 +356,8 @@ cargo test --all-features -- --skip audit_regression    # 36 passed
 |---|---|---|
 | `audit_1_no_fabricated_block_for_parent_slot_sibling` | 1 | **FIXED.** Bank 1001 never got a `BlockMeta`, its hash doesn't match the child's `parent_blockhash`, and it is no longer frozen. |
 | `audit_1b_optimistic_freeze_still_recovers_the_real_parent_by_hash` | 1 | **FIXED (added).** A genuine parent whose hash matches is still recovered, even before the slot resolves. |
-| `audit_2_retroactively_rooted_slot_still_gets_its_commitment` | 2 | Slot 1 is rooted, so it must receive `Finalized`. It receives nothing. |
+| `audit_2_retroactively_rooted_sole_candidate_resolves_immediately` | 2 | **FIXED.** A sole-candidate ancestor resolves immediately and delivers once it freezes. |
+| `audit_2b_ambiguous_ancestor_recovers_once_a_direct_commitment_arrives` | 2 | **FIXED (added).** A genuinely ambiguous ancestor is deferred, not dropped, and recovers once resolved. |
 | `audit_3_gapfill_schedules_teardown_once_at_the_finalized_revision` | 3 | Teardown must be scheduled once, at revision 3. It is scheduled at 1, 2 and 3. |
 | `audit_3a_duplicate_block_meta_is_still_rejected_after_partial_drain` | 3 | A duplicate `BlockMeta` for bank 100 must be rejected. It is accepted and re-emits the block. |
 | `audit_3b_finalized_resolution_survives_a_rogue_bank` | 3 | Slot 1 finalized on bank 100 must stay resolved to it. It re-resolves to bank 101. |

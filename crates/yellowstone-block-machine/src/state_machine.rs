@@ -747,11 +747,12 @@ impl BlocksStateMachine {
         // level may arrive before lower level commitment. By iterating from lower to higher
         // level commitment, we can ensure that we don't miss any slot status update.
         for update in to_push {
+            let update_commitment = update.commitment;
             let revision = self.push_new_update(BlockStateMachineOutput::SlotStatus(update));
             tracing::debug!(
                 "Slot status update for slot {slot} (bank {bank_id}) at revision {revision}"
             );
-            if commitment == CommitmentLevel::Finalized {
+            if update_commitment == CommitmentLevel::Finalized {
                 let mut multiset = LongShortForksMutationTracer {
                     long: &mut self.forks_history,
                     short: &mut self.forks_detected_in_current_tick,
@@ -826,10 +827,26 @@ impl BlocksStateMachine {
         }
         let retroactively_rooted_slots = std::mem::take(&mut self.retroactively_rooted_slots);
         for slot in retroactively_rooted_slots {
+            // A slot that only ever had one known bank_id can be safely resolved right here, even
+            // though resolution normally never happens this early (see the struct doc comment).
+            // That restriction exists to avoid a *premature* guess while a genuine second
+            // competing bank might still be in flight -- but a retroactively rooted slot is, by
+            // construction, already known to be part of a finalized chain, so a sole candidate
+            // for it cannot be anything but the canonical bank.
+            self.try_infer_sole_candidate_winner(slot);
+
             let Some(&bank_id) = self.resolved_bank_per_slot.get(&slot) else {
-                tracing::warn!(
-                    "slot {slot} retroactively rooted but has no resolved bank_id yet -- cannot propagate Finalized for it"
+                // Two or more genuinely competing banks are still unresolved for this slot, and
+                // nothing here can safely choose between them -- only a direct Confirmed/Finalized
+                // commitment update ever gets to say which one is canonical (see the struct doc
+                // comment). Defer instead of dropping: re-queue the slot so this retries on every
+                // subsequent tick, and the moment a real commitment update *does* resolve it
+                // (Solana guarantees exactly one bank per slot ever reaches Confirmed/Finalized),
+                // the deferred Finalized delivery below fires instead of having been lost.
+                tracing::debug!(
+                    "slot {slot} retroactively rooted but still has more than one unresolved bank_id -- deferring Finalized delivery until a direct commitment update resolves it"
                 );
+                self.retroactively_rooted_slots.insert(slot);
                 continue;
             };
             tracing::trace!("Retroactively rooting slot {slot} (bank {bank_id})");
@@ -1871,15 +1888,67 @@ mod audit_regression {
     }
 
     ///
-    /// AUDIT.md finding 2: retroactive rooting drops a slot's entire commitment delivery.
-    ///
-    /// A slot with two competing banks stays unresolved by design. Rooting it through a finalized
-    /// child must still deliver its commitment levels rather than discard the slot.
+    /// AUDIT.md finding 2, common case: retroactive rooting of a slot with exactly one bank must
+    /// resolve it immediately, even if that bank hasn't frozen yet. There is no competitor to
+    /// guess wrong against, and the finalized descendant already proves this slot is canonical.
     ///
     #[test]
-    fn audit_2_retroactively_rooted_slot_still_gets_its_commitment() {
+    fn audit_2_retroactively_rooted_sole_candidate_resolves_immediately() {
         let mut sm = BlocksStateMachine::default();
-        // Both banks registered before either freezes, so slot 1 never resolves.
+        // Slot 1 has exactly one bank, still buffering -- no BlockMeta, no commitment update,
+        // so nothing has ever called `try_infer_sole_candidate_winner` for it yet.
+        buffer(&mut sm, 1, Some(0), 100, 2);
+        assert!(
+            !sm.resolved_bank_per_slot.contains_key(&1),
+            "precondition: slot 1 has not been resolved by anything yet"
+        );
+
+        // The child finalizes, which retroactively roots slot 1.
+        seal(&mut sm, 2, Some(1), 200);
+        sm.process_consensus_event(cmt(2, Some(1), CommitmentLevel::Finalized, 200).into());
+        drain(&mut sm);
+
+        assert_eq!(
+            sm.resolved_bank_per_slot.get(&1),
+            Some(&100),
+            "the sole candidate must be resolved immediately, with no competitor to guess wrong against"
+        );
+
+        // Bank 100 has still never frozen, so per this crate's own ordering guarantee the
+        // resolved Finalized update is correctly queued pending its freeze, not lost -- it must
+        // flush out, gap-filled, the moment bank 100 finally receives its BlockMeta.
+        sm.process_replay_event(
+            BlockSummary {
+                slot: 1,
+                bank_id: 100,
+                parent_slot: 0,
+                entry_count: 2,
+                executed_transaction_count: 20,
+                blockhash: Hash::new_unique(),
+                parent_blockhash: Hash::new_unique(),
+                block_time: 1,
+            }
+            .into(),
+        )
+        .unwrap();
+        let seen = statuses(&drain(&mut sm));
+        assert!(
+            seen.contains(&(1, CommitmentLevel::Finalized)),
+            "slot 1 was resolved via the sole candidate and must deliver its gap-filled Finalized once bank 100 freezes, got {seen:?}"
+        );
+    }
+
+    ///
+    /// AUDIT.md finding 2, genuinely ambiguous case: a slot with two real competing banks, both
+    /// still only Processed, cannot be safely resolved by anything in this crate -- there is no
+    /// signal here to pick between them. The fix is not to guess, but to stop *permanently
+    /// dropping* the notification: once a real commitment update later resolves the ambiguity
+    /// (which Solana's consensus guarantees eventually happens for the genuine winner), the
+    /// deferred Finalized delivery must still fire rather than having been lost.
+    ///
+    #[test]
+    fn audit_2b_ambiguous_ancestor_recovers_once_a_direct_commitment_arrives() {
+        let mut sm = BlocksStateMachine::default();
         sm.process_replay_event(created_bank(1, Some(0), 100).into())
             .unwrap();
         sm.process_replay_event(created_bank(1, Some(0), 101).into())
@@ -1890,23 +1959,27 @@ mod audit_regression {
         sm.process_consensus_event(cmt(1, Some(0), CommitmentLevel::Processed, 101).into());
         assert!(
             !sm.resolved_bank_per_slot.contains_key(&1),
-            "precondition: slot 1 is unresolved"
+            "precondition: slot 1 is genuinely ambiguous between two real competitors"
         );
         drain(&mut sm);
 
-        // The child finalizes, which retroactively roots slot 1.
+        // The child finalizes, retroactively rooting slot 1 while it is still ambiguous.
         seal(&mut sm, 2, Some(1), 200);
         sm.process_consensus_event(cmt(2, Some(1), CommitmentLevel::Finalized, 200).into());
-        let outputs = drain(&mut sm);
-
-        let seen = statuses(&outputs);
+        let seen_before = statuses(&drain(&mut sm));
         assert!(
-            sm.forks.is_rooted_slot(&1),
-            "precondition: Forks rooted slot 1"
+            !seen_before.iter().any(|(s, _)| *s == 1),
+            "correctly not delivered yet: nothing here may guess between bank 100 and 101"
         );
+
+        // A real, direct Confirmed update for bank 100 arrives afterwards, resolving it for real.
+        sm.process_consensus_event(cmt(1, Some(0), CommitmentLevel::Confirmed, 100).into());
+        let seen_after = statuses(&drain(&mut sm));
+
+        assert_eq!(sm.resolved_bank_per_slot.get(&1), Some(&100));
         assert!(
-            seen.contains(&(1, CommitmentLevel::Finalized)),
-            "slot 1 was rooted so it must receive Finalized, got {seen:?}"
+            seen_after.contains(&(1, CommitmentLevel::Finalized)),
+            "the deferred retroactive Finalized must fire once the ambiguity resolves for real, got {seen_after:?}"
         );
     }
 
