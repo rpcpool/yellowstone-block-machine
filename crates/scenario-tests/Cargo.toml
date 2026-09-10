@@ -1,0 +1,22 @@
+[package]
+name = "scenario-tests"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+description = "End-to-end scenario tests for yellowstone-block-machine, built on its simulation test-tools"
+
+[dev-dependencies]
+futures-util = { workspace = true }
+solana-clock = { workspace = true }
+solana-commitment-config = { workspace = true }
+solana-hash = { workspace = true }
+tokio = { workspace = true, features = ["rt", "macros"] }
+yellowstone-block-machine = { workspace = true, features = ["dragonsmouth-thin", "test-tools"] }
+
+[lints]
+workspace = true

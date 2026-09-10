@@ -7,22 +7,25 @@ Primary target: `crates/yellowstone-block-machine/src/state_machine.rs`.
 
 ## Summary
 
-Thirteen defects are confirmed, each backed by a test (see the reproduction suite section). Six
+Fourteen defects are confirmed, each backed by a test (see the reproduction suite section). Six
 further defects were reported by the audit but have not been verified and are listed separately.
 
 None of these are visible to the existing suite. All 36 pre-existing tests pass regardless of which
 findings below are fixed, because the failing behaviours all sit in orderings that suite does not
 construct.
 
-**Status: 11 of 13 fixed.** All findings except 10 and 12 are fixed as of this revision: finding 1
+**Status: 12 of 14 fixed.** All findings except 10 and 12 are fixed as of this revision: finding 1
 (optimistic freeze fabricating blocks), finding 2 (retroactive rooting dropping commitment
 delivery), finding 3 (gap-filled Finalized scheduling premature teardown), finding 4 (superseding
 leaving a stale fork edge), finding 5 (dead-slot fork events losing their bank_ids), finding 6
 (discarded losers reaching no prune path), finding 7 (unresolved/never-finalized slots invisible to
 garbage collection), finding 8 (events for discarded banks returning `Ok`, including a third call
 site found while fixing it), finding 9 (`DeadSlotDetected` never constructed), finding 11
-(`FrozenBlock::entries` in hash-map order), and finding 19 (every `Account` update misclassified as
-a sysvar, found after this audit's own Coverage section flagged `proto_adapter.rs` as unreviewed).
+(`FrozenBlock::entries` in hash-map order), finding 19 (every `Account` update misclassified as
+a sysvar, found after this audit's own Coverage section flagged `proto_adapter.rs` as unreviewed),
+and finding 20 (retroactive rooting able to promote a stale, never-confirmed sole-candidate guess
+straight to `Finalized`, found while building deep-reorg scenarios in the separate `scenario-tests`
+crate).
 
 Findings 10 and 12 were never assigned a `TEST`/`READ` status meant to be flipped to `FIXED` -- they
 are dead-code observations (an unused queue, a handful of unused declarations) rather than logic
@@ -471,6 +474,45 @@ account is still delivered via the ordinary `BankData`/`account_idx_map` path.
 
 ---
 
+## 20. Retroactive rooting can promote a stale, never-confirmed sole-candidate guess to `Finalized`
+
+**Severity:** high &nbsp;&nbsp; **Status:** `FIXED` &nbsp;&nbsp; **Location:** `state_machine.rs:939`
+(`process_retroactively_rooted_slots`)
+
+`try_infer_sole_candidate_winner` resolves a slot the moment it looks like it has exactly one
+known bank_id -- called both from `handle_block_summary` (a bank's own `BlockMeta`/freeze) and
+from `process_retroactively_rooted_slots` itself. That's deliberately provisional: a genuine second
+competing bank can still be in flight and simply hasn't had its own `CreatedBank` observed yet
+(the struct doc comment explains exactly this risk for why resolution never happens at `CreatedBank`
+time). `handle_slot_commitment_status_update`'s Processed branch and
+`two_banks_for_same_slot_stay_peers_until_one_is_confirmed` both already document that such a guess
+is meant to be superseded once a real Confirmed/Finalized update disagrees with it.
+
+`process_retroactively_rooted_slots`, however, treated any name already sitting in
+`resolved_bank_per_slot` as ground truth once a descendant reached `Finalized`, without checking
+whether that name was ever actually confirmed or whether the slot was still genuinely unambiguous.
+Found via a scenario built with `scenario-tests`: a 5-bank tree (A -> B -> C, A -> D -> E, C and D
+both claiming slot 12 with different parents) where only the tip E ever received a direct
+commitment update. Because `SimulationBuilder::bank` replays one candidate's entire lifecycle
+before the next begins, C's `BlockMeta` froze it (and inferred it as slot 12's sole candidate)
+before D's own `CreatedBank` was ever observed. When E later reached `Finalized`, the retroactive
+rooting walk trusted that stale guess and promoted **C** -- not D, E's real parent -- all the way
+to `Finalized`, while D was silently left with no resolution at all. A client relying on this
+crate's block reconstruction would have been told the wrong block was canonical for slot 12, with
+no signal that anything was amiss.
+
+**Fix.** Applied: before trusting `resolved_bank_per_slot` in `process_retroactively_rooted_slots`,
+the fix re-checks whether the slot was ever backed by a direct Confirmed/Finalized update (tracked
+via `slot_min_commitment`) or is still genuinely unambiguous (`slot_to_banks[slot].len() <= 1`). If
+neither holds -- a second candidate has since appeared and nothing ever resolved the tie directly
+-- the existing name is treated as no resolution at all, and the slot is correctly deferred instead
+of promoted. New test `ambiguous_intermediate_ancestor_blocks_retroactive_rooting_of_its_slot` in
+`scenario-tests` reproduces the exact tree above and asserts neither C nor D ever reaches any
+commitment level, while A, B and E (none of which are part of the genuine ambiguity) still resolve
+correctly.
+
+---
+
 ## Reported but not verified
 
 These came out of the audit with a plausible mechanism but were not reproduced. They are recorded so
@@ -504,6 +546,12 @@ Areas still unreviewed:
   dropped or half-migrated by the rekeying.
 - `generate_entries` in the existing test module, which appears to emit colliding `entry_index`
   values and may make several existing tests weaker than they read.
+- Multi-generation retroactive rooting (a `Finalized` tip several slots below its nearest directly
+  resolved ancestor) had no end-to-end coverage until finding 20 was found this way, via
+  `crates/scenario-tests` -- a separate crate exercising the crate's own `dragonsmouth::simulation`
+  test-tools to build full wire-level fork trees rather than calling the state machine's internal
+  methods directly. Worth treating as a standing tool for future deep-reorg scenarios, not a
+  one-off.
 
 ## Reproduction suite
 
@@ -526,6 +574,11 @@ The findings above are backed by two things:
 - `crates/yellowstone-block-machine/src/dragonsmouth/block_accumulator.rs`, `mod tests` -- one
   additional test, `non_sysvar_account_does_not_count_toward_the_must_have_mask`, for finding 19.
   Also an ordinary passing test for the same reason as the `forks.rs` ones above.
+- `crates/scenario-tests/tests/scenarios.rs` -- a separate workspace crate driving the full
+  `BlockStream` pipeline through `dragonsmouth::simulation`, rather than calling state-machine
+  internals directly. `ambiguous_intermediate_ancestor_blocks_retroactive_rooting_of_its_slot`
+  covers finding 20; it asserted the *correct* behaviour from the start and failed against the
+  unfixed code, same inverted-test pattern as the `audit_*` tests above.
 
 ```text
 cargo test --all-features audit_          # the 15 audit_* tests, by name prefix
@@ -565,6 +618,7 @@ cargo test --all-features    # 55 passed in the lib target (state_machine.rs's m
 | `audit_9_dead_slot_emits_a_dead_slot_output` | 9 | **FIXED.** A Dead lifecycle update now produces `DeadSlotDetected`, not `ForksDetected`. |
 | `audit_11_frozen_block_entries_are_ordered_by_entry_index` | 11 | **FIXED.** Entries now come out sorted by `entry_index`. |
 | (block_accumulator.rs) `non_sysvar_account_does_not_count_toward_the_must_have_mask` | 19 | **FIXED.** A non-sysvar account is classified `BankData`, not `SysvarAccount`, and is still delivered normally. Not named `audit_*` -- it lives in `block_accumulator.rs`'s own test module, not `state_machine.rs`'s, so it isn't selected by the `audit_` prefix filter above. |
+| (scenario-tests) `ambiguous_intermediate_ancestor_blocks_retroactive_rooting_of_its_slot` | 20 | **FIXED.** In a 5-bank tree where only the tip is ever directly committed, neither of two genuinely competing intermediate banks is ever promoted to `Finalized`; the ancestors that aren't part of the ambiguity still resolve. Lives in the separate `scenario-tests` crate, not the lib target, so it isn't run by either command above -- use `cargo test -p scenario-tests`. |
 
 Findings 10 and 12 are absence-of-code observations with nothing to assert at runtime. Confirm
 they are still just dead code, not fixed into something new, with:

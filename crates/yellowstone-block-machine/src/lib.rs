@@ -92,9 +92,16 @@
 //!   Not required if you implement [`event::GeyserEventAdapter`] yourself.
 //! - `dragonsmouth`: Enables `client_ext` helpers on top of `dragonsmouth-thin`, including
 //!   `GeyserGrpcExt::subscribe_block`, and re-exports `yellowstone_grpc_client`.
+//! - `test-tools`: Enables [`dragonsmouth::simulation`], a mock `SubscribeUpdate` stream for
+//!   testing consumers of this crate against pre-programmed slot/bank scenarios without a live
+//!   validator or gRPC connection. Implies `dragonsmouth-thin`.
 //!
 //! If you are integrating with Yellowstone gRPC directly, `dragonsmouth` is the easiest starting point.
-#[cfg(any(feature = "dragonsmouth", feature = "dragonsmouth-thin"))]
+#[cfg(any(
+    feature = "dragonsmouth",
+    feature = "dragonsmouth-thin",
+    feature = "test-tools"
+))]
 pub mod dragonsmouth;
 pub mod event;
 pub mod forks;

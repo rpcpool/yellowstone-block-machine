@@ -936,7 +936,28 @@ impl BlocksStateMachine {
             // for it cannot be anything but the canonical bank.
             self.try_infer_sole_candidate_winner(slot);
 
-            let Some(&bank_id) = self.resolved_bank_per_slot.get(&slot) else {
+            // `resolved_bank_per_slot` can already name a bank here purely from
+            // `try_infer_sole_candidate_winner` having been called earlier (at `CreatedBank`/
+            // `BlockMeta` time) while this slot *looked* unambiguous -- that guess is only ever
+            // provisional (see `handle_slot_commitment_status_update`'s Processed branch and the
+            // "tentative... not a real discard" case it documents) unless a direct Confirmed/
+            // Finalized update backed it, which always sets `slot_min_commitment`. If a genuine
+            // second candidate has since shown up for this slot and nothing ever directly
+            // resolved the tie, that guess must not be promoted straight to `Finalized` here --
+            // it's exactly as unresolved as a slot that never got an inference at all.
+            let directly_confirmed = matches!(
+                self.slot_min_commitment.get(&slot),
+                Some(CommitmentLevel::Confirmed) | Some(CommitmentLevel::Finalized)
+            );
+            let unambiguous = self
+                .slot_to_banks
+                .get(&slot)
+                .is_none_or(|ids| ids.len() <= 1);
+            let trustworthy_resolution = (directly_confirmed || unambiguous)
+                .then(|| self.resolved_bank_per_slot.get(&slot).copied())
+                .flatten();
+
+            let Some(bank_id) = trustworthy_resolution else {
                 // Two or more genuinely competing banks are still unresolved for this slot, and
                 // nothing here can safely choose between them -- only a direct Confirmed/Finalized
                 // commitment update ever gets to say which one is canonical (see the struct doc
