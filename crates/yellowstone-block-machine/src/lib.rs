@@ -42,7 +42,8 @@
 //! - `BlockStreamEvent::FrozenBlock`,
 //! - `BlockStreamEvent::SlotCommitmentUpdate`,
 //! - `BlockStreamEvent::ForkDetected`,
-//! - `BlockStreamEvent::DeadBlockDetected`.
+//! - `BlockStreamEvent::DeadBlockDetected`,
+//! - `BlockStreamEvent::BankDiscarded`.
 //!
 //! High-level example:
 //!
@@ -79,6 +80,9 @@
 //!             }
 //!             BlockStreamEvent::DeadBlockDetected(dead) => {
 //!                 let _ = dead.slot;
+//!             }
+//!             BlockStreamEvent::BankDiscarded(discarded) => {
+//!                 let _ = (discarded.slot, discarded.bank_id);
 //!             }
 //!         }
 //!     }

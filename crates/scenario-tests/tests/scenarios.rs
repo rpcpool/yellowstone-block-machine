@@ -58,6 +58,19 @@ const fn frozen_bank_id(
     }
 }
 
+///
+/// The bank_id a `BankDiscarded` output named as having lost its slot to a sibling -- block-level,
+/// unlike `ForkDetected`, which is about a slot diverging from the canonical chain.
+///
+const fn discarded_bank_id(
+    output: &BlockMachineOutput<impl yellowstone_block_machine::stream::BlockEventStore>,
+) -> Option<BankId> {
+    match output {
+        BlockMachineOutput::BankDiscarded(discarded) => Some(discarded.bank_id),
+        _ => None,
+    }
+}
+
 #[tokio::test]
 async fn entry_counts_one_through_seven_all_freeze_correctly() {
     for entry_count in 1..=7u64 {
@@ -332,6 +345,7 @@ async fn competing_banks_for_the_same_slot_can_have_different_parents() {
     let outputs = collect(block_stream).await;
     let mut commitments: HashMap<BankId, Vec<CommitmentLevel>> = HashMap::new();
     let mut frozen_bank_ids: std::collections::HashSet<BankId> = std::collections::HashSet::new();
+    let mut discarded_bank_ids: Vec<BankId> = Vec::new();
     for output in &outputs {
         if let BlockMachineOutput::SlotCommitmentUpdate(update) = output {
             commitments
@@ -341,6 +355,9 @@ async fn competing_banks_for_the_same_slot_can_have_different_parents() {
         }
         if let Some(bank_id) = frozen_bank_id(output) {
             frozen_bank_ids.insert(bank_id);
+        }
+        if let Some(bank_id) = discarded_bank_id(output) {
+            discarded_bank_ids.push(bank_id);
         }
     }
 
@@ -379,6 +396,14 @@ async fn competing_banks_for_the_same_slot_can_have_different_parents() {
     assert!(frozen_bank_ids.contains(&b.bank_id));
     assert!(frozen_bank_ids.contains(&c.bank_id));
     assert!(frozen_bank_ids.contains(&d.bank_id));
+
+    // C's loss is also reported directly, block-level, via `BankDiscarded` -- exactly once, and
+    // naming no one but C (A/B never competed with a sibling, and D is the winner, not a loser).
+    assert_eq!(
+        discarded_bank_ids,
+        vec![c.bank_id],
+        "BankDiscarded must name C exactly once, and no other bank"
+    );
 }
 
 ///
@@ -480,4 +505,42 @@ async fn ambiguous_intermediate_ancestor_blocks_retroactive_rooting_of_its_slot(
              12 and must never reach any commitment level"
         );
     }
+}
+
+///
+/// `bank_a` resolves as slot 40's sole candidate purely via inference (no direct commitment yet,
+/// so this is still supersedable). `bank_b` then registers and is confirmed directly, superseding
+/// `bank_a` -- a genuine, one-time discard. The same `Confirmed` update for `bank_b` is then
+/// delivered a second time (as a duplicate wire delivery would), which must be a pure no-op: it
+/// must not discard `bank_a` all over again, and `BankDiscarded` must never fire twice for the
+/// same bank_id.
+#[tokio::test]
+async fn bank_discarded_never_fires_twice_for_the_same_bank_id() {
+    let slot = 20_000;
+    let bank_a = SimulatedBank::new(slot, 2_000_001).with_entry_count(1);
+    let bank_b = SimulatedBank::new(slot, 2_000_002).with_entry_count(1);
+
+    let stream = SimulationBuilder::new()
+        .bank(&bank_a)
+        .bank(&bank_b)
+        .confirmed(slot, bank_b.bank_id)
+        // A duplicate delivery of the very same commitment update -- must be a no-op.
+        .confirmed(slot, bank_b.bank_id)
+        .build();
+
+    let block_stream = BlockStream::<_, SubscribeUpdate, _>::new(
+        stream,
+        DragonsmouthBlockCumulator::default(),
+        CommitmentLevel::Processed,
+    );
+
+    let outputs = collect(block_stream).await;
+    let discarded_bank_ids: Vec<BankId> = outputs.iter().filter_map(discarded_bank_id).collect();
+
+    assert_eq!(
+        discarded_bank_ids,
+        vec![bank_a.bank_id],
+        "bank_a must be discarded exactly once, even though the Confirmed update that \
+         superseded it was itself delivered twice"
+    );
 }

@@ -4,7 +4,9 @@ use {
             RESERVED_FILTER_NAME,
             block_accumulator::{BankBuffer, DragonsmouthBlockCumulator, SYSVAR_PROGRAM_ID},
         },
-        state_machine::{DeadBlockDetected, ForkDetected, SlotCommitmentStatusUpdate},
+        state_machine::{
+            BankDiscarded, DeadBlockDetected, ForkDetected, SlotCommitmentStatusUpdate,
+        },
         stream::{Block, BlockEventStore, BlockMachineOutput, BlockStream},
     },
     futures_util::Stream,
@@ -96,6 +98,12 @@ pub enum BlockStreamEvent {
     ///
     /// A dead block has been detected, indicating that a block is no longer part of the canonical chain and should be discarded.
     DeadBlockDetected(DeadBlockDetected),
+    ///
+    /// A specific bank/block instance lost the race for its slot to a sibling bank_id. Unlike
+    /// `ForkDetected`, which is about a slot diverging from the canonical chain, this is
+    /// block-level -- it says nothing about whether the slot itself was ever considered forked.
+    ///
+    BankDiscarded(BankDiscarded),
 }
 
 impl Stream for DragonsmouthBlockStream {
@@ -122,6 +130,9 @@ impl Stream for DragonsmouthBlockStream {
                     }
                     BlockMachineOutput::DeadBlockDetected(dead_block_detected) => {
                         BlockStreamEvent::DeadBlockDetected(dead_block_detected)
+                    }
+                    BlockMachineOutput::BankDiscarded(discarded) => {
+                        BlockStreamEvent::BankDiscarded(discarded)
                     }
                 };
                 std::task::Poll::Ready(Some(Ok(output2)))

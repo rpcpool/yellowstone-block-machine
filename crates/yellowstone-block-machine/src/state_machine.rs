@@ -257,6 +257,16 @@ pub struct InvalidBlock {
     pub slot: Slot,
 }
 
+///
+/// A *slot* -- not a specific bank/block instance -- fell out of the canonical chain: the
+/// [`Forks`] tree structurally recognized that this slot's position diverges from (or was
+/// skipped by) the chain that's actually being rooted, typically because a sibling or cousin slot
+/// is the one that ends up canonical instead. This is slot-level bookkeeping, driven by
+/// slot-to-parent-slot edges in the tree -- it does **not** mean "this specific bank/block lost a
+/// race for its slot." Two bank_ids genuinely competing for the *same* slot number is a different
+/// situation entirely, with its own signal: see [`BankDiscarded`], which is bank/block-level, not
+/// slot-level, and fires independently of whether the tree ever considered the slot itself forked.
+///
 #[derive(Debug, Clone)]
 pub struct ForkDetected {
     pub slot: Slot,
@@ -273,12 +283,27 @@ pub struct DeadBlockDetected {
     pub bank_ids: Vec<BankId>,
 }
 
+///
+/// A specific bank/block instance lost the race for its slot to a sibling bank_id -- unlike
+/// [`ForkDetected`], this is block-level, not slot-level: the slot itself may never have been
+/// considered forked by the [`Forks`] tree at all (same-slot bank_id competition and slot-to-slot
+/// tree divergence are tracked independently). Emitted once per discarded bank_id, exactly when
+/// [`BlocksStateMachine::discard_losing_banks`] drops it -- a bank_id is discarded at most once
+/// ever (see that method), so this can never fire twice for the same `bank_id`.
+///
+#[derive(Debug, Clone, Copy)]
+pub struct BankDiscarded {
+    pub slot: Slot,
+    pub bank_id: BankId,
+}
+
 #[derive(Debug)]
 pub enum BlockStateMachineOutput {
     FrozenBlock(FrozenBlock),
     SlotStatus(SlotCommitmentStatusUpdate),
     ForksDetected(ForkDetected),
     DeadSlotDetected(DeadBlockDetected),
+    BankDiscarded(BankDiscarded),
 }
 
 impl BlockStateMachineOutput {
@@ -288,6 +313,7 @@ impl BlockStateMachineOutput {
             Self::FrozenBlock(blk) => blk.slot,
             Self::SlotStatus(update) => update.slot,
             Self::ForksDetected(info) => info.slot,
+            Self::BankDiscarded(info) => info.slot,
         }
     }
 }
@@ -645,7 +671,13 @@ impl BlocksStateMachine {
     /// not `Slot`) has no way to learn that on its own -- it is never told a loser existed unless
     /// this pushes a [`DeadletterEvent::Discarded`] for it, the same channel
     /// [`Self::execute_optimistic_freeze_for_needed_banks`] already uses to report a bank this
-    /// crate gave up on.
+    /// crate gave up on. A [`BlockStateMachineOutput::BankDiscarded`] is also emitted for each
+    /// loser -- the outward-facing counterpart, for a consumer that wants to know a specific
+    /// bank_id lost its slot (as opposed to [`BlockStateMachineOutput::ForksDetected`], which is
+    /// about the *slot* diverging from the canonical chain, not about bank-level competition).
+    /// Each bank_id is discarded at most once ever (it's removed from `ids` right here, and
+    /// `discarded_bank_ids` then blocks it from ever being registered as a fresh candidate again),
+    /// so this can never emit twice for the same bank_id.
     ///
     fn discard_losing_banks(&mut self, slot: Slot, winner: BankId) {
         let Some(ids) = self.slot_to_banks.get_mut(&slot) else {
@@ -657,6 +689,10 @@ impl BlocksStateMachine {
             self.remove_bank_references(loser);
             self.discarded_bank_ids.insert(loser, slot);
             self.push_to_dlq(DeadletterEvent::Discarded(loser));
+            self.push_new_update(BlockStateMachineOutput::BankDiscarded(BankDiscarded {
+                slot,
+                bank_id: loser,
+            }));
         }
     }
 

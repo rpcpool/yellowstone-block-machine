@@ -208,6 +208,14 @@ async fn process_block<W>(
                 BlockStreamEvent::DeadBlockDetected(dead_block_detected) => {
                     writeln!(out, "DeadBlockDetect: {}", dead_block_detected.slot).expect("write");
                 }
+                BlockStreamEvent::BankDiscarded(discarded) => {
+                    writeln!(
+                        out,
+                        "BankDiscarded: slot {}, bank_id {}",
+                        discarded.slot, discarded.bank_id
+                    )
+                    .expect("write");
+                }
             },
             Err(e) => {
                 writeln!(out, "BlockMachineError: {:?}", e).expect("write");

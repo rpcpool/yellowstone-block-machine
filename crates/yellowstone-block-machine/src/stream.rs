@@ -2,8 +2,8 @@ use {
     crate::{
         event::{GeyserEventAdapter, GeyserEventInfo},
         state_machine::{
-            BlockStateMachineOutput, BlockstoreStats, DeadBlockDetected, DeadletterEvent,
-            ForkDetected, FrozenBlock, SlotCommitmentStatusUpdate,
+            BankDiscarded, BlockStateMachineOutput, BlockstoreStats, DeadBlockDetected,
+            DeadletterEvent, ForkDetected, FrozenBlock, SlotCommitmentStatusUpdate,
         },
         wrapper::BlocksStateMachineWrapper,
     },
@@ -139,6 +139,7 @@ enum PendingEvent {
     SlotCommitmentUpdate(SlotCommitmentStatusUpdate),
     ForkDetected(ForkDetected),
     DeadBlockDetect(DeadBlockDetected),
+    BankDiscarded(BankDiscarded),
 }
 
 ///
@@ -166,6 +167,13 @@ pub enum BlockMachineOutput<EventStore> {
     /// Dead blocks mostly come from corrupted entries early in the replay process of a slot.
     ///
     DeadBlockDetected(DeadBlockDetected),
+    ///
+    /// A specific bank/block instance lost the race for its slot to a sibling bank_id. Unlike
+    /// [`Self::ForkDetected`], which is about a *slot* diverging from the canonical chain, this is
+    /// block-level: it says nothing about whether the slot itself was ever considered forked.
+    /// Emitted at most once per bank_id.
+    ///
+    BankDiscarded(BankDiscarded),
 }
 
 ///
@@ -301,6 +309,10 @@ where
                     self.pending
                         .push_back(PendingEvent::DeadBlockDetect(dead_block));
                 }
+                BlockStateMachineOutput::BankDiscarded(discarded) => {
+                    self.pending
+                        .push_back(PendingEvent::BankDiscarded(discarded));
+                }
             }
         }
     }
@@ -335,6 +347,9 @@ where
                     PendingEvent::ForkDetected(fork) => BlockMachineOutput::ForkDetected(fork),
                     PendingEvent::DeadBlockDetect(dead) => {
                         BlockMachineOutput::DeadBlockDetected(dead)
+                    }
+                    PendingEvent::BankDiscarded(discarded) => {
+                        BlockMachineOutput::BankDiscarded(discarded)
                     }
                 };
 
