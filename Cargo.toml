@@ -29,7 +29,7 @@ rand = "0.9.0"
 rustc-hash = "2.0.0"
 serde = "1.0.0"
 serde_yaml = "0.9.34"
-solana-clock = "3.0.0"
+solana-clock = "4.0.0"
 solana-commitment-config = "3.0.0"
 solana-pubkey = "4.0.0"
 solana-signature = "3.0.0"
@@ -41,8 +41,8 @@ tokio-util = "0.7.16"
 tonic = "0.14.0"
 tracing = "0.1.0"
 tracing-subscriber = "0.3.0"
-yellowstone-grpc-client = { git = "https://github.com/rpcpool/yellowstone-grpc", branch = "4.3-transition" }
-yellowstone-grpc-proto = { git = "https://github.com/rpcpool/yellowstone-grpc", branch = "4.3-transition" }
+yellowstone-grpc-client = "14.0.1"
+yellowstone-grpc-proto = "13.0.0"
 yellowstone-block-machine = { path = "crates/yellowstone-block-machine" }
 
 [workspace.lints.clippy]

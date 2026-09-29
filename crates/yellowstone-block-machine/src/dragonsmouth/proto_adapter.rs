@@ -109,6 +109,8 @@ impl GeyserEventAdapter for SubscribeUpdate {
             }
             UpdateOneof::Ping(_) => None,
             UpdateOneof::Pong(_) => None,
+            UpdateOneof::BlockFooter(_) => None,
+            UpdateOneof::EntryUpdateParent(_) => None,
         }
     }
 }
