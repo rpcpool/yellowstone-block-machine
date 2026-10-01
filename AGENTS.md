@@ -81,10 +81,15 @@ one of them.
 | Slot Finalized | `deregister_finalized_slot_schedule`, after the output is popped | its commitment updates |
 | Loses its slot to a sibling bank | `discard_losing_banks` | `BankDiscarded` + DLQ `Discarded` |
 | Slot dead (`SlotDead` / `dead_error`) | `mark_slot_as_dead` | `DeadSlotDetected { bank_ids }` |
-| Slot skipped by a Confirmed/Finalized descendant | `mark_slot_as_skipped` | `ForksDetected { bank_ids }` + DLQ `Discarded` |
+| Slot skipped by a Confirmed/Finalized descendant | `mark_slot_as_skipped` | `BankDiscarded` + DLQ `Discarded` per bank, and `ForksDetected { bank_ids }` the first time the slot is fork-reported |
 | Optimistic freeze impossible | `execute_optimistic_freeze_for_needed_banks` | DLQ `Incomplete` |
 | Slot forked in the graph | `gc` pass 1, once below the oldest rooted slot | `ForksDetected { bank_ids }`, then the `gc` trace |
 | Anything else stuck | `gc` pass 2, after `MAX_UNRESOLVED_SLOT_AGE` (300s) | the `gc` trace |
+
+Every DLQ `Discarded` must have a matching `BankDiscarded` output. `ForksDetected` is
+deduplicated per slot through `forks_history` (`LongShortForksMutationTracer`), so it is a
+slot-level signal only. Never rely on it alone to announce a list of banks being torn down: a
+slot reported in an earlier tick gets no new report, even if it gained banks since.
 
 Pass 2 is a last-resort memory bound, not a cleanup path. When a bank waits 300s for it, look for
 the wire signal that should have ended it sooner.

@@ -397,12 +397,15 @@ async fn competing_banks_for_the_same_slot_can_have_different_parents() {
     assert!(frozen_bank_ids.contains(&c.bank_id));
     assert!(frozen_bank_ids.contains(&d.bank_id));
 
-    // C's loss is also reported directly, block-level, via `BankDiscarded` -- exactly once, and
-    // naming no one but C (A/B never competed with a sibling, and D is the winner, not a loser).
+    // C's loss is also reported directly, block-level, via `BankDiscarded` -- exactly once. B is
+    // discarded too, for a different reason: D is Confirmed with parent A's slot 10, which proves
+    // slot 11 was skipped by the canonical chain (docs/skipped-slot-bank-leak.md). A is D's parent
+    // and D is the winner, so neither is ever discarded.
+    discarded_bank_ids.sort_unstable();
     assert_eq!(
         discarded_bank_ids,
-        vec![c.bank_id],
-        "BankDiscarded must name C exactly once, and no other bank"
+        vec![b.bank_id, c.bank_id],
+        "BankDiscarded must name B (skipped) and C (lost slot 12) exactly once each, and no other bank"
     );
 }
 

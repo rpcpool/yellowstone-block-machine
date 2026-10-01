@@ -168,7 +168,8 @@ pub enum BlockMachineOutput<EventStore> {
     ///
     DeadBlockDetected(DeadBlockDetected),
     ///
-    /// A specific bank/block instance lost the race for its slot to a sibling bank_id. Unlike
+    /// A specific bank/block instance was permanently discarded: it lost the race for its slot
+    /// to a sibling bank_id, or its slot was skipped by the canonical chain. Unlike
     /// [`Self::ForkDetected`], which is about a *slot* diverging from the canonical chain, this is
     /// block-level: it says nothing about whether the slot itself was ever considered forked.
     /// Emitted at most once per bank_id.

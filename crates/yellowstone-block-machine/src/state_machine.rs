@@ -284,12 +284,15 @@ pub struct DeadBlockDetected {
 }
 
 ///
-/// A specific bank/block instance lost the race for its slot to a sibling bank_id -- unlike
+/// A specific bank/block instance was permanently discarded: either it lost the race for its slot
+/// to a sibling bank_id ([`BlocksStateMachine::discard_losing_banks`]), or its slot was skipped by a
+/// `Confirmed`/`Finalized` descendant (`BlocksStateMachine::mark_slot_as_skipped`). Unlike
 /// [`ForkDetected`], this is block-level, not slot-level: the slot itself may never have been
 /// considered forked by the [`Forks`] tree at all (same-slot bank_id competition and slot-to-slot
-/// tree divergence are tracked independently). Emitted once per discarded bank_id, exactly when
-/// [`BlocksStateMachine::discard_losing_banks`] drops it -- a bank_id is discarded at most once
-/// ever (see that method), so this can never fire twice for the same `bank_id`.
+/// tree divergence are tracked independently). Emitted once per discarded bank_id, paired with a
+/// [`DeadletterEvent::Discarded`] for it -- a bank_id is discarded at most once ever (both paths
+/// remove it from `slot_to_banks` and block it via `discarded_bank_ids`), so this can never fire
+/// twice for the same `bank_id`.
 ///
 #[derive(Debug, Clone, Copy)]
 pub struct BankDiscarded {
@@ -1004,9 +1007,12 @@ impl BlocksStateMachine {
     /// reports the slot as forked.
     ///
     /// Mirrors [`Self::mark_slot_as_dead`]'s teardown (every bank_id is permanently discarded so
-    /// stragglers are rejected) and [`Self::discard_losing_banks`]'s
-    /// [`DeadletterEvent::Discarded`] per bank, but is reported through the generic
-    /// `ForksDetected` output -- a skipped slot was abandoned, not rejected by replay. The slot is
+    /// stragglers are rejected) and [`Self::discard_losing_banks`]'s per-bank
+    /// [`DeadletterEvent::Discarded`] + [`BlockStateMachineOutput::BankDiscarded`] pair. The slot
+    /// itself is reported through the generic `ForksDetected` output, not `DeadSlotDetected` -- a
+    /// skipped slot was abandoned, not rejected by replay -- but only the first time it is ever
+    /// fork-reported; the per-bank `BankDiscarded` is what guarantees every torn-down bank is
+    /// announced, including banks that appeared after an earlier fork report. The slot is
     /// recorded in `forks_history` so [`Self::gc`]'s ordinary sweep eventually reclaims its
     /// `discarded_bank_ids` entries; it is only marked forked inside [`Forks`] itself if it is
     /// already a node there (so its descendants are forked too), never added as a new orphan
@@ -1060,9 +1066,18 @@ impl BlocksStateMachine {
                 .insert(skipped_slot, bank_ids.clone());
         }
         self.remove_slot_references_in_state(skipped_slot);
+        // `ForksDetected` above is deduplicated per slot by `forks_history`: a slot already
+        // fork-reported in an earlier tick gets no new report here, even if it gained banks since.
+        // The per-bank `BankDiscarded` is never deduplicated, so every bank torn down here is
+        // announced regardless -- and every `DeadletterEvent::Discarded` keeps its matching
+        // output, as in `discard_losing_banks`.
         for bank_id in bank_ids {
             self.discarded_bank_ids.insert(bank_id, skipped_slot);
             self.push_to_dlq(DeadletterEvent::Discarded(bank_id));
+            self.push_new_update(BlockStateMachineOutput::BankDiscarded(BankDiscarded {
+                slot: skipped_slot,
+                bank_id,
+            }));
         }
     }
 
@@ -3100,5 +3115,107 @@ mod tests {
 
         assert!(!sm.discarded_bank_ids.contains_key(&1000));
         assert!(!sm.forks_history.contains(&100));
+    }
+
+    fn sorted_bank_discards(outputs: &[BlockStateMachineOutput]) -> Vec<(Slot, BankId)> {
+        let mut v: Vec<(Slot, BankId)> = outputs
+            .iter()
+            .filter_map(|o| match o {
+                BlockStateMachineOutput::BankDiscarded(d) => Some((d.slot, d.bank_id)),
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    ///
+    /// Review follow-up to docs/skipped-slot-bank-leak.md: `ForksDetected` is deduplicated per
+    /// slot by `forks_history`, so a skipped slot already fork-reported in an earlier tick gets no
+    /// new `ForksDetected`. Its banks must still be announced, via `BankDiscarded`.
+    ///
+    /// ```text
+    ///   earlier tick: 100 already fork-reported (seeded into forks_history)
+    ///
+    ///   98 ── 99 ─────────────────────────── 106   Confirmed, parent 99
+    ///   (C)   (C)
+    ///          └── 100 [bank 1000]   in the gap, but no new ForksDetected
+    ///
+    ///   => BankDiscarded(100, 1000) + DLQ Discarded(1000)
+    /// ```
+    ///
+    #[test]
+    fn skipped_slot_already_fork_reported_still_announces_its_banks() {
+        let mut sm = BlocksStateMachine::default();
+        seal_at(&mut sm, 99, 98, 990, CommitmentLevel::Confirmed);
+        buffer(&mut sm, 100, Some(99), 1000, 3);
+        drain(&mut sm);
+        sm.forks_history.insert(100);
+
+        seal_at(&mut sm, 106, 99, 1060, CommitmentLevel::Confirmed);
+
+        let outputs = drain(&mut sm);
+        assert!(
+            sorted_fork_reports(&outputs).is_empty(),
+            "precondition: the ForksDetected report is deduplicated away"
+        );
+        assert_eq!(sorted_bank_discards(&outputs), vec![(100, 1000)]);
+        assert_eq!(dlq_discarded(&mut sm), vec![1000]);
+    }
+
+    ///
+    /// Review follow-up to docs/skipped-slot-bank-leak.md, the case that actually loses
+    /// information: slot 100 is fork-reported with bank 1000, then gains a repaired bank 1001,
+    /// then a canonical slot skips over it. Bank 1001 was never named by any `ForksDetected`, so
+    /// only `BankDiscarded` can tell the consumer it is gone.
+    ///
+    /// ```text
+    ///   tick 1: 100 [bank 1000] Processed with parent 98, then 99 Finalized
+    ///
+    ///   98 ── 99 (F)                rooting 99 forks its sibling 100
+    ///    └─── 100 [bank 1000] (P)   => ForksDetected(100, [1000])
+    ///
+    ///   tick 2: a repaired bank 1001 shows up for 100
+    ///
+    ///    └─── 100 [bank 1000, bank 1001]
+    ///
+    ///   tick 3: 106 Confirmed with parent 99 skips 100
+    ///
+    ///   98 ── 99 (F) ──────────────────── 106 (C)
+    ///    └─── 100 [bank 1000, bank 1001]
+    ///
+    ///   => no new ForksDetected(100), but BankDiscarded for both 1000 and 1001
+    /// ```
+    ///
+    #[test]
+    fn bank_added_after_fork_report_is_announced_when_its_slot_is_skipped() {
+        let mut sm = BlocksStateMachine::default();
+        buffer(&mut sm, 100, Some(98), 1000, 3);
+        sm.process_consensus_event(
+            commitment(100, Some(98), CommitmentLevel::Processed, 1000).into(),
+        );
+        seal_at(&mut sm, 99, 98, 990, CommitmentLevel::Finalized);
+        assert_eq!(
+            sorted_fork_reports(&drain(&mut sm)),
+            vec![(100, vec![1000])],
+            "precondition: rooting 99 fork-reports its sibling 100 with bank 1000"
+        );
+
+        buffer(&mut sm, 100, Some(98), 1001, 2);
+        drain(&mut sm);
+
+        seal_at(&mut sm, 106, 99, 1060, CommitmentLevel::Confirmed);
+
+        let outputs = drain(&mut sm);
+        assert!(
+            sorted_fork_reports(&outputs).is_empty(),
+            "precondition: 100 was already fork-reported, so no second ForksDetected"
+        );
+        assert_eq!(
+            sorted_bank_discards(&outputs),
+            vec![(100, 1000), (100, 1001)],
+            "both banks, including 1001 which no ForksDetected ever named, must be announced"
+        );
+        assert_eq!(dlq_discarded(&mut sm), vec![1000, 1001]);
     }
 }
