@@ -461,6 +461,15 @@ where
         newly_forked_slots
     }
 
+    ///
+    /// Whether `slot` is a node of the fork graph at all -- either end of a recorded parent-child
+    /// edge, or a slot explicitly marked forked. A slot only ever passed to
+    /// [`Self::make_slot_rooted_with_rooted_trace`] with no edge of its own is not a node.
+    ///
+    pub fn contains(&self, slot: &T) -> bool {
+        self.parent_children_map.contains_key(slot)
+    }
+
     pub fn is_rooted_slot(&self, slot: &T) -> bool {
         self.rooted_slots.contains(slot)
     }

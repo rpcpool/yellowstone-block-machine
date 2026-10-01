@@ -535,6 +535,13 @@ pub struct BlocksStateMachine {
     /// bank_ids to the very teardown its own detection triggered -- see `mark_slot_as_dead`.
     ///
     dead_slot_bank_ids_snapshot: FxHashMap<Slot, Vec<BankId>>,
+
+    ///
+    /// Same purpose as `dead_slot_bank_ids_snapshot`, for a slot marked skipped by
+    /// [`Self::mark_skipped_slots_below`] this same tick. Kept separate so a skipped slot takes
+    /// the generic `ForksDetected` branch of the flush, never `DeadSlotDetected`.
+    ///
+    skipped_slot_bank_ids_snapshot: FxHashMap<Slot, Vec<BankId>>,
 }
 
 impl BlocksStateMachine {
@@ -565,6 +572,7 @@ impl BlocksStateMachine {
             forks_detected_in_current_tick: Default::default(),
             need_optimistic_freeze: Default::default(),
             dead_slot_bank_ids_snapshot: Default::default(),
+            skipped_slot_bank_ids_snapshot: Default::default(),
         }
     }
 
@@ -818,6 +826,7 @@ impl BlocksStateMachine {
             if commitment_rank(commitment) > commitment_rank(*floor) {
                 *floor = commitment;
             }
+            self.mark_skipped_slots_below(slot);
         }
 
         self.deliver_or_queue(bank_id, slot_status);
@@ -924,6 +933,136 @@ impl BlocksStateMachine {
         self.remove_slot_references_in_state(slot);
         for bank_id in bank_ids {
             self.discarded_bank_ids.insert(bank_id, slot);
+        }
+    }
+
+    ///
+    /// Marks every known slot strictly between `slot` and its resolved parent as skipped, once
+    /// `slot` has reached `Confirmed`/`Finalized` and that parent is known.
+    ///
+    /// A canonical slot with parent `p` is a definitive statement that every slot in
+    /// `(p, slot)` is off the canonical chain for good. The wire has no other signal for this:
+    /// such a slot never resolves, so it never enters [`Forks`], and if its bank never froze no
+    /// commitment status is ever emitted for it either -- without this, its bank (and whatever a
+    /// downstream accumulator buffered for it) is held until [`Self::gc`]'s
+    /// [`MAX_UNRESOLVED_SLOT_AGE`] sweep.
+    ///
+    /// Only a `Confirmed`/`Finalized` floor is trusted here, never a `Processed` sole-candidate
+    /// inference: the latter can later be superseded by a different bank naming a different
+    /// parent (dump-and-repair), whereas a `Confirmed`/`Finalized` resolution can never change
+    /// (see `handle_slot_commitment_status_update`), so a slot marked skipped here can never turn
+    /// out wrong.
+    ///
+    /// Walks only slots this machine already tracks: the cost is bounded by
+    /// `min(gap length, slot_to_banks.len())`, and a gap over slots never seen here is a no-op
+    /// that allocates nothing.
+    ///
+    /// # Arguments
+    ///
+    /// * `slot` - A slot that may have just reached `Confirmed`/`Finalized` or just learned its
+    ///   resolved bank's parent.
+    ///
+    fn mark_skipped_slots_below(&mut self, slot: Slot) {
+        if !matches!(
+            self.slot_min_commitment.get(&slot),
+            Some(CommitmentLevel::Confirmed) | Some(CommitmentLevel::Finalized)
+        ) {
+            return;
+        }
+        let Some(parent) = self
+            .resolved_bank_per_slot
+            .get(&slot)
+            .and_then(|bank_id| self.bank_parent_slot.get(bank_id))
+            .copied()
+        else {
+            return;
+        };
+        if parent >= slot {
+            tracing::error!(
+                "UNEXPECTED: slot {slot} resolved with parent {parent}, which is not below it -- not marking any skipped slots"
+            );
+            return;
+        }
+        let gap = parent + 1..slot;
+        let gap_len = slot - parent - 1;
+        let skipped: Vec<Slot> = if gap_len <= self.slot_to_banks.len() as u64 {
+            gap.filter(|s| self.slot_to_banks.contains_key(s)).collect()
+        } else {
+            self.slot_to_banks
+                .keys()
+                .copied()
+                .filter(|s| gap.contains(s))
+                .collect()
+        };
+        for skipped_slot in skipped {
+            self.mark_slot_as_skipped(skipped_slot, slot, parent);
+        }
+    }
+
+    ///
+    /// Discards every bank instance of a slot that a canonical descendant skipped over, and
+    /// reports the slot as forked.
+    ///
+    /// Mirrors [`Self::mark_slot_as_dead`]'s teardown (every bank_id is permanently discarded so
+    /// stragglers are rejected) and [`Self::discard_losing_banks`]'s
+    /// [`DeadletterEvent::Discarded`] per bank, but is reported through the generic
+    /// `ForksDetected` output -- a skipped slot was abandoned, not rejected by replay. The slot is
+    /// recorded in `forks_history` so [`Self::gc`]'s ordinary sweep eventually reclaims its
+    /// `discarded_bank_ids` entries; it is only marked forked inside [`Forks`] itself if it is
+    /// already a node there (so its descendants are forked too), never added as a new orphan
+    /// node nothing would ever prune.
+    ///
+    /// # Arguments
+    ///
+    /// * `skipped_slot` - The slot to discard.
+    /// * `by_slot` - The `Confirmed`/`Finalized` slot whose parent edge skips over it.
+    /// * `by_parent` - `by_slot`'s resolved parent.
+    ///
+    fn mark_slot_as_skipped(&mut self, skipped_slot: Slot, by_slot: Slot, by_parent: Slot) {
+        let skipped_floor = self.slot_min_commitment.get(&skipped_slot).copied();
+        if matches!(
+            skipped_floor,
+            Some(CommitmentLevel::Confirmed) | Some(CommitmentLevel::Finalized)
+        ) || self.forks.is_rooted_slot(&skipped_slot)
+        {
+            // Solana's fork choice makes this impossible: a canonical slot cannot skip over
+            // another canonical slot. Refuse rather than discard something the cluster committed.
+            tracing::error!(
+                "UNEXPECTED: slot {skipped_slot} lies strictly between {by_slot} and its parent {by_parent}, but is itself committed (floor {skipped_floor:?}, rooted: {}) -- not marking it skipped",
+                self.forks.is_rooted_slot(&skipped_slot)
+            );
+            return;
+        }
+
+        let bank_ids = self
+            .slot_to_banks
+            .get(&skipped_slot)
+            .cloned()
+            .unwrap_or_default();
+        tracing::debug!(
+            "slot {skipped_slot} skipped by {by_slot} (parent {by_parent}); discarding banks {bank_ids:?}"
+        );
+
+        let mut multitrace = LongShortForksMutationTracer {
+            long: &mut self.forks_history,
+            short: &mut self.forks_detected_in_current_tick,
+        };
+        if self.forks.contains(&skipped_slot) {
+            self.forks
+                .mark_slot_as_forked(skipped_slot, &mut multitrace);
+        } else {
+            multitrace.insert(skipped_slot);
+        }
+        // Same reason as `mark_slot_as_dead`: the flush later this tick reads `slot_to_banks`,
+        // which is about to be wiped.
+        if self.forks_detected_in_current_tick.contains(&skipped_slot) {
+            self.skipped_slot_bank_ids_snapshot
+                .insert(skipped_slot, bank_ids.clone());
+        }
+        self.remove_slot_references_in_state(skipped_slot);
+        for bank_id in bank_ids {
+            self.discarded_bank_ids.insert(bank_id, skipped_slot);
+            self.push_to_dlq(DeadletterEvent::Discarded(bank_id));
         }
     }
 
@@ -1040,7 +1179,12 @@ impl BlocksStateMachine {
                 continue;
             }
             tracing::warn!("Forks detected for slot {}", slot);
-            let bank_ids = self.slot_to_banks.get(&slot).cloned().unwrap_or_default();
+            // A slot marked skipped this tick had its `slot_to_banks` entry wiped by its own
+            // teardown -- see `mark_slot_as_skipped`.
+            let bank_ids = self
+                .skipped_slot_bank_ids_snapshot
+                .remove(&slot)
+                .unwrap_or_else(|| self.slot_to_banks.get(&slot).cloned().unwrap_or_default());
             self.push_new_update(BlockStateMachineOutput::ForksDetected(ForkDetected {
                 slot,
                 bank_ids,
@@ -1100,6 +1244,9 @@ impl BlocksStateMachine {
         // registered it earlier via a commitment update.
         if self.resolved_bank_per_slot.get(&slot) == Some(&bank_id) {
             self.register_resolved_parent(slot, block_summary.parent_slot);
+            // A Confirmed/Finalized status that raced ahead of this BlockMeta without a parent of
+            // its own couldn't mark the gap below this slot skipped yet; now it can.
+            self.mark_skipped_slots_below(slot);
         }
 
         // This should never happen, but in case it does we will try to optimistically freeze
@@ -2631,5 +2778,327 @@ mod tests {
             vec![0, 1, 2, 3, 4, 5],
             "a frozen block's entries must be ordered by entry_index"
         );
+    }
+
+    /// [`fork_reports`], with both the reports and each report's bank_ids sorted.
+    fn sorted_fork_reports(outputs: &[BlockStateMachineOutput]) -> Vec<(Slot, Vec<BankId>)> {
+        let mut reports = fork_reports(outputs);
+        for (_, bank_ids) in &mut reports {
+            bank_ids.sort_unstable();
+        }
+        reports.sort_unstable();
+        reports
+    }
+
+    fn dlq_discarded(sm: &mut BlocksStateMachine) -> Vec<BankId> {
+        let mut v = Vec::new();
+        while let Some(event) = sm.pop_next_dlq() {
+            if let DeadletterEvent::Discarded(bank_id) = event {
+                v.push(bank_id);
+            }
+        }
+        v.sort_unstable();
+        v
+    }
+
+    fn entry(slot: Slot, bank_id: BankId, entry_index: u64) -> EntryInfo {
+        EntryInfo {
+            slot,
+            bank_id,
+            entry_index,
+            starting_txn_index: entry_index * 10,
+            entry_hash: Hash::new_unique(),
+            executed_txn_count: 10,
+        }
+    }
+
+    /// `seal` plus a direct commitment update at `level`.
+    fn seal_at(
+        sm: &mut BlocksStateMachine,
+        slot: Slot,
+        parent: Slot,
+        bank_id: BankId,
+        level: CommitmentLevel,
+    ) {
+        seal(sm, slot, Some(parent), bank_id);
+        sm.process_consensus_event(commitment(slot, Some(parent), level, bank_id).into());
+    }
+
+    ///
+    /// docs/skipped-slot-bank-leak.md, the production reproducer: block data for slot N arrives
+    /// (entries only, no `BlockMeta`), then the cluster confirms N+6 with parent N-1. N's bank must
+    /// be discarded and reported right away, not 300s later by `gc`'s age sweep.
+    ///
+    /// ```text
+    ///   98 ── 99 ─────────────────────────── 106   Confirmed, parent 99
+    ///   (C)   (C)
+    ///          ┆
+    ///          ┆   100   bank 1000: entries only, no BlockMeta, parent unknown
+    ///          ┆    ▲
+    ///          └────┴── gap (99, 106) skips 100  =>  ForksDetected(100, [1000])
+    /// ```
+    ///
+    #[test]
+    fn skipped_slot_bank_is_discarded_once_a_descendant_confirms_past_it() {
+        let mut sm = BlocksStateMachine::default();
+        seal_at(&mut sm, 99, 98, 990, CommitmentLevel::Confirmed);
+        for i in 0..3 {
+            sm.process_replay_event(entry(100, 1000, i).into()).unwrap();
+        }
+        drain(&mut sm);
+        dlq_discarded(&mut sm);
+
+        seal_at(&mut sm, 106, 99, 1060, CommitmentLevel::Confirmed);
+
+        let outputs = drain(&mut sm);
+        assert_eq!(
+            sorted_fork_reports(&outputs),
+            vec![(100, vec![1000])],
+            "the skipped slot must be reported once, naming its bank"
+        );
+        assert!(
+            !outputs
+                .iter()
+                .any(|o| matches!(o, BlockStateMachineOutput::DeadSlotDetected(_))),
+            "a skipped slot is not a dead slot"
+        );
+        assert_eq!(dlq_discarded(&mut sm), vec![1000]);
+        assert!(!sm.block_buffer_map.contains_key(&1000));
+        assert!(!sm.slot_to_banks.contains_key(&100));
+        assert!(!sm.slot_first_seen_at.contains_key(&100));
+        assert!(sm.skipped_slot_bank_ids_snapshot.is_empty());
+        assert!(
+            sm.process_replay_event(entry(100, 1000, 3).into()).is_err(),
+            "a straggler for the skipped bank must be rejected"
+        );
+    }
+
+    ///
+    /// docs/skipped-slot-bank-leak.md: gaps are routine, so a gap over slots this machine never
+    /// saw must produce nothing and allocate nothing.
+    ///
+    /// ```text
+    ///   98 ── 99 ──────── 106 ──────────────────── 1_000_000
+    ///   (C)   (C)         (C)                      (C)
+    ///          └ 100..105 ┘ └ 107..999_999 ───────┘
+    ///            never seen    never seen (huge gap, must not be walked)
+    ///
+    ///   => no output, no state
+    /// ```
+    ///
+    #[test]
+    fn gap_over_unseen_slots_is_a_no_op() {
+        let mut sm = BlocksStateMachine::default();
+        seal_at(&mut sm, 99, 98, 990, CommitmentLevel::Confirmed);
+        drain(&mut sm);
+        let forks_history_before = sm.forks_history.len();
+
+        seal_at(&mut sm, 106, 99, 1060, CommitmentLevel::Confirmed);
+        // A huge gap, e.g. after an outage, must not be walked slot by slot either.
+        seal_at(&mut sm, 1_000_000, 106, 7, CommitmentLevel::Confirmed);
+
+        assert!(sorted_fork_reports(&drain(&mut sm)).is_empty());
+        assert!(dlq_discarded(&mut sm).is_empty());
+        assert_eq!(sm.forks_history.len(), forks_history_before);
+        assert!(sm.discarded_bank_ids.is_empty());
+        assert!(sm.skipped_slot_bank_ids_snapshot.is_empty());
+    }
+
+    ///
+    /// docs/skipped-slot-bank-leak.md: a skipped slot with several candidate banks (possibly
+    /// disagreeing on their parent) discards all of them.
+    ///
+    /// ```text
+    ///   98 ── 99 ─────────────────────────── 106   Confirmed, parent 99
+    ///   │(C)  │(C)
+    ///   │     └── 100 [bank 1000] ── 103 [bank 1030]
+    ///   └──────── 100 [bank 1001]
+    ///
+    ///   100 and 103 both lie in the gap (99, 106)
+    ///   => ForksDetected(100, [1000, 1001]), ForksDetected(103, [1030])
+    /// ```
+    ///
+    #[test]
+    fn skipped_slot_discards_every_candidate_bank() {
+        let mut sm = BlocksStateMachine::default();
+        seal_at(&mut sm, 99, 98, 990, CommitmentLevel::Confirmed);
+        buffer(&mut sm, 100, Some(99), 1000, 3);
+        buffer(&mut sm, 100, Some(98), 1001, 2);
+        buffer(&mut sm, 103, Some(100), 1030, 2);
+        drain(&mut sm);
+
+        seal_at(&mut sm, 106, 99, 1060, CommitmentLevel::Confirmed);
+
+        assert_eq!(
+            sorted_fork_reports(&drain(&mut sm)),
+            vec![(100, vec![1000, 1001]), (103, vec![1030])]
+        );
+        assert_eq!(dlq_discarded(&mut sm), vec![1000, 1001, 1030]);
+        for bank_id in [1000, 1001, 1030] {
+            assert!(!sm.block_buffer_map.contains_key(&bank_id));
+            assert!(!sm.is_bank_trackable(bank_id));
+        }
+    }
+
+    ///
+    /// docs/skipped-slot-bank-leak.md: the parent may only be learned from `BlockMeta`, after the
+    /// `Confirmed` status already resolved the slot.
+    ///
+    /// ```text
+    ///   step 1: 106 Confirmed, parent unknown -> gap unknown, 100 kept
+    ///
+    ///   98 ── 99          ?? ── 106 (C)
+    ///   (C)   (C)
+    ///          └── 100 [bank 1000]
+    ///
+    ///   step 2: BlockMeta for 106 says parent = 99
+    ///
+    ///   98 ── 99 ─────────────── 106 (C)
+    ///          └── 100 [bank 1000]          => ForksDetected(100, [1000])
+    /// ```
+    ///
+    #[test]
+    fn skipped_slots_are_marked_once_a_confirmed_slots_parent_is_learned() {
+        let mut sm = BlocksStateMachine::default();
+        seal_at(&mut sm, 99, 98, 990, CommitmentLevel::Confirmed);
+        buffer(&mut sm, 100, Some(99), 1000, 3);
+        drain(&mut sm);
+
+        sm.process_consensus_event(commitment(106, None, CommitmentLevel::Confirmed, 1060).into());
+        assert!(
+            sm.block_buffer_map.contains_key(&1000),
+            "precondition: nothing is known to be skipped without 106's parent"
+        );
+
+        sm.process_replay_event(
+            BlockSummary {
+                slot: 106,
+                bank_id: 1060,
+                parent_slot: 99,
+                entry_count: 0,
+                executed_transaction_count: 0,
+                blockhash: Hash::new_unique(),
+                parent_blockhash: Hash::new_unique(),
+                block_time: 1,
+            }
+            .into(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            sorted_fork_reports(&drain(&mut sm)),
+            vec![(100, vec![1000])]
+        );
+        assert_eq!(dlq_discarded(&mut sm), vec![1000]);
+    }
+
+    ///
+    /// docs/skipped-slot-bank-leak.md: a `Processed` sole-candidate resolution can be superseded
+    /// (dump-and-repair) by a bank naming a different parent, so it must never mark anything
+    /// skipped.
+    ///
+    /// ```text
+    ///   step 1: optimistic bank 1060 for 106 claims parent 99, only Processed
+    ///
+    ///   98 ── 99 ─────────────── 106 [bank 1060] (P)
+    ///   (C)   (C)
+    ///          └── 100 [bank 1000]          => 100 kept (Processed can't skip)
+    ///
+    ///   step 2: repaired bank 1061 for 106 extends 100, and is Confirmed
+    ///
+    ///   98 ── 99 ── 100 [bank 1000] ── 106 [bank 1061] (C)
+    ///                                       => 100 is the real parent, kept
+    /// ```
+    ///
+    #[test]
+    fn superseded_processed_resolution_does_not_skip_the_real_parent() {
+        let mut sm = BlocksStateMachine::default();
+        seal_at(&mut sm, 99, 98, 990, CommitmentLevel::Confirmed);
+        buffer(&mut sm, 100, Some(99), 1000, 3);
+
+        // Optimistic bank for 106 claims parent 99, skipping 100.
+        seal_at(&mut sm, 106, 99, 1060, CommitmentLevel::Processed);
+        assert_eq!(sm.resolved_bank_per_slot.get(&106), Some(&1060));
+        assert!(
+            sm.block_buffer_map.contains_key(&1000),
+            "a Processed resolution must not mark 100 skipped"
+        );
+
+        // The repaired bank for 106 actually extends 100, and is the one confirmed.
+        seal_at(&mut sm, 106, 100, 1061, CommitmentLevel::Confirmed);
+        assert_eq!(sm.resolved_bank_per_slot.get(&106), Some(&1061));
+
+        let outputs = drain(&mut sm);
+        assert!(
+            !sorted_fork_reports(&outputs)
+                .iter()
+                .any(|(slot, _)| *slot == 100),
+            "100 is 106's real parent and must not be reported skipped, got {:?}",
+            sorted_fork_reports(&outputs)
+        );
+        assert!(sm.is_bank_trackable(1000));
+        assert!(sm.block_buffer_map.contains_key(&1000));
+    }
+
+    ///
+    /// docs/skipped-slot-bank-leak.md: marking a slot skipped is a strong claim. If the wire ever
+    /// contradicts fork choice by committing a slot inside the gap, it must not be discarded.
+    ///
+    /// ```text
+    ///   98 ── 99 ─────────────── 106 (C)   claims parent 99
+    ///   (C)   (C)
+    ///          └── 100 (C)                 also Confirmed: contradiction
+    ///
+    ///   => 100 refused (error logged), bank 1000 still trackable
+    /// ```
+    ///
+    #[test]
+    fn committed_slot_inside_a_gap_is_not_discarded() {
+        let mut sm = BlocksStateMachine::default();
+        seal_at(&mut sm, 99, 98, 990, CommitmentLevel::Confirmed);
+        seal_at(&mut sm, 100, 99, 1000, CommitmentLevel::Confirmed);
+        drain(&mut sm);
+
+        seal_at(&mut sm, 106, 99, 1060, CommitmentLevel::Confirmed);
+
+        assert!(sorted_fork_reports(&drain(&mut sm)).is_empty());
+        assert!(dlq_discarded(&mut sm).is_empty());
+        assert!(sm.is_bank_trackable(1000));
+    }
+
+    ///
+    /// docs/skipped-slot-bank-leak.md: a skipped slot's `discarded_bank_ids` entries must still be
+    /// reclaimed by `gc`'s ordinary sweep once the rooted window moves past it.
+    ///
+    /// ```text
+    ///   98 ── 99 ─────────────── 106 ── 107 ── ... ── 1199   all Finalized
+    ///   (F)   (F)                (F)    (F)           (F)
+    ///          └── 100 [bank 1000]   skipped, discarded
+    ///
+    ///   > 1000 rooted slots push the rooted window past 100
+    ///   => gc drops 100 from forks_history and discarded_bank_ids
+    /// ```
+    ///
+    #[test]
+    fn skipped_slot_discards_are_reclaimed_by_gc() {
+        let mut sm = BlocksStateMachine::default();
+        seal_at(&mut sm, 99, 98, 990, CommitmentLevel::Finalized);
+        buffer(&mut sm, 100, Some(99), 1000, 3);
+        seal_at(&mut sm, 106, 99, 1060, CommitmentLevel::Finalized);
+        assert!(sm.discarded_bank_ids.contains_key(&1000));
+
+        // Root enough descendants that the fork graph truncates its rooted window past 100.
+        let mut parent = 106;
+        for slot in 107..1200 {
+            seal_at(&mut sm, slot, parent, slot * 10, CommitmentLevel::Finalized);
+            parent = slot;
+        }
+        drain(&mut sm);
+        sm.gc(None);
+        drain(&mut sm);
+        sm.gc(None);
+
+        assert!(!sm.discarded_bank_ids.contains_key(&1000));
+        assert!(!sm.forks_history.contains(&100));
     }
 }
