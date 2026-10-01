@@ -4,6 +4,9 @@ Guidance for agents and contributors changing this repo. Read this before you to
 `state_machine.rs` or `forks.rs`: most bugs fixed here came from code that looked like it could be
 simplified but was protecting a rule this file lists.
 
+**Keep this file current.** When a fix reveals a rule that isn't obvious from the code, add it here
+in the same commit.
+
 ## Layout
 
 | Path | What it is |
@@ -27,6 +30,18 @@ cargo fmt --all
 
 `cargo fmt` prints warnings about `imports_granularity` / `group_imports` on the stable toolchain.
 They are expected and harmless.
+
+## Glossary
+
+- **Processed:** the node replayed the block. Optimistic: several banks of one slot can be
+  Processed at once, and the winner can still change.
+- **Confirmed:** a supermajority voted for this bank. Treated as final; it never changes.
+- **Finalized:** rooted. Final, and every branch that doesn't contain it is abandoned for good.
+- **Forked:** the slot is on a branch the canonical chain did not take. Detected by `Forks`.
+- **Skipped:** no block for this slot is on the canonical chain. Proven when a Confirmed/Finalized
+  slot's parent is older than it. The wire has no event for this.
+- **Dead:** replay of the block failed (`SlotDead`). The only one of these the wire reports
+  directly.
 
 ## Core model
 
@@ -58,7 +73,8 @@ They are expected and harmless.
    Processed resolution must never drive this. Walk only slots already tracked; a gap over unseen
    slots must stay a no-op that allocates nothing.
 7. **Dead and skipped are different outputs.** `DeadSlotDetected` is only for a slot the wire
-   declared dead (replay failed). A skipped slot reports as `ForksDetected`. Each uses its own
+   declared dead (replay failed). A skipped slot reports as `ForksDetected` plus one
+   `BankDiscarded` per bank. Each uses its own
    bank_id snapshot (`dead_slot_bank_ids_snapshot` / `skipped_slot_bank_ids_snapshot`), because the
    teardown wipes `slot_to_banks` before the end-of-tick flush reads it.
 8. **Do not add orphan nodes to `Forks`.** `pop_oldest_rooted_slot` only reclaims nodes reachable
@@ -97,11 +113,23 @@ the wire signal that should have ended it sooner.
 The geyser interface has no "fork abandoned" or "bank pruned" notification. Do not treat any
 other status as Dead to fake one.
 
+## Known gaps (deliberately not fixed yet)
+
+- Block data for a skipped slot that first arrives *after* the descendant was confirmed is not
+  recognized as skipped. It still waits for `gc` pass 2 (300s). Fixing it means remembering
+  recent confirmed slots' parents and checking new banks against them.
+- AUDIT.md finding 10: `dead_blocks_queue` is never written, so `stats().dead_block_queue_len` is
+  always 0.
+- AUDIT.md finding 12: a few unused items (`tick_entry_cnt`, `min_history_revision_in_queue`,
+  `InvalidBlock`, ...) are left over from the rewrite.
+
+If you fix one, remove it from this list.
+
 ## Writing tests
 
 - Unit tests go in `mod tests` at the bottom of `state_machine.rs`. Reuse its helpers (`buffer`,
   `seal`, `seal_at`, `seal_bank`, `commitment`, `created_bank`, `dead`, `drain`, `fork_reports`,
-  `sorted_fork_reports`, `dlq_discarded`).
+  `sorted_fork_reports`, `sorted_bank_discards`, `dlq_discarded`).
 - Simulate the passage of time with `gc_with_now(None, Instant::now() + d)`. Never sleep.
 - Give each test a `///` doc comment that names the finding or doc it covers and includes an ASCII
   diagram of the slot lineage in a ```` ```text ```` block (see the skipped-slot tests).
