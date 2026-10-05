@@ -73,8 +73,11 @@ pub struct EntryEvInfo {
 ///
 /// A borrowed view over an Alpenglow block footer update.
 ///
-/// Exactly one footer exists per bank. The wire delivers it independently of the rest of the
-/// bank's events, so it may arrive before `CreatedBank`, between entries, or after `BlockMeta`.
+/// Exactly one footer exists per bank. Agave queues it on the same FIFO channel as the bank's
+/// entries, so it always follows all of them, but it is unordered relative to `BlockMeta` and
+/// commitment statuses, which are notified directly from replay. On leader slots it is only
+/// queued once the bank is frozen, so it commonly arrives after `BlockMeta` and can even arrive
+/// after `Processed`/`Confirmed`.
 ///
 #[derive(Debug, Clone)]
 pub struct BlockFooterEvInfo {

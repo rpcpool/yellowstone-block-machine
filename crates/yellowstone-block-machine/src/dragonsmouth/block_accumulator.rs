@@ -152,8 +152,8 @@ impl BankBuffer {
     /// BlockMeta itself reports, and -- when `require_block_footer` is set -- the bank's block
     /// footer was observed.
     ///
-    /// The footer is unordered relative to every other event of the bank, so BlockMeta arriving
-    /// says nothing about it. A BlockMeta the state machine forged for an optimistic freeze gets
+    /// The footer is unordered relative to BlockMeta (see [`BlockFooterEvInfo`]), so BlockMeta
+    /// arriving says nothing about it. A BlockMeta the state machine forged for an optimistic freeze gets
     /// no exemption: the footer is still required.
     ///
     const fn is_complete(&self, require_block_footer: bool) -> bool {
@@ -881,8 +881,9 @@ mod tests {
     }
 
     ///
-    /// The footer is unordered relative to the rest of the bank: one arriving before
-    /// `CreatedBank` (auto-vivifying the buffer) must still count.
+    /// Agave never sends this order (the footer follows all of the bank's entries, which follow
+    /// `CreatedBank`), but the buffer auto-vivifies on any event, so a footer seen first must
+    /// still count rather than be lost to a buffer that `CreatedBank` would replace.
     ///
     #[test]
     fn footer_arriving_before_created_bank_still_counts() {

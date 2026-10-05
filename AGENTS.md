@@ -87,8 +87,13 @@ They are expected and harmless.
     explicitly.
 11. **A Dragonsmouth block is complete only once its block footer is observed.** With
     `require_block_footer` on (the default), `BankBuffer::is_complete` also needs the bank's
-    Alpenglow footer. There is exactly one footer per bank, and the wire doesn't order it relative
-    to `CreatedBank`, entries or BlockMeta, so it may come first or last. A BlockMeta forged for
+    Alpenglow footer. There is exactly one footer per bank. Agave queues it on the same FIFO
+    channel as the bank's entries, so it follows all of them, but BlockMeta and slot statuses are
+    notified directly from replay, so the footer is unordered relative to them. On leader slots it
+    is only queued once the bank is frozen: it usually lands after BlockMeta and can land after
+    Processed/Confirmed (hence invariant 12). Agave never drops a footer (the producer blocks on a
+    full channel), so a bank that never gets one means a broken setup: a non-Alpenglow node, a
+    server without footer support, or a subscription that started mid-slot. A BlockMeta forged for
     an optimistic freeze gets no exemption. The gate lives only in `DragonsmouthBlockCumulator`:
     never make the state machine's freeze wait for the footer, because freeze drives resolution,
     `Forks`, skipped-slot marking and commitment delivery. A duplicate footer, or one naming the
