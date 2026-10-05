@@ -9,7 +9,8 @@ use {
     },
     tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt},
     yellowstone_block_machine::dragonsmouth::client_ext::{
-        BlockStreamEvent, DragonsmouthBlock, DragonsmouthBlockStream, GeyserGrpcExt,
+        BlockMachineConfig, BlockStreamEvent, DragonsmouthBlock, DragonsmouthBlockStream,
+        GeyserGrpcExt,
     },
     yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcBuilder},
     yellowstone_grpc_proto::geyser::{
@@ -106,6 +107,10 @@ struct Args {
     /// If set, suppresses printing [`BlockStreamEvent::SlotCommitmentUpdate`] events.
     #[clap(long)]
     no_slot_commitment_updates: bool,
+    /// If set, blocks are delivered without waiting for their Alpenglow block footer
+    /// ([`BlockMachineConfig::require_block_footer`] off). Use it against a pre-Alpenglow node.
+    #[clap(long)]
+    no_footer: bool,
 }
 
 /// Geyser gRPC endpoint configuration, loaded from the YAML file named by [`Args::config`].
@@ -155,6 +160,7 @@ async fn process_block<W>(
                     let mut entry_cnt = 0u64;
                     let mut entry_txn_cnt = 0u64;
                     let mut unique_sig_set = HashSet::new();
+                    let mut block_user_agent = "unknown".to_string();
                     for ev in block.iter() {
                         match ev.update_oneof.as_ref() {
                             Some(UpdateOneof::Account(_)) => account_cnt += 1,
@@ -172,6 +178,11 @@ async fn process_block<W>(
                                 entry_cnt += 1;
                                 entry_txn_cnt += entry.executed_transaction_count;
                             }
+                            Some(UpdateOneof::BlockFooter(metadata)) => {
+                                block_user_agent =
+                                    String::from_utf8_lossy(metadata.block_user_agent.as_slice())
+                                        .to_string();
+                            }
                             _ => {}
                         }
                     }
@@ -185,8 +196,7 @@ async fn process_block<W>(
                     );
                     let parent_slot = block.parent_slot();
                     let parent_blockhash = bs58::encode(block.parent_blockhash()).into_string();
-
-                    writeln!(out, "Block ({i}) {slot}, bank_id: {bank_id}, txn: {}, account: {account_cnt}, entry: {entry_cnt}, parent_slot: {parent_slot}, parent hash: {parent_blockhash}", unique_sig_set.len()).expect("write");
+                    writeln!(out, "Block ({i}) {slot}, {block_user_agent}, bank_id: {bank_id}, txn: {}, account: {account_cnt}, entry: {entry_cnt}, parent_slot: {parent_slot}, parent hash: {parent_blockhash}", unique_sig_set.len()).expect("write");
                     cross_check_account_txn_join(block);
                     i += 1;
                 }
@@ -271,12 +281,20 @@ async fn main() {
         entry: hash_map! {
             "test".to_string() => Default::default(),
         },
+        block_footer: hash_map! {
+            "test".to_string() => Default::default(),
+        },
         commitment: Some(CommitmentLevel::Processed as i32),
         ..Default::default()
     };
 
     let block_machine_rx = geyser
-        .subscribe_block(request)
+        .subscribe_block_with_config(
+            request,
+            BlockMachineConfig {
+                require_block_footer: !args.no_footer,
+            },
+        )
         .await
         .expect("subscribe_block");
     process_block(

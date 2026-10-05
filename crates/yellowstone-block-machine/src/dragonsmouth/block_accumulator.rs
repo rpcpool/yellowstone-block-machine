@@ -59,10 +59,11 @@ struct PendingFreeze {
 /// The parts of a bank's block footer this crate keeps once it is observed, regardless of
 /// whether the client's own subscription asked for the raw footer update.
 ///
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ObservedFooter {
     bank_hash: [u8; HASH_BYTES],
     block_producer_time_nanos: u64,
+    block_user_agent: String,
 }
 
 #[derive(Debug)]
@@ -181,7 +182,7 @@ impl BankBuffer {
     /// [`DragonsmouthBlockCumulator`] was built with `require_block_footer` off.
     ///
     pub fn bank_hash(&self) -> Option<[u8; HASH_BYTES]> {
-        self.footer.map(|footer| footer.bank_hash)
+        self.footer.as_ref().map(|footer| footer.bank_hash)
     }
 
     ///
@@ -194,7 +195,24 @@ impl BankBuffer {
     /// [`DragonsmouthBlockCumulator`] was built with `require_block_footer` off.
     ///
     pub fn block_producer_time_nanos(&self) -> Option<u64> {
-        self.footer.map(|footer| footer.block_producer_time_nanos)
+        self.footer
+            .as_ref()
+            .map(|footer| footer.block_producer_time_nanos)
+    }
+
+    ///
+    /// The user agent of the client that produced the block, as reported by the bank's block
+    /// footer. The wire carries raw bytes: invalid UTF-8 sequences are replaced by U+FFFD.
+    ///
+    /// # Returns
+    ///
+    /// `None` if no footer was observed for this bank, which only happens when the
+    /// [`DragonsmouthBlockCumulator`] was built with `require_block_footer` off.
+    ///
+    pub fn block_user_agent(&self) -> Option<String> {
+        self.footer
+            .as_ref()
+            .map(|footer| footer.block_user_agent.clone())
     }
 }
 
@@ -315,6 +333,7 @@ impl DragonsmouthBlockCumulator {
         block.footer = Some(ObservedFooter {
             bank_hash: footer.bank_hash,
             block_producer_time_nanos: footer.block_producer_time_nanos,
+            block_user_agent: footer.block_user_agent.clone(),
         });
         true
     }
@@ -523,6 +542,7 @@ mod tests {
     };
 
     const BANK_HASH: [u8; HASH_BYTES] = [7; HASH_BYTES];
+    const USER_AGENT: &str = "agave/4.0.0";
 
     fn reserved() -> Vec<String> {
         vec![RESERVED_FILTER_NAME.to_string()]
@@ -540,7 +560,7 @@ mod tests {
                 bank_id,
                 bank_hash: bank_hash.to_vec(),
                 block_producer_time_nanos: 42,
-                block_user_agent: vec![],
+                block_user_agent: USER_AGENT.as_bytes().to_vec(),
                 block_final_cert: None,
                 skip_reward_cert: None,
                 notar_reward_cert: None,
@@ -857,6 +877,7 @@ mod tests {
             .expect("footer was the last missing piece");
         assert_eq!(block.events.bank_hash(), Some(BANK_HASH));
         assert_eq!(block.events.block_producer_time_nanos(), Some(42));
+        assert_eq!(block.events.block_user_agent().as_deref(), Some(USER_AGENT));
     }
 
     ///
@@ -891,6 +912,7 @@ mod tests {
         let block = acc.finish_block(bank_id).expect("no footer needed");
         assert_eq!(block.events.bank_hash(), None);
         assert_eq!(block.events.block_producer_time_nanos(), None);
+        assert_eq!(block.events.block_user_agent(), None);
     }
 
     ///
@@ -1050,5 +1072,29 @@ mod tests {
             machine.handle_new_geyser_event(ev_info),
             Err(UntrackedSlot)
         ));
+    }
+
+    ///
+    /// The wire's `block_user_agent` is raw bytes: invalid UTF-8 is replaced by U+FFFD rather
+    /// than dropping the footer, which would leave the bank unable to ever seal.
+    ///
+    #[test]
+    fn non_utf8_user_agent_is_decoded_lossily() {
+        let mut acc = DragonsmouthBlockCumulator::default();
+        let (slot, bank_id) = (60, 6000);
+
+        let mut footer = footer_update(slot, bank_id, reserved());
+        let Some(UpdateOneof::BlockFooter(inner)) = footer.update_oneof.as_mut() else {
+            unreachable!()
+        };
+        inner.block_user_agent = vec![0xff, b'a'];
+        feed(&mut acc, footer);
+        feed_all_but_footer(&mut acc, slot, bank_id);
+
+        let block = acc.finish_block(bank_id).expect("sealed");
+        assert_eq!(
+            block.events.block_user_agent().as_deref(),
+            Some("\u{FFFD}a")
+        );
     }
 }
