@@ -80,9 +80,11 @@ They are expected and harmless.
 8. **Do not add orphan nodes to `Forks`.** `pop_oldest_rooted_slot` only reclaims nodes reachable
    from a root. Call `Forks::mark_slot_as_forked` only on a slot that is already a node
    (`Forks::contains`). Otherwise record it in `forks_history` alone so `gc` pass 1 can purge it.
-9. **Optimistic freeze matches the parent bank by content.** It freezes a still-buffering parent
-   bank only if that bank's last entry hash equals the child's `parent_blockhash`. Never freeze
-   "every buffering bank" at the parent slot.
+9. **A bank freezes only from its own BlockMeta.** Never forge a `BlockSummary`, e.g. from a
+   still-buffering parent bank's last entry hash when a child names it. The optimistic-freeze path
+   that did this was removed: it was never seen firing in production, and its forged summaries
+   (zero `parent_blockhash` and `block_time`) made the real BlockMeta be rejected as a duplicate
+   when it arrived late. A bank whose BlockMeta never arrives waits for `gc` pass 2.
 10. **`FrozenBlock::entries` is sorted by `entry_index`.** The buffer is a hash map, so sort
     explicitly.
 11. **A Dragonsmouth block is complete only once its block footer is observed.** With
@@ -93,12 +95,11 @@ They are expected and harmless.
     is only queued once the bank is frozen: it usually lands after BlockMeta and can land after
     Processed/Confirmed (hence invariant 12). Agave never drops a footer (the producer blocks on a
     full channel), so a bank that never gets one means a broken setup: a non-Alpenglow node, a
-    server without footer support, or a subscription that started mid-slot. A BlockMeta forged for
-    an optimistic freeze gets no exemption. The gate lives only in `DragonsmouthBlockCumulator`:
-    never make the state machine's freeze wait for the footer, because freeze drives resolution,
-    `Forks`, skipped-slot marking and commitment delivery. A duplicate footer, or one naming the
-    wrong slot, is `UNEXPECTED` and dropped. Turn the flag off for a cluster that has no footers
-    (pre-Alpenglow), or no block is ever delivered.
+    server without footer support, or a subscription that started mid-slot. The gate lives only
+    in `DragonsmouthBlockCumulator`: never make the state machine's freeze wait for the footer,
+    because freeze drives resolution, `Forks`, skipped-slot marking and commitment delivery. A
+    duplicate footer, or one naming the wrong slot, is `UNEXPECTED` and dropped. Turn the flag off
+    for a cluster that has no footers (pre-Alpenglow), or no block is ever delivered.
 12. **A commitment update never reaches the consumer before its bank's block.** An accumulator
     can seal a block after the state machine has frozen it and emitted its commitment updates
     (a late footer, sysvar or entry), so `BlockStream` holds each update in `held_commitments`
@@ -119,7 +120,6 @@ one of them.
 | Loses its slot to a sibling bank | `discard_losing_banks` | `BankDiscarded` + DLQ `Discarded` |
 | Slot dead (`SlotDead` / `dead_error`) | `mark_slot_as_dead` | `DeadSlotDetected { bank_ids }` |
 | Slot skipped by a Confirmed/Finalized descendant | `mark_slot_as_skipped` | `BankDiscarded` + DLQ `Discarded` per bank, and `ForksDetected { bank_ids }` the first time the slot is fork-reported |
-| Optimistic freeze impossible | `execute_optimistic_freeze_for_needed_banks` | DLQ `Incomplete` |
 | Slot forked in the graph | `gc` pass 1, once below the oldest rooted slot | `ForksDetected { bank_ids }`, then the `gc` trace |
 | Footer never arrives (`require_block_footer` on) | discard, dead, skip or `gc` signal for the bank; once the slot is Finalized, the held-commitment eviction below | none; `prune_block` logs a warning and `banks_awaiting_footer` counts it until then |
 | Commitment updates held for a block that never seals | `BlockStream::evict_stale_held_commitments`, after `MAX_UNRESOLVED_SLOT_AGE`, prunes the bank | none (its updates are dropped); logs a warning |

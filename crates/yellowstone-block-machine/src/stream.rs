@@ -381,7 +381,7 @@ where
         // Drain DLQ — clean up banks the state machine gave up on, or discarded as losers.
         while let Some(dlq_event) = self.machine.pop_next_dlq() {
             match dlq_event {
-                DeadletterEvent::Incomplete(bank_id) | DeadletterEvent::Discarded(bank_id) => {
+                DeadletterEvent::Discarded(bank_id) => {
                     self.forget_bank(bank_id);
                 }
             }

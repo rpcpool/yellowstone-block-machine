@@ -153,8 +153,7 @@ impl BankBuffer {
     /// footer was observed.
     ///
     /// The footer is unordered relative to BlockMeta (see [`BlockFooterEvInfo`]), so BlockMeta
-    /// arriving says nothing about it. A BlockMeta the state machine forged for an optimistic freeze gets
-    /// no exemption: the footer is still required.
+    /// arriving says nothing about it.
     ///
     const fn is_complete(&self, require_block_footer: bool) -> bool {
         let Some(pending) = self.pending_freeze.as_ref() else {
