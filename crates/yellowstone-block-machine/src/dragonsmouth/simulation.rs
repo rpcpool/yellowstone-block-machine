@@ -525,25 +525,22 @@ impl SimulationBuilder {
     ///   still-arriving body (early), immediately after the body (the common case), or after the
     ///   bank's own `commitment` progression has already been delivered (late -- only possible
     ///   when `plan.commitment` is `Some`, since otherwise there's nothing to be "after");
-    /// - the block footer (unless `plan.skip_footer`) lands at a uniformly random position after
-    ///   the bank's last `Entry` -- agave queues it on the same FIFO channel as the entries -- so
-    ///   it may precede or follow `BlockMeta` and even the commitment progression, as on a leader
-    ///   slot, where the footer is only queued once the bank is frozen.
+    /// - the block footer (unless `plan.skip_footer`) lands immediately before `BlockMeta`,
+    ///   wherever `BlockMeta` lands: the backend always sends a bank's footer, then its
+    ///   `BlockMeta`, then its commitment statuses, in that order.
     ///
     pub fn random_bank(self, rng: &mut impl RngCore, plan: &RandomBlockPlan) -> Self {
         let start = self.events.len();
         let mut this = self.random_bank_without_footer(rng, plan);
         if !plan.skip_footer && !plan.dead {
-            let after_last_entry = this
+            let insert_at = this
                 .events
                 .iter()
                 .enumerate()
                 .skip(start)
-                .filter(|(_, ev)| matches!(ev.update_oneof, Some(UpdateOneof::Entry(_))))
-                .map(|(index, _)| index + 1)
-                .max()
-                .expect("random_bank always emits at least one entry");
-            let insert_at = rng.random_range(after_last_entry..=this.events.len());
+                .find(|(_, ev)| matches!(ev.update_oneof, Some(UpdateOneof::BlockMeta(_))))
+                .map(|(index, _)| index)
+                .expect("a bank that isn't dead always gets a BlockMeta");
             this.events.insert(
                 insert_at,
                 block_footer_update(plan.slot, plan.bank_id, plan.blockhash),
@@ -1180,11 +1177,8 @@ mod tests {
     }
 
     #[test]
-    fn random_bank_emits_exactly_one_footer_after_its_entries_at_a_varying_position() {
-        let mut saw_before_block_meta = false;
-        let mut saw_after_confirmed = false;
-
-        for seed in 0..60u64 {
+    fn random_bank_emits_exactly_one_footer_right_before_its_block_meta() {
+        for seed in 0..20u64 {
             let plan = RandomBlockPlan::new(80, 8_000 + seed)
                 .with_transaction_count(2)
                 .with_entry_count(2)
@@ -1195,27 +1189,9 @@ mod tests {
 
             assert_eq!(events.iter().filter(|ev| is_block_footer(ev)).count(), 1);
             let footer_index = events.iter().position(is_block_footer).unwrap();
-            let last_entry_index = events
-                .iter()
-                .rposition(|ev| matches!(ev.update_oneof, Some(UpdateOneof::Entry(_))))
-                .unwrap();
-            assert!(
-                footer_index > last_entry_index,
-                "the footer shares the entries' FIFO channel, so it must follow every entry"
-            );
             let block_meta_index = events.iter().position(is_block_meta).unwrap();
-            let confirmed_index = events
-                .iter()
-                .position(|ev| slot_status(ev) == Some(SlotStatus::SlotConfirmed as i32))
-                .unwrap();
-            saw_before_block_meta |= footer_index < block_meta_index;
-            saw_after_confirmed |= footer_index > confirmed_index;
+            assert_eq!(footer_index + 1, block_meta_index);
         }
-
-        assert!(
-            saw_before_block_meta && saw_after_confirmed,
-            "across enough seeds, the footer must land both before BlockMeta and after Confirmed"
-        );
     }
 
     #[test]

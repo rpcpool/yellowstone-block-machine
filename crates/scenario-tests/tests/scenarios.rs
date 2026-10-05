@@ -550,8 +550,9 @@ async fn bank_discarded_never_fires_twice_for_the_same_bank_id() {
 
 ///
 /// AGENTS.md invariants 11 and 12: a block is only delivered once its footer arrives, even when
-/// the footer comes after the slot was already confirmed, and the Confirmed update is held until
-/// after the block. The block then carries the footer's bank hash.
+/// the footer comes after the slot was already confirmed (not an order the backend sends, but
+/// one a raw agave source can): the state machine queues the Confirmed update until the bank
+/// freezes, so it still comes after the block. The block then carries the footer's bank hash.
 ///
 #[tokio::test]
 async fn block_is_delivered_only_once_its_footer_arrives() {

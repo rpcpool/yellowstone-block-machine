@@ -73,11 +73,11 @@ pub struct EntryEvInfo {
 ///
 /// A borrowed view over an Alpenglow block footer update.
 ///
-/// Exactly one footer exists per bank. Agave queues it on the same FIFO channel as the bank's
-/// entries, so it always follows all of them, but it is unordered relative to `BlockMeta` and
-/// commitment statuses, which are notified directly from replay. On leader slots it is only
-/// queued once the bank is frozen, so it commonly arrives after `BlockMeta` and can even arrive
-/// after `Processed`/`Confirmed`.
+/// Exactly one footer exists per bank. The Yellowstone backend sends it after all of the bank's
+/// content and right before its `BlockMeta`, followed by its commitment statuses. At the agave
+/// plugin interface it is less ordered: it follows all of the bank's entries, but is unordered
+/// relative to `BlockMeta` and commitment statuses (on leader slots it is only queued once the
+/// bank is frozen).
 ///
 #[derive(Debug, Clone)]
 pub struct BlockFooterEvInfo {

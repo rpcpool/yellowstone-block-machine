@@ -528,9 +528,10 @@ mod tests {
     }
 
     ///
-    /// AGENTS.md invariant 12: on leader slots the footer can arrive after Processed and even
-    /// Confirmed. Those commitment updates are queued by the state machine until the bank
-    /// freezes, so they still come out after the block, in order.
+    /// AGENTS.md invariant 12: the backend never sends this order, but a raw agave source can
+    /// (on leader slots the footer can arrive after Processed and even Confirmed). Those
+    /// commitment updates are queued by the state machine until the bank freezes, so they still
+    /// come out after the block, in order.
     ///
     /// ```text
     /// slot 9 ── slot 10, bank 1000: BlockMeta, Processed, Confirmed ... footer

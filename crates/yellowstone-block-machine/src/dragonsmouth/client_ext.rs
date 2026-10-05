@@ -1,3 +1,5 @@
+// Re-exported so `client_ext::BlockMachineConfig` imports keep working.
+pub use crate::wrapper::BlockMachineConfig;
 use {
     crate::{
         dragonsmouth::{
@@ -20,9 +22,6 @@ use {
         SubscribeRequestFilterBlockFooter, SubscribeRequestFilterSlots, SubscribeUpdate,
     },
 };
-
-// Re-exported so `client_ext::BlockMachineConfig` imports keep working.
-pub use crate::wrapper::BlockMachineConfig;
 
 ///
 /// A stream of [`BlockStreamEvent`] events produced by the block machine, adapted to the `SubscribeUpdate` type used by the gRPC client.
