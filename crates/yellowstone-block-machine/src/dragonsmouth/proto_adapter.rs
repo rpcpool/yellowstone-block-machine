@@ -123,7 +123,6 @@ impl GeyserEventAdapter for SubscribeUpdate {
                     slot: footer.slot,
                     bank_id: footer.bank_id,
                     bank_hash,
-                    block_producer_time_nanos: footer.block_producer_time_nanos,
                     block_user_agent: String::from_utf8_lossy(&footer.block_user_agent)
                         .into_owned(),
                 }))

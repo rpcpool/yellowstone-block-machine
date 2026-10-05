@@ -84,7 +84,6 @@ pub struct BlockFooterEvInfo {
     pub slot: Slot,
     pub bank_id: BankId,
     pub bank_hash: [u8; HASH_BYTES],
-    pub block_producer_time_nanos: u64,
     ///
     /// The user agent of the client that produced the block, decoded as UTF-8 with invalid
     /// sequences replaced by U+FFFD (the wire carries raw bytes).

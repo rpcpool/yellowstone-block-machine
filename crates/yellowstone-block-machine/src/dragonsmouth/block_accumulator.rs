@@ -64,7 +64,6 @@ struct PendingFreeze {
 #[derive(Debug, Clone)]
 struct ObservedFooter {
     bank_hash: [u8; HASH_BYTES],
-    block_producer_time_nanos: u64,
     block_user_agent: String,
 }
 
@@ -180,22 +179,6 @@ impl BankBuffer {
     }
 
     ///
-    /// The time the leader produced the block, in nanoseconds, as reported by the bank's block
-    /// footer.
-    ///
-    /// # Returns
-    ///
-    /// `None` if no footer was observed for this bank, which only happens when
-    /// [`BlockMachineConfig::require_block_footer`](crate::wrapper::BlockMachineConfig::require_block_footer)
-    /// is off.
-    ///
-    pub fn block_producer_time_nanos(&self) -> Option<u64> {
-        self.footer
-            .as_ref()
-            .map(|footer| footer.block_producer_time_nanos)
-    }
-
-    ///
     /// The user agent of the client that produced the block, as reported by the bank's block
     /// footer. The wire carries raw bytes: invalid UTF-8 sequences are replaced by U+FFFD.
     ///
@@ -275,7 +258,6 @@ impl DragonsmouthBlockCumulator {
         }
         block.footer = Some(ObservedFooter {
             bank_hash: footer.bank_hash,
-            block_producer_time_nanos: footer.block_producer_time_nanos,
             block_user_agent: footer.block_user_agent.clone(),
         });
         !sealed
@@ -801,7 +783,6 @@ mod tests {
         assert_eq!(acc.pop_newly_sealed(), Some(bank_id));
         let block = acc.finish_block(bank_id).expect("sealed");
         assert_eq!(block.events.bank_hash(), Some(BANK_HASH));
-        assert_eq!(block.events.block_producer_time_nanos(), Some(42));
         assert_eq!(block.events.block_user_agent().as_deref(), Some(USER_AGENT));
     }
 
@@ -819,7 +800,6 @@ mod tests {
         assert_eq!(acc.pop_newly_sealed(), Some(bank_id));
         let block = acc.finish_block(bank_id).expect("sealed");
         assert_eq!(block.events.bank_hash(), None);
-        assert_eq!(block.events.block_producer_time_nanos(), None);
         assert_eq!(block.events.block_user_agent(), None);
     }
 

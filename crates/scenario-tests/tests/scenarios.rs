@@ -177,7 +177,7 @@ fn random_seed() -> u64 {
 }
 
 #[tokio::test]
-async fn random_block_reconstructs_regardless_of_block_meta_timing() {
+async fn random_block_reconstructs_regardless_of_content_order() {
     let seed = random_seed();
     let slot = 9_000;
     let plan = RandomBlockPlan::new(slot, 900_000)
@@ -204,7 +204,7 @@ async fn random_block_reconstructs_regardless_of_block_meta_timing() {
             BlockMachineOutput::FrozenBlock(block) if block.bank_id == plan.bank_id => Some(block),
             _ => None,
         })
-        .unwrap_or_else(|| panic!("seed {seed}: block never froze regardless of BlockMeta timing"));
+        .unwrap_or_else(|| panic!("seed {seed}: block never froze regardless of content order"));
     assert_eq!(
         frozen.entry_count, plan.entry_count,
         "seed {seed}: entry count mismatch"

@@ -82,19 +82,6 @@ impl DragonsmouthBlock {
     }
 
     ///
-    /// The time the leader produced this block, in nanoseconds, as reported by its Alpenglow
-    /// block footer.
-    ///
-    /// # Returns
-    ///
-    /// `None` only if the stream was built with [`BlockMachineConfig::require_block_footer`] off
-    /// and no footer arrived before the block sealed.
-    ///
-    pub fn block_producer_time_nanos(&self) -> Option<u64> {
-        self.inner.events.block_producer_time_nanos()
-    }
-
-    ///
     /// The user agent of the client that produced this block, as reported by its Alpenglow
     /// block footer. The wire carries raw bytes: invalid UTF-8 sequences are replaced by U+FFFD.
     ///

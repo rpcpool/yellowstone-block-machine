@@ -431,7 +431,6 @@ mod tests {
             slot,
             bank_id,
             bank_hash: [1; 32],
-            block_producer_time_nanos: 0,
             block_user_agent: String::new(),
         })
     }
