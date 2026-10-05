@@ -6,7 +6,7 @@ use {
             DeadletterEvent, ForkDetected, FrozenBlock, MAX_UNRESOLVED_SLOT_AGE,
             SlotCommitmentStatusUpdate,
         },
-        wrapper::BlocksStateMachineWrapper,
+        wrapper::{BlockMachineConfig, BlocksStateMachineWrapper},
     },
     derive_more::From,
     futures_util::{Stream, TryStream, TryStreamExt},
@@ -208,7 +208,10 @@ pub struct BlockStream<Source, Adaptor, Acc> {
     /// Commitment updates for banks whose block wasn't delivered yet, in arrival order. A
     /// commitment update must never reach the consumer before its block: an accumulator may seal
     /// a block later than the state machine freezes it (see
-    /// [`BlockAccumulator::pop_newly_sealed`]), e.g. because its block footer is late.
+    /// [`BlockAccumulator::pop_newly_sealed`]). On a live stream that doesn't happen (sysvars and
+    /// entries always precede BlockMeta, and the driver waits for the footer), but it does for a
+    /// bank already in flight when the subscription started, whose early sysvars were broadcast
+    /// before it: that block never seals, and its commitment updates must not go out without it.
     ///
     held_commitments: FxHashMap<BankId, HeldCommitments>,
     _adapter: PhantomData<Adaptor>,
@@ -230,11 +233,43 @@ impl<Source, Adaptor, Acc> BlockStream<Source, Adaptor, Acc>
 where
     Adaptor: GeyserEventAdapter,
 {
+    ///
+    /// Same as [`BlockStream::new_with_config`] with [`BlockMachineConfig::default`], which
+    /// requires a block footer for every bank.
+    ///
     pub fn new(source: Source, block_acc: Acc, min_commitment_level: CommitmentLevel) -> Self {
+        Self::new_with_config(
+            source,
+            block_acc,
+            min_commitment_level,
+            BlockMachineConfig::default(),
+        )
+    }
+
+    ///
+    /// Creates a stream reconstructing blocks from `source`.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The raw Geyser event stream.
+    /// * `block_acc` - The accumulator storing each bank's content.
+    /// * `min_commitment_level` - Commitment updates below this level are not emitted.
+    /// * `config` - See [`BlockMachineConfig`].
+    ///
+    /// # Returns
+    ///
+    /// The [`BlockStream`].
+    ///
+    pub fn new_with_config(
+        source: Source,
+        block_acc: Acc,
+        min_commitment_level: CommitmentLevel,
+        config: BlockMachineConfig,
+    ) -> Self {
         Self {
             min_commitment_level,
             source,
-            machine: BlocksStateMachineWrapper::new_with_slot_gc_tracing(),
+            machine: BlocksStateMachineWrapper::new_with_slot_gc_tracing().with_config(config),
             storage: block_acc,
             pending: VecDeque::new(),
             delivered_banks: FxHashSet::default(),
@@ -278,12 +313,15 @@ where
     }
 
     ///
-    /// The accumulator this stream stores block content in, for implementation-specific
-    /// introspection (e.g. `DragonsmouthBlockCumulator::banks_awaiting_footer`, behind the
-    /// `dragonsmouth-thin` feature).
+    /// Counts the banks whose BlockMeta arrived but whose block footer did not, so they can't
+    /// freeze yet.
     ///
-    pub const fn accumulator(&self) -> &Acc {
-        &self.storage
+    /// # Returns
+    ///
+    /// See [`BlocksStateMachineWrapper::banks_awaiting_footer`].
+    ///
+    pub fn banks_awaiting_footer(&self) -> usize {
+        self.machine.banks_awaiting_footer()
     }
 
     fn insert_into_storage(&mut self, event: Adaptor::EventT, ev_info: &GeyserEventInfo) {
@@ -725,8 +763,8 @@ impl<E> BlockAccumulator for SimpleBlockAccumulator<E> {
 mod tests {
     use {
         super::{
-            BlockEventStore, BlockMachineOutput, BlockStream, PendingEvent, SimpleBlockAccumulator,
-            SimpleBlockStore,
+            BlockEventStore, BlockMachineConfig, BlockMachineOutput, BlockStream, PendingEvent,
+            SimpleBlockAccumulator, SimpleBlockStore,
         },
         crate::{
             event::GeyserEventAdapter,
@@ -860,10 +898,14 @@ mod tests {
         SubscribeUpdate,
         SimpleBlockAccumulator<SubscribeUpdate>,
     > {
-        BlockStream::new(
+        // These tests build banks without block footers.
+        BlockStream::new_with_config(
             stream::iter(Vec::<Result<SubscribeUpdate, io::Error>>::new()),
             SimpleBlockAccumulator::default(),
             min_commitment_level,
+            BlockMachineConfig {
+                require_block_footer: false,
+            },
         )
     }
 

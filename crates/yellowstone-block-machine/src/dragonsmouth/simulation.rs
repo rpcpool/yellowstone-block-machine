@@ -888,6 +888,7 @@ mod tests {
             dragonsmouth::block_accumulator::DragonsmouthBlockCumulator,
             event::GeyserEventAdapter,
             stream::{BlockMachineOutput, BlockStream},
+            wrapper::BlockMachineConfig,
         },
         std::pin::Pin,
     };
@@ -1236,8 +1237,8 @@ mod tests {
     }
 
     ///
-    /// A bank whose footer never arrives is never delivered by the default (footer-requiring)
-    /// accumulator, but is by one built with `require_block_footer` off.
+    /// A bank whose footer never arrives never freezes by default (footers required), and is
+    /// counted as awaiting its footer; with `require_block_footer` off it is delivered.
     ///
     #[test]
     fn bank_without_footer_is_only_delivered_when_footers_are_not_required() {
@@ -1247,13 +1248,16 @@ mod tests {
                 .bank(&bank)
                 .confirmed(bank.slot, bank.bank_id)
                 .build();
-            let mut block_stream = BlockStream::<_, SubscribeUpdate, _>::new(
+            let mut block_stream = BlockStream::<_, SubscribeUpdate, _>::new_with_config(
                 stream,
-                DragonsmouthBlockCumulator::new(require_block_footer),
+                DragonsmouthBlockCumulator::default(),
                 CommitmentLevel::Confirmed,
+                BlockMachineConfig {
+                    require_block_footer,
+                },
             );
             let outputs = drain(&mut block_stream);
-            let awaiting = block_stream.accumulator().banks_awaiting_footer();
+            let awaiting = block_stream.banks_awaiting_footer();
             let frozen = outputs
                 .iter()
                 .any(|output| matches!(output, BlockMachineOutput::FrozenBlock(_)));
@@ -1265,8 +1269,9 @@ mod tests {
     }
 
     ///
-    /// A block sealing after its slot's commitment updates (here because its footer arrives
-    /// last) is still delivered first, followed by every held commitment update in order.
+    /// A bank whose footer arrives after its slot's commitment updates is still delivered first,
+    /// followed by every commitment update in order (the driver only freezes it once the footer
+    /// arrives, and the state machine queues commitment updates until then).
     ///
     #[test]
     fn commitment_updates_wait_for_a_late_sealing_block() {

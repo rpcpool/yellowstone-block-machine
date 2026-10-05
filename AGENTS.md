@@ -87,26 +87,31 @@ They are expected and harmless.
    when it arrived late. A bank whose BlockMeta never arrives waits for `gc` pass 2.
 10. **`FrozenBlock::entries` is sorted by `entry_index`.** The buffer is a hash map, so sort
     explicitly.
-11. **A Dragonsmouth block is complete only once its block footer is observed.** With
-    `require_block_footer` on (the default), `BankBuffer::is_complete` also needs the bank's
-    Alpenglow footer. There is exactly one footer per bank. Agave queues it on the same FIFO
-    channel as the bank's entries, so it follows all of them, but BlockMeta and slot statuses are
-    notified directly from replay, so the footer is unordered relative to them. On leader slots it
-    is only queued once the bank is frozen: it usually lands after BlockMeta and can land after
-    Processed/Confirmed (hence invariant 12). Agave never drops a footer (the producer blocks on a
-    full channel), so a bank that never gets one means a broken setup: a non-Alpenglow node, a
-    server without footer support, or a subscription that started mid-slot. The gate lives only
-    in `DragonsmouthBlockCumulator`: never make the state machine's freeze wait for the footer,
-    because freeze drives resolution, `Forks`, skipped-slot marking and commitment delivery. A
-    duplicate footer, or one naming the wrong slot, is `UNEXPECTED` and dropped. Turn the flag off
-    for a cluster that has no footers (pre-Alpenglow), or no block is ever delivered.
-12. **A commitment update never reaches the consumer before its bank's block.** An accumulator
-    can seal a block after the state machine has frozen it and emitted its commitment updates
-    (a late footer, sysvar or entry), so `BlockStream` holds each update in `held_commitments`
-    until that bank's block is delivered, then releases them in arrival order right after the
-    block. A bank whose block is never delivered never gets its commitment updates delivered.
-    Every prune path in `BlockStream` goes through `forget_bank`, which also drops the held
-    updates. Never call `storage.prune_block` directly there.
+11. **The driver decides when a block ends; the state machine never sees footers.** A bank's
+    `BlockSummary` is its end-of-block marker, and `BlocksStateMachineWrapper` (the driver) decides
+    when to feed it. With `BlockMachineConfig::require_block_footer` on (the default), it feeds it
+    only once both the bank's BlockMeta and its Alpenglow block footer arrived, in either order,
+    holding whichever came first. With it off, BlockMeta alone ends the block. There is exactly
+    one footer per bank. Agave queues it on the same FIFO channel as the bank's entries, so it
+    follows all of them, but BlockMeta and slot statuses are notified directly from replay, so the
+    footer is unordered relative to them. On leader slots it is only queued once the bank is
+    frozen: it usually lands after BlockMeta and can land after Processed/Confirmed. Agave never
+    drops a footer (the producer blocks on a full channel), so a bank that never gets one means a
+    broken setup: a non-Alpenglow node, a server without footer support, or a subscription that
+    started mid-slot. A duplicate BlockMeta or footer is `UNEXPECTED` and rejected. Don't add
+    footer logic to `BlocksStateMachine` or a footer gate to an accumulator: a frozen bank already
+    has its footer. Turn the flag off for a cluster that has no footers (pre-Alpenglow), or no
+    bank ever freezes.
+12. **A commitment update never reaches the consumer before its bank's block.** The state
+    machine queues a bank's commitment updates until it freezes, which covers a late footer. On a
+    live stream the accumulator then seals at the freeze: sysvars and entries always precede
+    BlockMeta (agave writes every sysvar before freeze and sends BlockMeta after it). The one
+    exception is a bank already in flight when the subscription started, whose early sysvars were
+    broadcast before it: it freezes but never seals. For that, `BlockStream` holds each update in
+    `held_commitments` until that bank's block is delivered, then releases them in arrival order
+    right after the block. A bank whose block is never delivered never gets its commitment
+    updates delivered. Every prune path in `BlockStream` goes through `forget_bank`, which also
+    drops the held updates. Never call `storage.prune_block` directly there.
 
 ## How state is released
 
@@ -121,7 +126,7 @@ one of them.
 | Slot dead (`SlotDead` / `dead_error`) | `mark_slot_as_dead` | `DeadSlotDetected { bank_ids }` |
 | Slot skipped by a Confirmed/Finalized descendant | `mark_slot_as_skipped` | `BankDiscarded` + DLQ `Discarded` per bank, and `ForksDetected { bank_ids }` the first time the slot is fork-reported |
 | Slot forked in the graph | `gc` pass 1, once below the oldest rooted slot | `ForksDetected { bank_ids }`, then the `gc` trace |
-| Footer never arrives (`require_block_footer` on) | discard, dead, skip or `gc` signal for the bank; once the slot is Finalized, the held-commitment eviction below | none; `prune_block` logs a warning and `banks_awaiting_footer` counts it until then |
+| BlockMeta or footer arrives without its counterpart (`require_block_footer` on) | the wrapper drops the held marker after `MAX_UNRESOLVED_SLOT_AGE` (on its `gc` schedule), or as soon as the bank is discarded; the never-frozen bank's state goes through `gc` pass 2 | the `gc` trace; `banks_awaiting_footer` counts it until then, and dropping a BlockMeta logs a warning |
 | Commitment updates held for a block that never seals | `BlockStream::evict_stale_held_commitments`, after `MAX_UNRESOLVED_SLOT_AGE`, prunes the bank | none (its updates are dropped); logs a warning |
 | Anything else stuck | `gc` pass 2, after `MAX_UNRESOLVED_SLOT_AGE` (300s) | the `gc` trace |
 

@@ -578,6 +578,21 @@ impl BlocksStateMachine {
     }
 
     ///
+    /// Whether `bank_id` already froze, i.e. its `BlockSummary` was already processed.
+    ///
+    /// # Arguments
+    ///
+    /// * `bank_id` - The bank to check.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the bank froze and hasn't been torn down since.
+    ///
+    pub fn is_bank_frozen(&self, bank_id: BankId) -> bool {
+        self.frozen_commitment_index.contains_key(&bank_id)
+    }
+
+    ///
     /// Infers a slot's resolved bank_id when it hasn't been named by a direct
     /// Confirmed/Finalized status update yet but there's exactly one known candidate for it —
     /// geyser doesn't guarantee a direct commitment status update arrives for every slot. With

@@ -15,9 +15,11 @@ use {
 
 // Sysvars a bank must be observed to have written before its block is considered complete.
 // Clock and SlotHashes are rewritten inline as part of bank construction -- before `CreatedBank`
-// itself fires; SlotHistory and RecentBlockhashes are written later, as the block freezes, which
-// is exactly why BlockMeta arriving isn't by itself sufficient evidence that the bank's content
-// is all in: BlockMeta and these late Account writes are independent messages that can reorder.
+// itself fires; RecentBlockhashes at the slot's last tick and SlotHistory inside `freeze()`. All
+// four are written before the bank freezes and agave sends BlockMeta only after freeze, so on a
+// live stream they always precede BlockMeta. The gate still matters for a bank already in flight
+// when the subscription started: its early sysvars were broadcast before it, and such a block
+// must never be delivered as complete.
 //
 // These four are deliberately the ones written on *every* slot. Other sysvars -- e.g.
 // SysvarRent/SysvarEpochRewards, which are only rewritten on an epoch boundary -- can arrive
@@ -148,28 +150,20 @@ impl BankBuffer {
 
     ///
     /// A block is only considered finished once: `CreatedBank` was observed, every must-have
-    /// sysvar account was observed, BlockMeta arrived, at least as many entries were observed as
-    /// BlockMeta itself reports, and -- when `require_block_footer` is set -- the bank's block
-    /// footer was observed.
+    /// sysvar account was observed, the bank froze (see [`BlockAccumulator::freeze_block`]), and
+    /// at least as many entries were observed as BlockMeta itself reports.
     ///
-    /// The footer is unordered relative to BlockMeta (see [`BlockFooterEvInfo`]), so BlockMeta
-    /// arriving says nothing about it.
+    /// The block footer isn't checked here: when footers are required, the driver
+    /// ([`crate::wrapper::BlocksStateMachineWrapper`]) only freezes a bank once its footer
+    /// arrived, so a frozen bank already has one.
     ///
-    const fn is_complete(&self, require_block_footer: bool) -> bool {
+    const fn is_complete(&self) -> bool {
         let Some(pending) = self.pending_freeze.as_ref() else {
             return false;
         };
         self.created_bank_seen
             && self.sysvar_bitmask == MUST_HAVE_SYSVAR_ACCOUNTS_MASK
             && self.entries_seen >= pending.entries_count
-            && (!require_block_footer || self.footer.is_some())
-    }
-
-    ///
-    /// Whether BlockMeta arrived but the block footer hasn't yet.
-    ///
-    const fn is_awaiting_footer(&self) -> bool {
-        self.pending_freeze.is_some() && self.footer.is_none()
     }
 
     ///
@@ -177,8 +171,9 @@ impl BankBuffer {
     ///
     /// # Returns
     ///
-    /// `None` if no footer was observed for this bank, which only happens when the
-    /// [`DragonsmouthBlockCumulator`] was built with `require_block_footer` off.
+    /// `None` if no footer was observed for this bank, which only happens when
+    /// [`BlockMachineConfig::require_block_footer`](crate::wrapper::BlockMachineConfig::require_block_footer)
+    /// is off.
     ///
     pub fn bank_hash(&self) -> Option<[u8; HASH_BYTES]> {
         self.footer.as_ref().map(|footer| footer.bank_hash)
@@ -190,8 +185,9 @@ impl BankBuffer {
     ///
     /// # Returns
     ///
-    /// `None` if no footer was observed for this bank, which only happens when the
-    /// [`DragonsmouthBlockCumulator`] was built with `require_block_footer` off.
+    /// `None` if no footer was observed for this bank, which only happens when
+    /// [`BlockMachineConfig::require_block_footer`](crate::wrapper::BlockMachineConfig::require_block_footer)
+    /// is off.
     ///
     pub fn block_producer_time_nanos(&self) -> Option<u64> {
         self.footer
@@ -205,8 +201,9 @@ impl BankBuffer {
     ///
     /// # Returns
     ///
-    /// `None` if no footer was observed for this bank, which only happens when the
-    /// [`DragonsmouthBlockCumulator`] was built with `require_block_footer` off.
+    /// `None` if no footer was observed for this bank, which only happens when
+    /// [`BlockMachineConfig::require_block_footer`](crate::wrapper::BlockMachineConfig::require_block_footer)
+    /// is off.
     ///
     pub fn block_user_agent(&self) -> Option<String> {
         self.footer
@@ -222,66 +219,16 @@ impl BankBuffer {
 ///
 /// A block only moves from `active_block_map` to `frozen_block_map` (becoming eligible for
 /// [`BlockAccumulator::finish_block`]) once [`BlockBuffer::is_complete`] holds -- BlockMeta
-/// arriving is necessary but not sufficient, since some of what it implies (the must-have
-/// sysvars and the block footer in particular) can genuinely still be in flight when it shows up.
+/// arriving is necessary but not sufficient, since a bank already in flight when the
+/// subscription started can be missing some of its content.
+#[derive(Default)]
 pub struct DragonsmouthBlockCumulator {
     active_bank_map: FxHashMap<BankId, BankBuffer>,
     frozen_bank_map: FxHashMap<BankId, BankBuffer>,
     newly_sealed: VecDeque<BankId>,
-    require_block_footer: bool,
-}
-
-impl Default for DragonsmouthBlockCumulator {
-    ///
-    /// Requires a block footer for every bank. See [`DragonsmouthBlockCumulator::new`].
-    ///
-    fn default() -> Self {
-        Self::new(true)
-    }
 }
 
 impl DragonsmouthBlockCumulator {
-    ///
-    /// Creates an empty accumulator.
-    ///
-    /// # Arguments
-    ///
-    /// * `require_block_footer` - Whether a bank only seals once its Alpenglow block footer has
-    ///   been observed. Turn it off for a cluster that doesn't produce footers (pre-Alpenglow):
-    ///   with it on, no block would ever seal there.
-    ///
-    /// # Returns
-    ///
-    /// A [`DragonsmouthBlockCumulator`] holding no banks.
-    ///
-    pub fn new(require_block_footer: bool) -> Self {
-        Self {
-            active_bank_map: FxHashMap::default(),
-            frozen_bank_map: FxHashMap::default(),
-            newly_sealed: VecDeque::new(),
-            require_block_footer,
-        }
-    }
-
-    ///
-    /// Counts the banks whose BlockMeta arrived but whose block footer did not.
-    ///
-    /// # Returns
-    ///
-    /// The number of such banks. Always `0` when `require_block_footer` is off. A value that
-    /// keeps growing means the stream isn't delivering footers: either the cluster isn't on
-    /// Alpenglow, or the subscription lacks a `block_footer` filter.
-    ///
-    pub fn banks_awaiting_footer(&self) -> usize {
-        if !self.require_block_footer {
-            return 0;
-        }
-        self.active_bank_map
-            .values()
-            .filter(|block| block.is_awaiting_footer())
-            .count()
-    }
-
     ///
     /// Records `footer` as `bank_id`'s block footer, unless the bank already has one or the
     /// footer names a different slot than the bank's own.
@@ -293,27 +240,24 @@ impl DragonsmouthBlockCumulator {
     ///
     /// # Returns
     ///
-    /// `true` if the footer was recorded, `false` if it was refused. A refused footer must not be
-    /// stored for delivery either.
+    /// `true` if the footer was recorded on a bank still being built, so the raw update can be
+    /// stored for delivery like any other event. `false` if it was refused, or recorded on an
+    /// already-sealed bank (only possible with footers not required, where a footer may arrive
+    /// after the block sealed): the raw update must not be stored in either case, since a sealed
+    /// bank takes no new events and a new buffer for it would never seal.
     ///
     fn record_footer(&mut self, bank_id: BankId, footer: &BlockFooterEvInfo) -> bool {
-        // Checked before the auto-vivifying lookup below, which would otherwise hide a duplicate
-        // for an already-sealed bank behind a new empty buffer.
-        let already_sealed_with_footer = self
-            .frozen_bank_map
-            .get(&bank_id)
-            .is_some_and(|block| block.footer.is_some());
-        if already_sealed_with_footer {
-            tracing::error!(
-                "UNEXPECTED: duplicate block footer for already-sealed bank {bank_id} (slot {}). Dropping.",
-                footer.slot
-            );
-            return false;
-        }
-        let block = self
-            .active_bank_map
-            .entry(bank_id)
-            .or_insert_with(|| BankBuffer::new(bank_id, footer.slot));
+        // Look the bank up in both maps before auto-vivifying anything, so a footer for a sealed
+        // bank lands on that bank rather than on a new empty buffer.
+        let (block, sealed) = match self.frozen_bank_map.get_mut(&bank_id) {
+            Some(block) => (block, true),
+            None => (
+                self.active_bank_map
+                    .entry(bank_id)
+                    .or_insert_with(|| BankBuffer::new(bank_id, footer.slot)),
+                false,
+            ),
+        };
         if block.footer.is_some() {
             tracing::error!(
                 "UNEXPECTED: duplicate block footer for bank {bank_id} (slot {}). Dropping.",
@@ -334,7 +278,7 @@ impl DragonsmouthBlockCumulator {
             block_producer_time_nanos: footer.block_producer_time_nanos,
             block_user_agent: footer.block_user_agent.clone(),
         });
-        true
+        !sealed
     }
 
     ///
@@ -345,7 +289,7 @@ impl DragonsmouthBlockCumulator {
         let Some(block) = self.active_bank_map.get(&bank_id) else {
             return;
         };
-        if !block.is_complete(self.require_block_footer) {
+        if !block.is_complete() {
             return;
         }
         let mut block = self
@@ -508,14 +452,7 @@ impl BlockAccumulator for DragonsmouthBlockCumulator {
     }
 
     fn prune_block(&mut self, bank_id: BankId) {
-        if let Some(block) = self.active_bank_map.remove(&bank_id) {
-            if self.require_block_footer && block.is_awaiting_footer() {
-                tracing::warn!(
-                    "Pruning bank {bank_id} (slot {}) whose BlockMeta arrived but whose block footer never did -- is the cluster on Alpenglow, and is the stream subscribed to block footers?",
-                    block.slot
-                );
-            }
-        }
+        self.active_bank_map.remove(&bank_id);
         self.frozen_bank_map.remove(&bank_id);
     }
 
@@ -849,76 +786,64 @@ mod tests {
     }
 
     ///
-    /// AGENTS.md invariant 11: with footers required, BlockMeta plus every other completeness
-    /// condition is not enough -- the bank only seals once its footer arrives, even when the
-    /// footer is the very last event.
+    /// The footer's fields are exposed on the sealed block. The footer arrives first here, which
+    /// agave never does (the footer follows all of the bank's entries, which follow
+    /// `CreatedBank`), but the buffer auto-vivifies on any event, so it must still be kept.
     ///
     #[test]
-    fn block_does_not_seal_until_footer_observed() {
+    fn footer_fields_are_exposed_on_the_sealed_block() {
         let mut acc = DragonsmouthBlockCumulator::default();
         let (slot, bank_id) = (50, 5000);
 
+        feed(&mut acc, footer_update(slot, bank_id, reserved()));
         feed_all_but_footer(&mut acc, slot, bank_id);
 
-        assert!(
-            acc.finish_block(bank_id).is_none(),
-            "must not seal: the block footer is still missing"
-        );
-        assert!(acc.pop_newly_sealed().is_none());
-        assert_eq!(acc.banks_awaiting_footer(), 1);
-
-        feed(&mut acc, footer_update(slot, bank_id, reserved()));
-
-        assert_eq!(acc.banks_awaiting_footer(), 0);
         assert_eq!(acc.pop_newly_sealed(), Some(bank_id));
-        let block = acc
-            .finish_block(bank_id)
-            .expect("footer was the last missing piece");
+        let block = acc.finish_block(bank_id).expect("sealed");
         assert_eq!(block.events.bank_hash(), Some(BANK_HASH));
         assert_eq!(block.events.block_producer_time_nanos(), Some(42));
         assert_eq!(block.events.block_user_agent().as_deref(), Some(USER_AGENT));
     }
 
     ///
-    /// Agave never sends this order (the footer follows all of the bank's entries, which follow
-    /// `CreatedBank`), but the buffer auto-vivifies on any event, so a footer seen first must
-    /// still count rather than be lost to a buffer that `CreatedBank` would replace.
+    /// AGENTS.md invariant 11: the footer gate lives in the driver, not here. A frozen bank seals
+    /// without a footer (only possible with footers not required) and reports no footer fields.
     ///
     #[test]
-    fn footer_arriving_before_created_bank_still_counts() {
+    fn block_without_footer_seals_and_reports_no_footer_fields() {
         let mut acc = DragonsmouthBlockCumulator::default();
-        let (slot, bank_id) = (51, 5100);
-
-        feed(&mut acc, footer_update(slot, bank_id, reserved()));
-        feed_all_but_footer(&mut acc, slot, bank_id);
-
-        assert_eq!(acc.pop_newly_sealed(), Some(bank_id));
-        assert!(acc.finish_block(bank_id).is_some());
-    }
-
-    ///
-    /// With `require_block_footer` off (pre-Alpenglow), a bank seals without a footer and
-    /// reports no footer fields.
-    ///
-    #[test]
-    fn footer_not_required_when_disabled() {
-        let mut acc = DragonsmouthBlockCumulator::new(false);
         let (slot, bank_id) = (52, 5200);
 
         feed_all_but_footer(&mut acc, slot, bank_id);
 
-        assert_eq!(acc.banks_awaiting_footer(), 0);
         assert_eq!(acc.pop_newly_sealed(), Some(bank_id));
-        let block = acc.finish_block(bank_id).expect("no footer needed");
+        let block = acc.finish_block(bank_id).expect("sealed");
         assert_eq!(block.events.bank_hash(), None);
         assert_eq!(block.events.block_producer_time_nanos(), None);
         assert_eq!(block.events.block_user_agent(), None);
     }
 
     ///
-    /// Same delivery rule as sysvars: a footer only present because of the reserved filter
-    /// counts toward completeness but isn't handed to the client; one that also matched the
-    /// client's own filter is.
+    /// With footers not required, a footer can arrive after its bank sealed. It is recorded on
+    /// the sealed bank instead of starting a new buffer that would never seal.
+    ///
+    #[test]
+    fn footer_after_seal_is_recorded_on_the_sealed_bank() {
+        let mut acc = DragonsmouthBlockCumulator::default();
+        let (slot, bank_id) = (51, 5100);
+
+        feed_all_but_footer(&mut acc, slot, bank_id);
+        assert_eq!(acc.pop_newly_sealed(), Some(bank_id));
+        feed(&mut acc, footer_update(slot, bank_id, reserved()));
+
+        assert!(!acc.active_bank_map.contains_key(&bank_id));
+        let block = acc.finish_block(bank_id).expect("sealed");
+        assert_eq!(block.events.bank_hash(), Some(BANK_HASH));
+    }
+
+    ///
+    /// Same delivery rule as sysvars: a footer only present because of the reserved filter is
+    /// recorded but isn't handed to the client; one that also matched the client's own filter is.
     ///
     #[test]
     fn footer_is_only_delivered_if_the_client_wanted_it() {
@@ -1007,37 +932,20 @@ mod tests {
     }
 
     ///
-    /// A footer naming a different slot than the bank it targets is UNEXPECTED and must not
-    /// satisfy that bank's footer requirement.
+    /// A footer naming a different slot than the bank it targets is UNEXPECTED and is not
+    /// recorded.
     ///
     #[test]
     fn footer_for_the_wrong_slot_is_dropped() {
         let mut acc = DragonsmouthBlockCumulator::default();
         let (slot, bank_id) = (57, 5700);
 
-        feed_all_but_footer(&mut acc, slot, bank_id);
+        feed(&mut acc, created_bank_update(slot, bank_id));
         feed(&mut acc, footer_update(slot + 1, bank_id, reserved()));
-
-        assert!(acc.pop_newly_sealed().is_none());
-        assert_eq!(acc.banks_awaiting_footer(), 1);
-    }
-
-    ///
-    /// Pruning a bank still waiting on its footer clears it from the counter (and logs a warning
-    /// that the footer never came).
-    ///
-    #[test]
-    fn pruning_a_bank_awaiting_its_footer_clears_the_counter() {
-        let mut acc = DragonsmouthBlockCumulator::default();
-        let (slot, bank_id) = (58, 5800);
-
         feed_all_but_footer(&mut acc, slot, bank_id);
-        assert_eq!(acc.banks_awaiting_footer(), 1);
 
-        acc.prune_block(bank_id);
-
-        assert_eq!(acc.banks_awaiting_footer(), 0);
-        assert!(acc.finish_block(bank_id).is_none());
+        let block = acc.finish_block(bank_id).expect("sealed");
+        assert_eq!(block.events.bank_hash(), None);
     }
 
     ///

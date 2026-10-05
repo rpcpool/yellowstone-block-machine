@@ -21,6 +21,9 @@ use {
     },
 };
 
+// Re-exported so `client_ext::BlockMachineConfig` imports keep working.
+pub use crate::wrapper::BlockMachineConfig;
+
 ///
 /// A stream of [`BlockStreamEvent`] events produced by the block machine, adapted to the `SubscribeUpdate` type used by the gRPC client.
 pub struct DragonsmouthBlockStream {
@@ -151,10 +154,10 @@ impl DragonsmouthBlockStream {
     ///
     /// # Returns
     ///
-    /// See [`DragonsmouthBlockCumulator::banks_awaiting_footer`].
+    /// See [`BlocksStateMachineWrapper::banks_awaiting_footer`](crate::wrapper::BlocksStateMachineWrapper::banks_awaiting_footer).
     ///
     pub fn banks_awaiting_footer(&self) -> usize {
-        self.inner.accumulator().banks_awaiting_footer()
+        self.inner.banks_awaiting_footer()
     }
 }
 
@@ -191,28 +194,6 @@ impl Stream for DragonsmouthBlockStream {
             }
             Some(Err(e)) => std::task::Poll::Ready(Some(Err(BlockMachineError::GrpcError(e)))),
             None => std::task::Poll::Ready(None),
-        }
-    }
-}
-
-///
-/// Options for [`GeyserGrpcExt::subscribe_block_with_config`].
-///
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BlockMachineConfig {
-    ///
-    /// Whether a block is only delivered once its Alpenglow block footer has been observed. When
-    /// set, `subscribe_block` also subscribes to block footers (metadata only, no certificates).
-    /// Turn it off for a cluster that doesn't produce footers (pre-Alpenglow): with it on, no
-    /// block would ever be delivered there. Defaults to `true`.
-    ///
-    pub require_block_footer: bool,
-}
-
-impl Default for BlockMachineConfig {
-    fn default() -> Self {
-        Self {
-            require_block_footer: true,
         }
     }
 }
@@ -329,10 +310,11 @@ impl GeyserGrpcExt for GeyserGrpcClient {
 
         let (_sink, source) = self.subscribe_with_request(Some(subscribe_request)).await?;
 
-        let block_stream = BlockStream::new(
+        let block_stream = BlockStream::new_with_config(
             source,
-            DragonsmouthBlockCumulator::new(config.require_block_footer),
+            DragonsmouthBlockCumulator::default(),
             commitment_level,
+            config,
         );
         let dragonsmouth_block_stream = DragonsmouthBlockStream {
             inner: block_stream,
