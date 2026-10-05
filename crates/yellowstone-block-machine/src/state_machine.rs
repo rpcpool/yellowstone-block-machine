@@ -20,7 +20,7 @@ pub enum SlotLifecycle {
     Dead,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotCommitmentStatusUpdate {
     pub parent_slot: Option<Slot>,
     pub slot: Slot,

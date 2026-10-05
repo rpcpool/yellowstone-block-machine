@@ -1,6 +1,9 @@
 use {
     crate::{
-        event::{BlockMetaEvInfo, EntryEvInfo, GeyserEventInfo, SlotStatusKind, SlotUpdateEvInfo},
+        event::{
+            BlockFooterEvInfo, BlockMetaEvInfo, EntryEvInfo, GeyserEventInfo, SlotStatusKind,
+            SlotUpdateEvInfo,
+        },
         forks::Forks,
         state_machine::{
             BlockStateMachineOutput, BlockSummary, BlocksStateMachine, DeadletterEvent, EntryInfo,
@@ -179,7 +182,11 @@ impl BlocksStateMachineWrapper {
             GeyserEventInfo::Slot(slot_update) => self.handle_slot_update(slot_update),
             GeyserEventInfo::BlockMeta(block_meta) => self.handle_block_meta(block_meta),
             GeyserEventInfo::Entry(entry) => self.handle_block_entry(entry),
-            GeyserEventInfo::BankData { bank_id, .. }
+            // The state machine never needs the footer: requiring it for completeness is the
+            // accumulator's job (see `DragonsmouthBlockCumulator`), so only gate it on the bank
+            // still being trackable, like any other content event.
+            GeyserEventInfo::BlockFooter(BlockFooterEvInfo { bank_id, .. })
+            | GeyserEventInfo::BankData { bank_id, .. }
             | GeyserEventInfo::SysvarAccount { bank_id, .. } => {
                 if self.sm.is_bank_trackable(bank_id) {
                     Ok(())

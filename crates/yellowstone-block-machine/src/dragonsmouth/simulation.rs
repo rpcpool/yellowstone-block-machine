@@ -2,7 +2,7 @@
 //! validator or gRPC connection.
 //!
 //! [`SimulationBuilder`] programs a sequence of wire-shaped [`SubscribeUpdate`] events -- slot
-//! lifecycle transitions, sysvar/account writes, entries, block metadata -- and [`build`] turns
+//! lifecycle transitions, sysvar/account writes, entries, block metadata, block footers -- and [`build`] turns
 //! it into a [`SimulatedGeyserStream`], a plain [`Stream`] of `Result<SubscribeUpdate, Infallible>`
 //! that can be fed directly to [`crate::stream::BlockStream`] (or anything else generic over a
 //! `TryStream<Ok = SubscribeUpdate>`) in place of a real `GeyserStream`.
@@ -66,8 +66,8 @@ use {
     },
     yellowstone_grpc_proto::geyser::{
         SlotStatus, SubscribeUpdate, SubscribeUpdateAccount, SubscribeUpdateAccountInfo,
-        SubscribeUpdateBlockMeta, SubscribeUpdateEntry, SubscribeUpdateSlot,
-        SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
+        SubscribeUpdateBlockFooter, SubscribeUpdateBlockMeta, SubscribeUpdateEntry,
+        SubscribeUpdateSlot, SubscribeUpdateTransaction, SubscribeUpdateTransactionInfo,
         SubscribeUpdateTransactionStatus, subscribe_update::UpdateOneof,
     },
 };
@@ -239,6 +239,26 @@ fn block_meta_update(
 }
 
 ///
+/// A bank's Alpenglow block footer. `bank_hash` is derived from `blockhash` purely so each
+/// simulated bank gets a distinct, recognizable value.
+///
+fn block_footer_update(slot: Slot, bank_id: BankId, bank_hash: Hash) -> SubscribeUpdate {
+    wrap(
+        UpdateOneof::BlockFooter(SubscribeUpdateBlockFooter {
+            slot,
+            bank_id,
+            bank_hash: bank_hash.to_bytes().to_vec(),
+            block_producer_time_nanos: 0,
+            block_user_agent: vec![],
+            block_final_cert: None,
+            skip_reward_cert: None,
+            notar_reward_cert: None,
+        }),
+        vec![crate::dragonsmouth::RESERVED_FILTER_NAME.to_string()],
+    )
+}
+
+///
 /// The wire-level `SlotStatus` progression a bank passes through on its way to `level` --
 /// `Processed` always comes first (a real validator never emits `Confirmed`/`Finalized` for a
 /// bank_id it hasn't already reported `Processed` for).
@@ -258,7 +278,8 @@ const fn commitment_progression(level: CommitmentLevel) -> &'static [SlotStatus]
 ///
 /// A single candidate block for a slot -- everything [`SimulationBuilder::bank`] needs to
 /// generate that bank's full happy-path event sequence: `CreatedBank`, the four must-have sysvar
-/// accounts (see [`MUST_HAVE_SYSVAR_ACCOUNTS`]), `entry_count` `Entry` events, and `BlockMeta`.
+/// accounts (see [`MUST_HAVE_SYSVAR_ACCOUNTS`]), `entry_count` `Entry` events, the block footer,
+/// and `BlockMeta`.
 ///
 #[derive(Debug, Clone)]
 pub struct SimulatedBank {
@@ -276,6 +297,10 @@ pub struct SimulatedBank {
     /// Unix timestamp reported in this bank's `BlockMeta`. `0` if unset.
     ///
     pub block_time: i64,
+    ///
+    /// If set, this bank's block footer is never delivered, as on a pre-Alpenglow cluster.
+    ///
+    pub skip_footer: bool,
 }
 
 impl SimulatedBank {
@@ -288,6 +313,7 @@ impl SimulatedBank {
             blockhash: Hash::new_unique(),
             entry_count: 1,
             block_time: 0,
+            skip_footer: false,
         }
     }
 
@@ -309,6 +335,11 @@ impl SimulatedBank {
 
     pub const fn with_block_time(mut self, block_time: i64) -> Self {
         self.block_time = block_time;
+        self
+    }
+
+    pub const fn with_skip_footer(mut self) -> Self {
+        self.skip_footer = true;
         self
     }
 }
@@ -352,6 +383,10 @@ pub struct RandomBlockPlan {
     ///
     pub dead: bool,
     pub block_time: i64,
+    ///
+    /// If set, this bank's block footer is never delivered, as on a pre-Alpenglow cluster.
+    ///
+    pub skip_footer: bool,
 }
 
 impl RandomBlockPlan {
@@ -368,6 +403,7 @@ impl RandomBlockPlan {
             commitment: None,
             dead: false,
             block_time: 0,
+            skip_footer: false,
         }
     }
 
@@ -411,6 +447,11 @@ impl RandomBlockPlan {
         self.block_time = block_time;
         self
     }
+
+    pub const fn with_skip_footer(mut self) -> Self {
+        self.skip_footer = true;
+        self
+    }
 }
 
 ///
@@ -429,7 +470,8 @@ impl SimulationBuilder {
 
     ///
     /// Appends `bank`'s full happy-path event sequence: `CreatedBank`, the must-have sysvar
-    /// accounts, `bank.entry_count` `Entry` events, then `BlockMeta`. Call this once per
+    /// accounts, `bank.entry_count` `Entry` events, the block footer (unless
+    /// `bank.skip_footer`), then `BlockMeta`. Call this once per
     /// candidate block -- e.g. up to 7 times with the same `slot` and different `bank_id`s to
     /// simulate the maximum number of distinct blocks Alpenglow allows a correct node to hold
     /// for one slot -- and follow up with [`Self::confirmed`]/[`Self::finalized`]/[`Self::dead`]
@@ -450,6 +492,10 @@ impl SimulationBuilder {
         for index in 0..bank.entry_count {
             self.events
                 .push_back(entry_update(bank.slot, index, bank.bank_id));
+        }
+        if !bank.skip_footer {
+            self.events
+                .push_back(block_footer_update(bank.slot, bank.bank_id, bank.blockhash));
         }
         self.events.push_back(block_meta_update(
             bank.slot,
@@ -478,9 +524,29 @@ impl SimulationBuilder {
     /// - `BlockMeta`'s delivery timing is randomized to one of three cases: mixed into the
     ///   still-arriving body (early), immediately after the body (the common case), or after the
     ///   bank's own `commitment` progression has already been delivered (late -- only possible
-    ///   when `plan.commitment` is `Some`, since otherwise there's nothing to be "after").
+    ///   when `plan.commitment` is `Some`, since otherwise there's nothing to be "after");
+    /// - the block footer (unless `plan.skip_footer`) lands at a uniformly random position
+    ///   anywhere in the bank's sequence, even before `CreatedBank` or after the commitment
+    ///   progression: the wire doesn't order it relative to anything else.
     ///
-    pub fn random_bank(mut self, rng: &mut impl RngCore, plan: &RandomBlockPlan) -> Self {
+    pub fn random_bank(self, rng: &mut impl RngCore, plan: &RandomBlockPlan) -> Self {
+        let start = self.events.len();
+        let mut this = self.random_bank_without_footer(rng, plan);
+        if !plan.skip_footer && !plan.dead {
+            let insert_at = rng.random_range(start..=this.events.len());
+            this.events.insert(
+                insert_at,
+                block_footer_update(plan.slot, plan.bank_id, plan.blockhash),
+            );
+        }
+        this
+    }
+
+    fn random_bank_without_footer(
+        mut self,
+        rng: &mut impl RngCore,
+        plan: &RandomBlockPlan,
+    ) -> Self {
         let entry_count = plan.entry_count.max(1);
 
         // The four must-have sysvars arrive before `CreatedBank` itself.
@@ -655,6 +721,16 @@ impl SimulationBuilder {
     ///
     pub fn extend(mut self, events: impl IntoIterator<Item = SubscribeUpdate>) -> Self {
         self.events.extend(events);
+        self
+    }
+
+    ///
+    /// Appends a block footer for `bank_id`, e.g. to deliver one late for a bank built with
+    /// `with_skip_footer`.
+    ///
+    pub fn block_footer(mut self, slot: Slot, bank_id: BankId, bank_hash: Hash) -> Self {
+        self.events
+            .push_back(block_footer_update(slot, bank_id, bank_hash));
         self
     }
 
@@ -837,8 +913,8 @@ mod tests {
         let bank = SimulatedBank::new(10, 1000).with_entry_count(3);
         let events = SimulationBuilder::new().bank(&bank).into_events();
 
-        // CreatedBank + 4 must-have sysvars + 3 entries + BlockMeta.
-        assert_eq!(events.len(), 1 + 4 + 3 + 1);
+        // CreatedBank + 4 must-have sysvars + 3 entries + BlockFooter + BlockMeta.
+        assert_eq!(events.len(), 1 + 4 + 3 + 1 + 1);
         for event in &events {
             let ev_info = SubscribeUpdate::extract_geyser_ev_info(event)
                 .expect("every simulated event must be recognized by the crate's own adapter");
@@ -1085,6 +1161,133 @@ mod tests {
         assert!(
             !reached.contains_key(&sibling.bank_id),
             "a sibling given no commitment must never itself be reported as resolved"
+        );
+    }
+
+    fn is_block_footer(event: &SubscribeUpdate) -> bool {
+        matches!(event.update_oneof, Some(UpdateOneof::BlockFooter(_)))
+    }
+
+    #[test]
+    fn random_bank_emits_exactly_one_footer_at_a_varying_position() {
+        let mut saw_before_created_bank = false;
+        let mut saw_after_block_meta = false;
+
+        for seed in 0..60u64 {
+            let plan = RandomBlockPlan::new(80, 8_000 + seed)
+                .with_transaction_count(2)
+                .with_entry_count(2)
+                .with_commitment(CommitmentLevel::Confirmed);
+            let events = SimulationBuilder::new()
+                .random_bank(&mut seeded_rng(seed), &plan)
+                .into_events();
+
+            assert_eq!(events.iter().filter(|ev| is_block_footer(ev)).count(), 1);
+            let footer_index = events.iter().position(is_block_footer).unwrap();
+            let created_bank_index = events
+                .iter()
+                .position(|ev| slot_status(ev) == Some(SlotStatus::SlotCreatedBank as i32))
+                .unwrap();
+            let block_meta_index = events.iter().position(is_block_meta).unwrap();
+            saw_before_created_bank |= footer_index < created_bank_index;
+            saw_after_block_meta |= footer_index > block_meta_index;
+        }
+
+        assert!(
+            saw_before_created_bank && saw_after_block_meta,
+            "across enough seeds, the footer must land both before CreatedBank and after BlockMeta"
+        );
+    }
+
+    #[test]
+    fn skip_footer_and_dead_banks_emit_no_footer() {
+        let bank = SimulatedBank::new(81, 8100).with_skip_footer();
+        let events = SimulationBuilder::new().bank(&bank).into_events();
+        assert!(!events.iter().any(is_block_footer));
+
+        let mut rng = seeded_rng(1);
+        for plan in [
+            RandomBlockPlan::new(82, 8200).with_skip_footer(),
+            RandomBlockPlan::new(83, 8300).with_dead(),
+        ] {
+            let events = SimulationBuilder::new()
+                .random_bank(&mut rng, &plan)
+                .into_events();
+            assert!(!events.iter().any(is_block_footer));
+        }
+    }
+
+    ///
+    /// A bank whose footer never arrives is never delivered by the default (footer-requiring)
+    /// accumulator, but is by one built with `require_block_footer` off.
+    ///
+    #[test]
+    fn bank_without_footer_is_only_delivered_when_footers_are_not_required() {
+        let bank = SimulatedBank::new(84, 8400).with_skip_footer();
+        let frozen = |require_block_footer: bool| {
+            let stream = SimulationBuilder::new()
+                .bank(&bank)
+                .confirmed(bank.slot, bank.bank_id)
+                .build();
+            let mut block_stream = BlockStream::<_, SubscribeUpdate, _>::new(
+                stream,
+                DragonsmouthBlockCumulator::new(require_block_footer),
+                CommitmentLevel::Confirmed,
+            );
+            let outputs = drain(&mut block_stream);
+            let awaiting = block_stream.accumulator().banks_awaiting_footer();
+            let frozen = outputs
+                .iter()
+                .any(|output| matches!(output, BlockMachineOutput::FrozenBlock(_)));
+            (frozen, awaiting)
+        };
+
+        assert_eq!(frozen(true), (false, 1));
+        assert_eq!(frozen(false), (true, 0));
+    }
+
+    ///
+    /// A block sealing after its slot's commitment updates (here because its footer arrives
+    /// last) is still delivered first, followed by every held commitment update in order.
+    ///
+    #[test]
+    fn commitment_updates_wait_for_a_late_sealing_block() {
+        let bank = SimulatedBank::new(85, 8500).with_skip_footer();
+        let stream = SimulationBuilder::new()
+            .bank(&bank)
+            .processed(bank.slot, bank.bank_id)
+            .confirmed(bank.slot, bank.bank_id)
+            .block_footer(bank.slot, bank.bank_id, bank.blockhash)
+            .build();
+        let mut block_stream = BlockStream::<_, SubscribeUpdate, _>::new(
+            stream,
+            DragonsmouthBlockCumulator::default(),
+            CommitmentLevel::Processed,
+        );
+
+        let order: Vec<Option<CommitmentLevel>> = drain(&mut block_stream)
+            .into_iter()
+            .filter_map(|output| match output {
+                BlockMachineOutput::FrozenBlock(block) if block.bank_id == bank.bank_id => {
+                    Some(None)
+                }
+                BlockMachineOutput::SlotCommitmentUpdate(update)
+                    if update.bank_id == bank.bank_id =>
+                {
+                    Some(Some(update.commitment))
+                }
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            order,
+            vec![
+                None,
+                Some(CommitmentLevel::Processed),
+                Some(CommitmentLevel::Confirmed)
+            ],
+            "the block first, then its commitment updates in arrival order"
         );
     }
 }

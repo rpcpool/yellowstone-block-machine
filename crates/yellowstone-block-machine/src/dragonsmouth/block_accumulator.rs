@@ -1,7 +1,7 @@
 use {
     crate::{
         dragonsmouth::RESERVED_FILTER_NAME,
-        event::{GeyserEventInfo, SlotStatusKind},
+        event::{BlockFooterEvInfo, GeyserEventInfo, SlotStatusKind},
         state_machine::FrozenBlock,
         stream::{Block, BlockAccumulator, BlockEventStore},
     },
@@ -55,6 +55,16 @@ struct PendingFreeze {
     block_time: u64,
 }
 
+///
+/// The parts of a bank's block footer this crate keeps once it is observed, regardless of
+/// whether the client's own subscription asked for the raw footer update.
+///
+#[derive(Debug, Clone, Copy)]
+struct ObservedFooter {
+    bank_hash: [u8; HASH_BYTES],
+    block_producer_time_nanos: u64,
+}
+
 #[derive(Debug)]
 pub struct BankBuffer {
     slot: Slot,
@@ -66,8 +76,10 @@ pub struct BankBuffer {
     transaction_idx_map: Vec<usize>,
     transaction_status_map: Vec<usize>,
     entry_idx_map: Vec<usize>,
+    block_footer_idx: Option<usize>,
     created_bank_seen: bool,
     sysvar_bitmask: u8,
+    footer: Option<ObservedFooter>,
     // Every Entry observed for this bank, regardless of whether the client's own subscription
     // wants entries delivered -- independent of `entry_idx_map`, which only tracks
     // client-visible ones. Needed so the entry-count check below isn't skewed by filtering.
@@ -92,6 +104,7 @@ impl BlockEventStore for BankBuffer {
             + self.transaction_idx_map.len()
             + self.transaction_status_map.len()
             + self.entry_idx_map.len()
+            + usize::from(self.block_footer_idx.is_some())
     }
 
     fn blockhash(&self) -> [u8; HASH_BYTES] {
@@ -118,8 +131,10 @@ impl BankBuffer {
             transaction_idx_map: Vec::new(),
             entry_idx_map: Vec::new(),
             transaction_status_map: Vec::new(),
+            block_footer_idx: None,
             created_bank_seen: false,
             sysvar_bitmask: 0,
+            footer: None,
             entries_seen: 0,
             pending_freeze: None,
             entry_count: 0,
@@ -132,16 +147,54 @@ impl BankBuffer {
 
     ///
     /// A block is only considered finished once: `CreatedBank` was observed, every must-have
-    /// sysvar account was observed, BlockMeta arrived, and at least as many entries were
-    /// observed as BlockMeta itself reports.
+    /// sysvar account was observed, BlockMeta arrived, at least as many entries were observed as
+    /// BlockMeta itself reports, and -- when `require_block_footer` is set -- the bank's block
+    /// footer was observed.
     ///
-    const fn is_complete(&self) -> bool {
+    /// The footer is unordered relative to every other event of the bank, so BlockMeta arriving
+    /// says nothing about it. A BlockMeta the state machine forged for an optimistic freeze gets
+    /// no exemption: the footer is still required.
+    ///
+    const fn is_complete(&self, require_block_footer: bool) -> bool {
         let Some(pending) = self.pending_freeze.as_ref() else {
             return false;
         };
         self.created_bank_seen
             && self.sysvar_bitmask == MUST_HAVE_SYSVAR_ACCOUNTS_MASK
             && self.entries_seen >= pending.entries_count
+            && (!require_block_footer || self.footer.is_some())
+    }
+
+    ///
+    /// Whether BlockMeta arrived but the block footer hasn't yet.
+    ///
+    const fn is_awaiting_footer(&self) -> bool {
+        self.pending_freeze.is_some() && self.footer.is_none()
+    }
+
+    ///
+    /// The bank hash reported by the bank's block footer.
+    ///
+    /// # Returns
+    ///
+    /// `None` if no footer was observed for this bank, which only happens when the
+    /// [`DragonsmouthBlockCumulator`] was built with `require_block_footer` off.
+    ///
+    pub fn bank_hash(&self) -> Option<[u8; HASH_BYTES]> {
+        self.footer.map(|footer| footer.bank_hash)
+    }
+
+    ///
+    /// The time the leader produced the block, in nanoseconds, as reported by the bank's block
+    /// footer.
+    ///
+    /// # Returns
+    ///
+    /// `None` if no footer was observed for this bank, which only happens when the
+    /// [`DragonsmouthBlockCumulator`] was built with `require_block_footer` off.
+    ///
+    pub fn block_producer_time_nanos(&self) -> Option<u64> {
+        self.footer.map(|footer| footer.block_producer_time_nanos)
     }
 }
 
@@ -153,15 +206,119 @@ impl BankBuffer {
 /// A block only moves from `active_block_map` to `frozen_block_map` (becoming eligible for
 /// [`BlockAccumulator::finish_block`]) once [`BlockBuffer::is_complete`] holds -- BlockMeta
 /// arriving is necessary but not sufficient, since some of what it implies (the must-have
-/// sysvars in particular) can genuinely still be in flight when it shows up.
-#[derive(Default)]
+/// sysvars and the block footer in particular) can genuinely still be in flight when it shows up.
 pub struct DragonsmouthBlockCumulator {
     active_bank_map: FxHashMap<BankId, BankBuffer>,
     frozen_bank_map: FxHashMap<BankId, BankBuffer>,
     newly_sealed: VecDeque<BankId>,
+    require_block_footer: bool,
+}
+
+impl Default for DragonsmouthBlockCumulator {
+    ///
+    /// Requires a block footer for every bank. See [`DragonsmouthBlockCumulator::new`].
+    ///
+    fn default() -> Self {
+        Self::new(true)
+    }
 }
 
 impl DragonsmouthBlockCumulator {
+    ///
+    /// Creates an empty accumulator.
+    ///
+    /// # Arguments
+    ///
+    /// * `require_block_footer` - Whether a bank only seals once its Alpenglow block footer has
+    ///   been observed. Turn it off for a cluster that doesn't produce footers (pre-Alpenglow):
+    ///   with it on, no block would ever seal there.
+    ///
+    /// # Returns
+    ///
+    /// A [`DragonsmouthBlockCumulator`] holding no banks.
+    ///
+    pub fn new(require_block_footer: bool) -> Self {
+        Self {
+            active_bank_map: FxHashMap::default(),
+            frozen_bank_map: FxHashMap::default(),
+            newly_sealed: VecDeque::new(),
+            require_block_footer,
+        }
+    }
+
+    ///
+    /// Counts the banks whose BlockMeta arrived but whose block footer did not.
+    ///
+    /// # Returns
+    ///
+    /// The number of such banks. Always `0` when `require_block_footer` is off. A value that
+    /// keeps growing means the stream isn't delivering footers: either the cluster isn't on
+    /// Alpenglow, or the subscription lacks a `block_footer` filter.
+    ///
+    pub fn banks_awaiting_footer(&self) -> usize {
+        if !self.require_block_footer {
+            return 0;
+        }
+        self.active_bank_map
+            .values()
+            .filter(|block| block.is_awaiting_footer())
+            .count()
+    }
+
+    ///
+    /// Records `footer` as `bank_id`'s block footer, unless the bank already has one or the
+    /// footer names a different slot than the bank's own.
+    ///
+    /// # Arguments
+    ///
+    /// * `bank_id` - The bank the footer belongs to.
+    /// * `footer` - The footer's wire-agnostic view.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the footer was recorded, `false` if it was refused. A refused footer must not be
+    /// stored for delivery either.
+    ///
+    fn record_footer(&mut self, bank_id: BankId, footer: &BlockFooterEvInfo) -> bool {
+        // Checked before the auto-vivifying lookup below, which would otherwise hide a duplicate
+        // for an already-sealed bank behind a new empty buffer.
+        let already_sealed_with_footer = self
+            .frozen_bank_map
+            .get(&bank_id)
+            .is_some_and(|block| block.footer.is_some());
+        if already_sealed_with_footer {
+            tracing::error!(
+                "UNEXPECTED: duplicate block footer for already-sealed bank {bank_id} (slot {}). Dropping.",
+                footer.slot
+            );
+            return false;
+        }
+        let block = self
+            .active_bank_map
+            .entry(bank_id)
+            .or_insert_with(|| BankBuffer::new(bank_id, footer.slot));
+        if block.footer.is_some() {
+            tracing::error!(
+                "UNEXPECTED: duplicate block footer for bank {bank_id} (slot {}). Dropping.",
+                footer.slot
+            );
+            return false;
+        }
+        if block.slot != footer.slot {
+            tracing::error!(
+                "UNEXPECTED: block footer for bank {bank_id} names slot {}, but the bank belongs to slot {}. Dropping.",
+                footer.slot,
+                block.slot
+            );
+            return false;
+        }
+        block.footer = Some(ObservedFooter {
+            bank_hash: footer.bank_hash,
+            block_producer_time_nanos: footer.block_producer_time_nanos,
+        });
+        true
+    }
+
     ///
     /// Promotes `bank_id` from `active_block_map` to `frozen_block_map` if it just became
     /// complete. Safe to call after any event that could plausibly have completed it.
@@ -170,7 +327,7 @@ impl DragonsmouthBlockCumulator {
         let Some(block) = self.active_bank_map.get(&bank_id) else {
             return;
         };
-        if !block.is_complete() {
+        if !block.is_complete(self.require_block_footer) {
             return;
         }
         let mut block = self
@@ -202,6 +359,12 @@ impl BlockAccumulator for DragonsmouthBlockCumulator {
         bank_id: BankId,
         ev_info: &GeyserEventInfo,
     ) {
+        if let GeyserEventInfo::BlockFooter(footer) = ev_info {
+            if !self.record_footer(bank_id, footer) {
+                return;
+            }
+        }
+
         let slot = ev_info.slot();
         let block = self
             .active_bank_map
@@ -229,14 +392,16 @@ impl BlockAccumulator for DragonsmouthBlockCumulator {
             _ => {}
         }
 
-        // We only match on those four since this is where we add the reserved filter to the
+        // We only match on those five since this is where we add the reserved filter to the
         // event -- Slot/BlockMeta/Entry are always force-subscribed (see `subscribe_block`) so
         // this crate can track lifecycle/completeness even if the client never asked for them;
-        // Account is force-subscribed too, but only for the must-have sysvars above.
+        // Account is force-subscribed too, but only for the must-have sysvars above, and
+        // BlockFooter only when footers are required.
         match ev_info {
             GeyserEventInfo::Slot(_)
             | GeyserEventInfo::BlockMeta(_)
             | GeyserEventInfo::Entry(_)
+            | GeyserEventInfo::BlockFooter(_)
             | GeyserEventInfo::SysvarAccount { .. } => {
                 event.filters.retain(|f| f != RESERVED_FILTER_NAME);
 
@@ -274,6 +439,7 @@ impl BlockAccumulator for DragonsmouthBlockCumulator {
                 }
             }
             GeyserEventInfo::Entry(_) => block.entry_idx_map.push(idx),
+            GeyserEventInfo::BlockFooter(_) => block.block_footer_idx = Some(idx),
             _ => {
                 //block meta and slot are ignored
                 self.try_seal(bank_id);
@@ -324,7 +490,14 @@ impl BlockAccumulator for DragonsmouthBlockCumulator {
     }
 
     fn prune_block(&mut self, bank_id: BankId) {
-        self.active_bank_map.remove(&bank_id);
+        if let Some(block) = self.active_bank_map.remove(&bank_id) {
+            if self.require_block_footer && block.is_awaiting_footer() {
+                tracing::warn!(
+                    "Pruning bank {bank_id} (slot {}) whose BlockMeta arrived but whose block footer never did -- is the cluster on Alpenglow, and is the stream subscribed to block footers?",
+                    block.slot
+                );
+            }
+        }
         self.frozen_bank_map.remove(&bank_id);
     }
 
@@ -337,13 +510,64 @@ impl BlockAccumulator for DragonsmouthBlockCumulator {
 mod tests {
     use {
         super::*,
-        crate::event::GeyserEventAdapter,
+        crate::{
+            event::GeyserEventAdapter, state_machine::UntrackedSlot,
+            wrapper::BlocksStateMachineWrapper,
+        },
         solana_hash::Hash,
         yellowstone_grpc_proto::geyser::{
-            SlotStatus, SubscribeUpdateAccount, SubscribeUpdateAccountInfo, SubscribeUpdateEntry,
-            SubscribeUpdateSlot, subscribe_update::UpdateOneof,
+            SlotStatus, SubscribeUpdateAccount, SubscribeUpdateAccountInfo,
+            SubscribeUpdateBlockFooter, SubscribeUpdateEntry, SubscribeUpdateSlot,
+            subscribe_update::UpdateOneof,
         },
     };
+
+    const BANK_HASH: [u8; HASH_BYTES] = [7; HASH_BYTES];
+
+    fn reserved() -> Vec<String> {
+        vec![RESERVED_FILTER_NAME.to_string()]
+    }
+
+    fn footer_update_with_hash(
+        slot: u64,
+        bank_id: u64,
+        bank_hash: [u8; HASH_BYTES],
+        filters: Vec<String>,
+    ) -> SubscribeUpdate {
+        update(
+            UpdateOneof::BlockFooter(SubscribeUpdateBlockFooter {
+                slot,
+                bank_id,
+                bank_hash: bank_hash.to_vec(),
+                block_producer_time_nanos: 42,
+                block_user_agent: vec![],
+                block_final_cert: None,
+                skip_reward_cert: None,
+                notar_reward_cert: None,
+            }),
+            filters,
+        )
+    }
+
+    fn footer_update(slot: u64, bank_id: u64, filters: Vec<String>) -> SubscribeUpdate {
+        footer_update_with_hash(slot, bank_id, BANK_HASH, filters)
+    }
+
+    ///
+    /// Feeds everything a bank needs to seal except its block footer: `CreatedBank`, the
+    /// must-have sysvars, one entry, and a BlockMeta reporting that one entry.
+    ///
+    fn feed_all_but_footer(acc: &mut DragonsmouthBlockCumulator, slot: u64, bank_id: u64) {
+        feed(acc, created_bank_update(slot, bank_id));
+        for sysvar in MUST_HAVE_SYSVAR_ACCOUNTS {
+            feed(
+                acc,
+                sysvar_account_update(slot, bank_id, sysvar, reserved()),
+            );
+        }
+        feed(acc, entry_update(slot, 0, bank_id));
+        freeze(acc, slot, bank_id, 1);
+    }
 
     fn update(oneof: UpdateOneof, filters: Vec<String>) -> SubscribeUpdate {
         SubscribeUpdate {
@@ -433,6 +657,7 @@ mod tests {
         let (slot, bank_id) = (10, 1000);
 
         feed(&mut acc, created_bank_update(slot, bank_id));
+        feed(&mut acc, footer_update(slot, bank_id, reserved()));
         for &sysvar in &MUST_HAVE_SYSVAR_ACCOUNTS[..3] {
             feed(
                 &mut acc,
@@ -475,6 +700,7 @@ mod tests {
         let (slot, bank_id) = (20, 2000);
 
         feed(&mut acc, created_bank_update(slot, bank_id));
+        feed(&mut acc, footer_update(slot, bank_id, reserved()));
         for sysvar in MUST_HAVE_SYSVAR_ACCOUNTS {
             feed(
                 &mut acc,
@@ -507,6 +733,7 @@ mod tests {
         let (slot, bank_id) = (30, 3000);
 
         feed(&mut acc, created_bank_update(slot, bank_id));
+        feed(&mut acc, footer_update(slot, bank_id, reserved()));
         // Three sysvars are only present because of the crate's own reserved filter -- the
         // client never asked for accounts. The fourth also carries the client's own filter tag.
         for &sysvar in &MUST_HAVE_SYSVAR_ACCOUNTS[..3] {
@@ -551,6 +778,7 @@ mod tests {
         let (slot, bank_id) = (40, 4000);
 
         feed(&mut acc, created_bank_update(slot, bank_id));
+        feed(&mut acc, footer_update(slot, bank_id, reserved()));
         for sysvar in MUST_HAVE_SYSVAR_ACCOUNTS {
             feed(
                 &mut acc,
@@ -599,5 +827,228 @@ mod tests {
             1,
             "the non-sysvar account should still be delivered like any other client-visible event"
         );
+    }
+
+    ///
+    /// AGENTS.md invariant 11: with footers required, BlockMeta plus every other completeness
+    /// condition is not enough -- the bank only seals once its footer arrives, even when the
+    /// footer is the very last event.
+    ///
+    #[test]
+    fn block_does_not_seal_until_footer_observed() {
+        let mut acc = DragonsmouthBlockCumulator::default();
+        let (slot, bank_id) = (50, 5000);
+
+        feed_all_but_footer(&mut acc, slot, bank_id);
+
+        assert!(
+            acc.finish_block(bank_id).is_none(),
+            "must not seal: the block footer is still missing"
+        );
+        assert!(acc.pop_newly_sealed().is_none());
+        assert_eq!(acc.banks_awaiting_footer(), 1);
+
+        feed(&mut acc, footer_update(slot, bank_id, reserved()));
+
+        assert_eq!(acc.banks_awaiting_footer(), 0);
+        assert_eq!(acc.pop_newly_sealed(), Some(bank_id));
+        let block = acc
+            .finish_block(bank_id)
+            .expect("footer was the last missing piece");
+        assert_eq!(block.events.bank_hash(), Some(BANK_HASH));
+        assert_eq!(block.events.block_producer_time_nanos(), Some(42));
+    }
+
+    ///
+    /// The footer is unordered relative to the rest of the bank: one arriving before
+    /// `CreatedBank` (auto-vivifying the buffer) must still count.
+    ///
+    #[test]
+    fn footer_arriving_before_created_bank_still_counts() {
+        let mut acc = DragonsmouthBlockCumulator::default();
+        let (slot, bank_id) = (51, 5100);
+
+        feed(&mut acc, footer_update(slot, bank_id, reserved()));
+        feed_all_but_footer(&mut acc, slot, bank_id);
+
+        assert_eq!(acc.pop_newly_sealed(), Some(bank_id));
+        assert!(acc.finish_block(bank_id).is_some());
+    }
+
+    ///
+    /// With `require_block_footer` off (pre-Alpenglow), a bank seals without a footer and
+    /// reports no footer fields.
+    ///
+    #[test]
+    fn footer_not_required_when_disabled() {
+        let mut acc = DragonsmouthBlockCumulator::new(false);
+        let (slot, bank_id) = (52, 5200);
+
+        feed_all_but_footer(&mut acc, slot, bank_id);
+
+        assert_eq!(acc.banks_awaiting_footer(), 0);
+        assert_eq!(acc.pop_newly_sealed(), Some(bank_id));
+        let block = acc.finish_block(bank_id).expect("no footer needed");
+        assert_eq!(block.events.bank_hash(), None);
+        assert_eq!(block.events.block_producer_time_nanos(), None);
+    }
+
+    ///
+    /// Same delivery rule as sysvars: a footer only present because of the reserved filter
+    /// counts toward completeness but isn't handed to the client; one that also matched the
+    /// client's own filter is.
+    ///
+    #[test]
+    fn footer_is_only_delivered_if_the_client_wanted_it() {
+        let mut acc = DragonsmouthBlockCumulator::default();
+
+        let (slot, hidden) = (53, 5300);
+        feed(&mut acc, footer_update(slot, hidden, reserved()));
+        feed_all_but_footer(&mut acc, slot, hidden);
+        let block = acc.finish_block(hidden).expect("sealed");
+        assert_eq!(block.events.block_footer_idx, None);
+        assert_eq!(block.events.len(), 0);
+        assert_eq!(
+            block.events.bank_hash(),
+            Some(BANK_HASH),
+            "typed fields are available even when the raw footer isn't delivered"
+        );
+
+        let (slot, wanted) = (54, 5400);
+        feed(
+            &mut acc,
+            footer_update(
+                slot,
+                wanted,
+                vec![
+                    RESERVED_FILTER_NAME.to_string(),
+                    "client-footer-filter".to_string(),
+                ],
+            ),
+        );
+        feed_all_but_footer(&mut acc, slot, wanted);
+        let block = acc.finish_block(wanted).expect("sealed");
+        assert_eq!(block.events.len(), 1);
+        assert!(matches!(
+            block
+                .events
+                .iter()
+                .next()
+                .and_then(|ev| ev.update_oneof.as_ref()),
+            Some(UpdateOneof::BlockFooter(_))
+        ));
+    }
+
+    ///
+    /// There is exactly one footer per bank, so a second one is UNEXPECTED: it's dropped, the
+    /// first one's fields are kept, and it isn't delivered even if the client asked for footers.
+    ///
+    #[test]
+    fn duplicate_footer_is_dropped() {
+        let mut acc = DragonsmouthBlockCumulator::default();
+        let (slot, bank_id) = (55, 5500);
+
+        feed(&mut acc, footer_update(slot, bank_id, reserved()));
+        feed(
+            &mut acc,
+            footer_update_with_hash(
+                slot,
+                bank_id,
+                [9; HASH_BYTES],
+                vec!["client-footer-filter".to_string()],
+            ),
+        );
+        feed_all_but_footer(&mut acc, slot, bank_id);
+
+        let block = acc.finish_block(bank_id).expect("sealed");
+        assert_eq!(block.events.bank_hash(), Some(BANK_HASH));
+        assert_eq!(block.events.len(), 0, "the duplicate must not be delivered");
+    }
+
+    ///
+    /// A duplicate footer for an already-sealed bank must not leave a new, empty buffer behind
+    /// in `active_bank_map` that nothing would ever seal.
+    ///
+    #[test]
+    fn duplicate_footer_after_seal_does_not_recreate_the_bank_buffer() {
+        let mut acc = DragonsmouthBlockCumulator::default();
+        let (slot, bank_id) = (56, 5600);
+
+        feed(&mut acc, footer_update(slot, bank_id, reserved()));
+        feed_all_but_footer(&mut acc, slot, bank_id);
+        assert_eq!(acc.pop_newly_sealed(), Some(bank_id));
+
+        feed(&mut acc, footer_update(slot, bank_id, reserved()));
+
+        assert!(!acc.active_bank_map.contains_key(&bank_id));
+        assert!(acc.finish_block(bank_id).is_some());
+    }
+
+    ///
+    /// A footer naming a different slot than the bank it targets is UNEXPECTED and must not
+    /// satisfy that bank's footer requirement.
+    ///
+    #[test]
+    fn footer_for_the_wrong_slot_is_dropped() {
+        let mut acc = DragonsmouthBlockCumulator::default();
+        let (slot, bank_id) = (57, 5700);
+
+        feed_all_but_footer(&mut acc, slot, bank_id);
+        feed(&mut acc, footer_update(slot + 1, bank_id, reserved()));
+
+        assert!(acc.pop_newly_sealed().is_none());
+        assert_eq!(acc.banks_awaiting_footer(), 1);
+    }
+
+    ///
+    /// Pruning a bank still waiting on its footer clears it from the counter (and logs a warning
+    /// that the footer never came).
+    ///
+    #[test]
+    fn pruning_a_bank_awaiting_its_footer_clears_the_counter() {
+        let mut acc = DragonsmouthBlockCumulator::default();
+        let (slot, bank_id) = (58, 5800);
+
+        feed_all_but_footer(&mut acc, slot, bank_id);
+        assert_eq!(acc.banks_awaiting_footer(), 1);
+
+        acc.prune_block(bank_id);
+
+        assert_eq!(acc.banks_awaiting_footer(), 0);
+        assert!(acc.finish_block(bank_id).is_none());
+    }
+
+    ///
+    /// AGENTS.md invariant 5: a footer for a bank the state machine already discarded (here, its
+    /// slot went dead) must be rejected with `Err(UntrackedSlot)`, so `BlockStream` never stores
+    /// it in a buffer nothing would prune.
+    ///
+    #[test]
+    fn footer_for_a_discarded_bank_is_rejected_by_the_wrapper() {
+        let (slot, bank_id) = (59, 5900);
+        let mut machine = BlocksStateMachineWrapper::new();
+        for ev in [
+            created_bank_update(slot, bank_id),
+            update(
+                UpdateOneof::Slot(SubscribeUpdateSlot {
+                    slot,
+                    parent: None,
+                    status: SlotStatus::SlotDead as i32,
+                    dead_error: Some("dead".to_string()),
+                    bank_id: Some(bank_id),
+                }),
+                reserved(),
+            ),
+        ] {
+            let ev_info = SubscribeUpdate::extract_geyser_ev_info(&ev).unwrap();
+            let _ = machine.handle_new_geyser_event(ev_info);
+        }
+
+        let footer = footer_update(slot, bank_id, reserved());
+        let ev_info = SubscribeUpdate::extract_geyser_ev_info(&footer).unwrap();
+        assert!(matches!(
+            machine.handle_new_geyser_event(ev_info),
+            Err(UntrackedSlot)
+        ));
     }
 }

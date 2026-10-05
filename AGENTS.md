@@ -85,6 +85,22 @@ They are expected and harmless.
    "every buffering bank" at the parent slot.
 10. **`FrozenBlock::entries` is sorted by `entry_index`.** The buffer is a hash map, so sort
     explicitly.
+11. **A Dragonsmouth block is complete only once its block footer is observed.** With
+    `require_block_footer` on (the default), `BankBuffer::is_complete` also needs the bank's
+    Alpenglow footer. There is exactly one footer per bank, and the wire doesn't order it relative
+    to `CreatedBank`, entries or BlockMeta, so it may come first or last. A BlockMeta forged for
+    an optimistic freeze gets no exemption. The gate lives only in `DragonsmouthBlockCumulator`:
+    never make the state machine's freeze wait for the footer, because freeze drives resolution,
+    `Forks`, skipped-slot marking and commitment delivery. A duplicate footer, or one naming the
+    wrong slot, is `UNEXPECTED` and dropped. Turn the flag off for a cluster that has no footers
+    (pre-Alpenglow), or no block is ever delivered.
+12. **A commitment update never reaches the consumer before its bank's block.** An accumulator
+    can seal a block after the state machine has frozen it and emitted its commitment updates
+    (a late footer, sysvar or entry), so `BlockStream` holds each update in `held_commitments`
+    until that bank's block is delivered, then releases them in arrival order right after the
+    block. A bank whose block is never delivered never gets its commitment updates delivered.
+    Every prune path in `BlockStream` goes through `forget_bank`, which also drops the held
+    updates. Never call `storage.prune_block` directly there.
 
 ## How state is released
 
@@ -100,6 +116,8 @@ one of them.
 | Slot skipped by a Confirmed/Finalized descendant | `mark_slot_as_skipped` | `BankDiscarded` + DLQ `Discarded` per bank, and `ForksDetected { bank_ids }` the first time the slot is fork-reported |
 | Optimistic freeze impossible | `execute_optimistic_freeze_for_needed_banks` | DLQ `Incomplete` |
 | Slot forked in the graph | `gc` pass 1, once below the oldest rooted slot | `ForksDetected { bank_ids }`, then the `gc` trace |
+| Footer never arrives (`require_block_footer` on) | discard, dead, skip or `gc` signal for the bank; once the slot is Finalized, the held-commitment eviction below | none; `prune_block` logs a warning and `banks_awaiting_footer` counts it until then |
+| Commitment updates held for a block that never seals | `BlockStream::evict_stale_held_commitments`, after `MAX_UNRESOLVED_SLOT_AGE`, prunes the bank | none (its updates are dropped); logs a warning |
 | Anything else stuck | `gc` pass 2, after `MAX_UNRESOLVED_SLOT_AGE` (300s) | the `gc` trace |
 
 Every DLQ `Discarded` must have a matching `BankDiscarded` output. `ForksDetected` is

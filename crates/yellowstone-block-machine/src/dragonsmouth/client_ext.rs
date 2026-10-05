@@ -17,7 +17,7 @@ use {
     yellowstone_grpc_client::{GeyserGrpcClient, GeyserGrpcClientError, GeyserStream},
     yellowstone_grpc_proto::geyser::{
         CommitmentLevel as ProtoCommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
-        SubscribeRequestFilterSlots, SubscribeUpdate,
+        SubscribeRequestFilterBlockFooter, SubscribeRequestFilterSlots, SubscribeUpdate,
     },
 };
 
@@ -67,6 +67,31 @@ impl DragonsmouthBlock {
         self.inner.blocktime_unix_ts
     }
 
+    ///
+    /// The bank hash reported by this bank's Alpenglow block footer.
+    ///
+    /// # Returns
+    ///
+    /// `None` only if the stream was built with [`BlockMachineConfig::require_block_footer`] off
+    /// and no footer arrived before the block sealed.
+    ///
+    pub fn bank_hash(&self) -> Option<[u8; solana_hash::HASH_BYTES]> {
+        self.inner.events.bank_hash()
+    }
+
+    ///
+    /// The time the leader produced this block, in nanoseconds, as reported by its Alpenglow
+    /// block footer.
+    ///
+    /// # Returns
+    ///
+    /// `None` only if the stream was built with [`BlockMachineConfig::require_block_footer`] off
+    /// and no footer arrived before the block sealed.
+    ///
+    pub fn block_producer_time_nanos(&self) -> Option<u64> {
+        self.inner.events.block_producer_time_nanos()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &SubscribeUpdate> {
         self.inner.events.iter()
     }
@@ -107,6 +132,19 @@ pub enum BlockStreamEvent {
     BankDiscarded(BankDiscarded),
 }
 
+impl DragonsmouthBlockStream {
+    ///
+    /// Counts the banks whose BlockMeta arrived but whose block footer did not.
+    ///
+    /// # Returns
+    ///
+    /// See [`DragonsmouthBlockCumulator::banks_awaiting_footer`].
+    ///
+    pub fn banks_awaiting_footer(&self) -> usize {
+        self.inner.accumulator().banks_awaiting_footer()
+    }
+}
+
 impl Stream for DragonsmouthBlockStream {
     type Item = Result<BlockStreamEvent, BlockMachineError>;
 
@@ -144,11 +182,46 @@ impl Stream for DragonsmouthBlockStream {
     }
 }
 
+///
+/// Options for [`GeyserGrpcExt::subscribe_block_with_config`].
+///
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockMachineConfig {
+    ///
+    /// Whether a block is only delivered once its Alpenglow block footer has been observed. When
+    /// set, `subscribe_block` also subscribes to block footers (metadata only, no certificates).
+    /// Turn it off for a cluster that doesn't produce footers (pre-Alpenglow): with it on, no
+    /// block would ever be delivered there. Defaults to `true`.
+    ///
+    pub require_block_footer: bool,
+}
+
+impl Default for BlockMachineConfig {
+    fn default() -> Self {
+        Self {
+            require_block_footer: true,
+        }
+    }
+}
+
 #[async_trait]
 pub trait GeyserGrpcExt {
+    ///
+    /// Same as [`GeyserGrpcExt::subscribe_block_with_config`] with
+    /// [`BlockMachineConfig::default`].
+    ///
     async fn subscribe_block(
         &mut self,
         subscribe_request: SubscribeRequest,
+    ) -> Result<DragonsmouthBlockStream, GeyserGrpcClientError> {
+        self.subscribe_block_with_config(subscribe_request, BlockMachineConfig::default())
+            .await
+    }
+
+    async fn subscribe_block_with_config(
+        &mut self,
+        subscribe_request: SubscribeRequest,
+        config: BlockMachineConfig,
     ) -> Result<DragonsmouthBlockStream, GeyserGrpcClientError>;
 }
 
@@ -176,9 +249,10 @@ impl GeyserGrpcExt for GeyserGrpcClient {
     /// The block machine will internally filter and process events based on the minimum commitment level specified in the original `SubscribeRequest`.
     ///
     ///
-    async fn subscribe_block(
+    async fn subscribe_block_with_config(
         &mut self,
         mut subscribe_request: SubscribeRequest,
+        config: BlockMachineConfig,
     ) -> Result<DragonsmouthBlockStream, GeyserGrpcClientError> {
         let proto_commitment_level =
             ProtoCommitmentLevel::try_from(subscribe_request.commitment.unwrap_or(0))
@@ -227,11 +301,26 @@ impl GeyserGrpcExt for GeyserGrpcClient {
             },
         );
 
+        // Metadata only: completeness just needs to know the footer arrived. A caller who wants
+        // the certificates adds their own `block_footer` filter with `include_certificates`.
+        if config.require_block_footer {
+            subscribe_request.block_footer.insert(
+                RESERVED_FILTER_NAME.to_owned(),
+                SubscribeRequestFilterBlockFooter {
+                    include_certificates: Some(false),
+                },
+            );
+        }
+
         subscribe_request.commitment = Some(0); // Processed
 
         let (_sink, source) = self.subscribe_with_request(Some(subscribe_request)).await?;
 
-        let block_stream = BlockStream::new(source, Default::default(), commitment_level);
+        let block_stream = BlockStream::new(
+            source,
+            DragonsmouthBlockCumulator::new(config.require_block_footer),
+            commitment_level,
+        );
         let dragonsmouth_block_stream = DragonsmouthBlockStream {
             inner: block_stream,
         };

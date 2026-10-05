@@ -3,17 +3,18 @@ use {
         event::{GeyserEventAdapter, GeyserEventInfo},
         state_machine::{
             BankDiscarded, BlockStateMachineOutput, BlockstoreStats, DeadBlockDetected,
-            DeadletterEvent, ForkDetected, FrozenBlock, SlotCommitmentStatusUpdate,
+            DeadletterEvent, ForkDetected, FrozenBlock, MAX_UNRESOLVED_SLOT_AGE,
+            SlotCommitmentStatusUpdate,
         },
         wrapper::BlocksStateMachineWrapper,
     },
     derive_more::From,
     futures_util::{Stream, TryStream, TryStreamExt},
-    rustc_hash::FxHashMap,
+    rustc_hash::{FxHashMap, FxHashSet},
     solana_clock::{BankId, Slot},
     solana_commitment_config::CommitmentLevel,
     solana_hash::HASH_BYTES,
-    std::{cmp::Ordering, collections::VecDeque, marker::PhantomData},
+    std::{cmp::Ordering, collections::VecDeque, marker::PhantomData, time::Instant},
 };
 
 ///
@@ -154,7 +155,9 @@ pub enum BlockMachineOutput<EventStore> {
     ///
     /// An update on the commitment status of a slot.
     /// Note: This is sent when the slot reaches or exceeds the minimum commitment level set during initialization.
-    /// It is guaranteed that the block for this slot has been sent before this update.
+    /// It is guaranteed that the block for this bank has been sent before this update. An
+    /// update for a bank whose block is never sent (e.g. its accumulator never considered it
+    /// complete) is never sent either.
     ///
     SlotCommitmentUpdate(SlotCommitmentStatusUpdate),
     ///
@@ -195,7 +198,32 @@ pub struct BlockStream<Source, Adaptor, Acc> {
     machine: BlocksStateMachineWrapper,
     storage: Acc,
     pending: VecDeque<PendingEvent>,
+    ///
+    /// Banks whose block was already handed to the consumer, so their commitment updates can
+    /// go out immediately. Removed once the bank's Finalized update is sent (nothing follows it)
+    /// or the bank is pruned.
+    ///
+    delivered_banks: FxHashSet<BankId>,
+    ///
+    /// Commitment updates for banks whose block wasn't delivered yet, in arrival order. A
+    /// commitment update must never reach the consumer before its block: an accumulator may seal
+    /// a block later than the state machine freezes it (see
+    /// [`BlockAccumulator::pop_newly_sealed`]), e.g. because its block footer is late.
+    ///
+    held_commitments: FxHashMap<BankId, HeldCommitments>,
     _adapter: PhantomData<Adaptor>,
+}
+
+///
+/// Commitment updates waiting for their bank's block to be delivered.
+///
+#[derive(Debug)]
+struct HeldCommitments {
+    ///
+    /// When the first update was held, for [`BlockStream::evict_stale_held_commitments`].
+    ///
+    since: Instant,
+    updates: Vec<SlotCommitmentStatusUpdate>,
 }
 
 impl<Source, Adaptor, Acc> BlockStream<Source, Adaptor, Acc>
@@ -209,6 +237,8 @@ where
             machine: BlocksStateMachineWrapper::new_with_slot_gc_tracing(),
             storage: block_acc,
             pending: VecDeque::new(),
+            delivered_banks: FxHashSet::default(),
+            held_commitments: FxHashMap::default(),
             _adapter: PhantomData,
         }
     }
@@ -247,9 +277,103 @@ where
         self.machine.sm.stats()
     }
 
+    ///
+    /// The accumulator this stream stores block content in, for implementation-specific
+    /// introspection (e.g. `DragonsmouthBlockCumulator::banks_awaiting_footer`, behind the
+    /// `dragonsmouth-thin` feature).
+    ///
+    pub const fn accumulator(&self) -> &Acc {
+        &self.storage
+    }
+
     fn insert_into_storage(&mut self, event: Adaptor::EventT, ev_info: &GeyserEventInfo) {
         if let Some(bank_id) = ev_info.bank_id() {
             self.storage.add_event(event, bank_id, ev_info);
+        }
+    }
+
+    ///
+    /// Drops everything this stream and its accumulator hold for `bank_id`, including any
+    /// commitment updates still waiting for its block: a pruned bank's block is never delivered,
+    /// so neither are they.
+    ///
+    /// # Arguments
+    ///
+    /// * `bank_id` - The bank to forget.
+    ///
+    fn forget_bank(&mut self, bank_id: BankId) {
+        self.storage.prune_block(bank_id);
+        self.delivered_banks.remove(&bank_id);
+        if let Some(held) = self.held_commitments.remove(&bank_id) {
+            tracing::debug!(
+                "Dropping {} commitment update(s) for pruned bank {bank_id} whose block was never delivered",
+                held.updates.len()
+            );
+        }
+    }
+
+    ///
+    /// Queues `update` until its bank's block is delivered.
+    ///
+    /// # Arguments
+    ///
+    /// * `update` - A commitment update whose bank's block hasn't been delivered yet.
+    ///
+    fn hold_commitment(&mut self, update: SlotCommitmentStatusUpdate) {
+        self.held_commitments
+            .entry(update.bank_id)
+            .or_insert_with(|| HeldCommitments {
+                since: Instant::now(),
+                updates: Vec::new(),
+            })
+            .updates
+            .push(update);
+        self.evict_stale_held_commitments(Instant::now());
+    }
+
+    ///
+    /// Puts `bank_id`'s held commitment updates at the front of the pending queue, in arrival
+    /// order, so they are the next outputs after its block.
+    ///
+    /// # Arguments
+    ///
+    /// * `bank_id` - The bank whose block was just delivered.
+    ///
+    fn release_held_commitments(&mut self, bank_id: BankId) {
+        let Some(held) = self.held_commitments.remove(&bank_id) else {
+            return;
+        };
+        for update in held.updates.into_iter().rev() {
+            self.pending
+                .push_front(PendingEvent::SlotCommitmentUpdate(update));
+        }
+    }
+
+    ///
+    /// Forgets every bank whose commitment updates have waited longer than
+    /// [`MAX_UNRESOLVED_SLOT_AGE`] for a block that never came, the same last-resort memory
+    /// bound the state machine's `gc` pass 2 uses. Without it, a bank the state machine already
+    /// finalized and deregistered but the accumulator never sealed (e.g. its block footer never
+    /// arrived) would be held here, and stay in the accumulator, forever.
+    ///
+    /// # Arguments
+    ///
+    /// * `now` - The current time.
+    ///
+    fn evict_stale_held_commitments(&mut self, now: Instant) {
+        let stale: Vec<BankId> = self
+            .held_commitments
+            .iter()
+            .filter(|(_, held)| {
+                now.saturating_duration_since(held.since) >= MAX_UNRESOLVED_SLOT_AGE
+            })
+            .map(|(&bank_id, _)| bank_id)
+            .collect();
+        for bank_id in stale {
+            tracing::warn!(
+                "Bank {bank_id}'s block was never delivered after {MAX_UNRESOLVED_SLOT_AGE:?} of held commitment updates -- dropping them and pruning the bank"
+            );
+            self.forget_bank(bank_id);
         }
     }
 
@@ -258,13 +382,13 @@ where
         while let Some(dlq_event) = self.machine.pop_next_dlq() {
             match dlq_event {
                 DeadletterEvent::Incomplete(bank_id) | DeadletterEvent::Discarded(bank_id) => {
-                    self.storage.prune_block(bank_id);
+                    self.forget_bank(bank_id);
                 }
             }
         }
 
         while let Some(bank_id) = self.machine.pop_bank_gc_trace() {
-            self.storage.prune_block(bank_id);
+            self.forget_bank(bank_id);
         }
     }
 
@@ -297,15 +421,15 @@ where
                     }
                 }
                 BlockStateMachineOutput::ForksDetected(fork_detected) => {
-                    for bank_id in &fork_detected.bank_ids {
-                        self.storage.prune_block(*bank_id);
+                    for &bank_id in &fork_detected.bank_ids {
+                        self.forget_bank(bank_id);
                     }
                     self.pending
                         .push_back(PendingEvent::ForkDetected(fork_detected));
                 }
                 BlockStateMachineOutput::DeadSlotDetected(dead_block) => {
-                    for bank_id in &dead_block.bank_ids {
-                        self.storage.prune_block(*bank_id);
+                    for &bank_id in &dead_block.bank_ids {
+                        self.forget_bank(bank_id);
                     }
                     self.pending
                         .push_back(PendingEvent::DeadBlockDetect(dead_block));
@@ -336,13 +460,21 @@ where
             if let Some(pending_ev) = self.pending.pop_front() {
                 let output = match pending_ev {
                     PendingEvent::FrozenBlock(bank_id) => {
-                        if let Some(block) = self.storage.finish_block(bank_id) {
-                            BlockMachineOutput::FrozenBlock(block)
-                        } else {
+                        let Some(block) = self.storage.finish_block(bank_id) else {
                             continue;
-                        }
+                        };
+                        self.delivered_banks.insert(bank_id);
+                        self.release_held_commitments(bank_id);
+                        BlockMachineOutput::FrozenBlock(block)
                     }
                     PendingEvent::SlotCommitmentUpdate(update) => {
+                        if !self.delivered_banks.contains(&update.bank_id) {
+                            self.hold_commitment(update);
+                            continue;
+                        }
+                        if update.commitment == CommitmentLevel::Finalized {
+                            self.delivered_banks.remove(&update.bank_id);
+                        }
                         BlockMachineOutput::SlotCommitmentUpdate(update)
                     }
                     PendingEvent::ForkDetected(fork) => BlockMachineOutput::ForkDetected(fork),
@@ -596,7 +728,10 @@ mod tests {
             BlockEventStore, BlockMachineOutput, BlockStream, PendingEvent, SimpleBlockAccumulator,
             SimpleBlockStore,
         },
-        crate::{event::GeyserEventAdapter, state_machine::SlotCommitmentStatusUpdate},
+        crate::{
+            event::GeyserEventAdapter,
+            state_machine::{MAX_UNRESOLVED_SLOT_AGE, SlotCommitmentStatusUpdate},
+        },
         futures_util::{Stream, stream},
         solana_commitment_config::CommitmentLevel,
         solana_hash::{HASH_BYTES, Hash},
@@ -604,6 +739,7 @@ mod tests {
             io,
             pin::Pin,
             task::{Context, Poll},
+            time::Instant,
         },
         yellowstone_grpc_proto::geyser::{
             SlotStatus, SubscribeUpdate, SubscribeUpdateAccount, SubscribeUpdateBlockMeta,
@@ -876,32 +1012,66 @@ mod tests {
         assert_eq!(store.blockhash(), [42; HASH_BYTES]);
     }
 
+    const fn processed(slot: u64, bank_id: u64) -> SlotCommitmentStatusUpdate {
+        SlotCommitmentStatusUpdate {
+            parent_slot: Some(slot - 1),
+            slot,
+            commitment: CommitmentLevel::Processed,
+            bank_id,
+        }
+    }
+
+    ///
+    /// A commitment update must never reach the consumer before its bank's block: with no block
+    /// in storage for bank 77, its update is held instead of emitted.
+    ///
     #[test]
-    fn skips_missing_frozen_block_and_emits_following_commitment_update() {
+    fn commitment_update_is_held_while_its_block_is_missing() {
         let mut bs = empty_source_stream(CommitmentLevel::Processed);
 
-        // Simulate a pending FrozenBlock for a bank_id that no longer exists in storage,
-        // followed by a valid commitment update for the same bank.
         bs.pending.push_back(PendingEvent::FrozenBlock(77));
-        bs.pending.push_back(PendingEvent::SlotCommitmentUpdate(
-            SlotCommitmentStatusUpdate {
-                parent_slot: Some(76),
-                slot: 77,
-                commitment: CommitmentLevel::Processed,
-                bank_id: 77,
-            },
-        ));
+        bs.pending
+            .push_back(PendingEvent::SlotCommitmentUpdate(processed(77, 77)));
 
         let waker = futures_util::task::noop_waker();
         let mut cx = Context::from_waker(&waker);
 
-        let first = Pin::new(&mut bs).poll_next(&mut cx);
         assert!(matches!(
-            first,
-            Poll::Ready(Some(Ok(BlockMachineOutput::SlotCommitmentUpdate(_))))
+            Pin::new(&mut bs).poll_next(&mut cx),
+            Poll::Ready(None)
         ));
+        assert_eq!(bs.held_commitments[&77].updates, vec![processed(77, 77)]);
+    }
 
-        let second = Pin::new(&mut bs).poll_next(&mut cx);
-        assert!(matches!(second, Poll::Ready(None)));
+    ///
+    /// Held updates for a block that never comes are dropped, and the bank pruned, after
+    /// `MAX_UNRESOLVED_SLOT_AGE` -- otherwise a finalized-but-never-sealed bank would be kept
+    /// forever, since the state machine deregisters it without a prune signal.
+    ///
+    #[test]
+    fn held_commitment_updates_are_evicted_after_max_unresolved_slot_age() {
+        let mut bs = empty_source_stream(CommitmentLevel::Processed);
+        bs.hold_commitment(processed(77, 77));
+
+        bs.evict_stale_held_commitments(Instant::now());
+        assert!(bs.held_commitments.contains_key(&77), "too young to evict");
+
+        bs.evict_stale_held_commitments(
+            Instant::now() + MAX_UNRESOLVED_SLOT_AGE + std::time::Duration::from_secs(1),
+        );
+        assert!(bs.held_commitments.is_empty());
+    }
+
+    ///
+    /// Pruning a bank drops its held commitment updates along with it.
+    ///
+    #[test]
+    fn pruning_a_bank_drops_its_held_commitment_updates() {
+        let mut bs = empty_source_stream(CommitmentLevel::Processed);
+        bs.hold_commitment(processed(77, 77));
+
+        bs.forget_bank(77);
+
+        assert!(bs.held_commitments.is_empty());
     }
 }

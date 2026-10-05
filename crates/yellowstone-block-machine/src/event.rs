@@ -71,6 +71,20 @@ pub struct EntryEvInfo {
 }
 
 ///
+/// A borrowed view over an Alpenglow block footer update.
+///
+/// Exactly one footer exists per bank. The wire delivers it independently of the rest of the
+/// bank's events, so it may arrive before `CreatedBank`, between entries, or after `BlockMeta`.
+///
+#[derive(Debug, Clone, Copy)]
+pub struct BlockFooterEvInfo {
+    pub slot: Slot,
+    pub bank_id: BankId,
+    pub bank_hash: [u8; HASH_BYTES],
+    pub block_producer_time_nanos: u64,
+}
+
+///
 /// A borrowed, wire-format-agnostic view over a single Geyser event, produced by a
 /// [`GeyserEventAdapter`].
 ///
@@ -83,6 +97,7 @@ pub enum GeyserEventInfo {
     Slot(SlotUpdateEvInfo),
     BlockMeta(BlockMetaEvInfo),
     Entry(EntryEvInfo),
+    BlockFooter(BlockFooterEvInfo),
     SysvarAccount {
         slot: Slot,
         ///
@@ -104,6 +119,7 @@ impl GeyserEventInfo {
             GeyserEventInfo::Slot(ev) => ev.slot,
             GeyserEventInfo::BlockMeta(ev) => ev.slot,
             GeyserEventInfo::Entry(ev) => ev.slot,
+            GeyserEventInfo::BlockFooter(ev) => ev.slot,
             GeyserEventInfo::BankData { slot, .. } => *slot,
             GeyserEventInfo::SysvarAccount { slot, .. } => *slot,
         }
@@ -119,6 +135,7 @@ impl GeyserEventInfo {
             GeyserEventInfo::Slot(ev) => ev.bank_id,
             GeyserEventInfo::BlockMeta(ev) => Some(ev.bank_id),
             GeyserEventInfo::Entry(ev) => Some(ev.bank_id),
+            GeyserEventInfo::BlockFooter(ev) => Some(ev.bank_id),
             GeyserEventInfo::BankData { bank_id, .. } => Some(*bank_id),
             GeyserEventInfo::SysvarAccount { bank_id, .. } => Some(*bank_id),
         }

@@ -547,3 +547,60 @@ async fn bank_discarded_never_fires_twice_for_the_same_bank_id() {
          superseded it was itself delivered twice"
     );
 }
+
+///
+/// AGENTS.md invariants 11 and 12: a block is only delivered once its footer arrives, even when
+/// the footer comes after the slot was already confirmed, and the Confirmed update is held until
+/// after the block. The block then carries the footer's bank hash.
+///
+#[tokio::test]
+async fn block_is_delivered_only_once_its_footer_arrives() {
+    let slot = 9_000;
+    let bank = SimulatedBank::new(slot, 900_000).with_skip_footer();
+    let bank_hash = solana_hash::Hash::new_unique();
+
+    let without_footer = SimulationBuilder::new()
+        .bank(&bank)
+        .confirmed(slot, bank.bank_id)
+        .build();
+    let outputs = collect(BlockStream::<_, SubscribeUpdate, _>::new(
+        without_footer,
+        DragonsmouthBlockCumulator::default(),
+        CommitmentLevel::Confirmed,
+    ))
+    .await;
+    assert!(
+        !outputs
+            .iter()
+            .any(|output| frozen_bank_id(output).is_some()),
+        "no footer, no block"
+    );
+
+    let with_late_footer = SimulationBuilder::new()
+        .bank(&bank)
+        .confirmed(slot, bank.bank_id)
+        .block_footer(slot, bank.bank_id, bank_hash)
+        .build();
+    let outputs = collect(BlockStream::<_, SubscribeUpdate, _>::new(
+        with_late_footer,
+        DragonsmouthBlockCumulator::default(),
+        CommitmentLevel::Confirmed,
+    ))
+    .await;
+    let block_index = outputs
+        .iter()
+        .position(|output| frozen_bank_id(output) == Some(bank.bank_id))
+        .expect("the late footer must release the block");
+    let commitment_index = outputs
+        .iter()
+        .position(|output| resolved_bank_id(output) == Some(bank.bank_id))
+        .expect("the Confirmed update must still be delivered");
+    assert!(
+        block_index < commitment_index,
+        "the commitment update must come after its block"
+    );
+    let BlockMachineOutput::FrozenBlock(block) = &outputs[block_index] else {
+        unreachable!()
+    };
+    assert_eq!(block.events.bank_hash(), Some(bank_hash.to_bytes()));
+}
