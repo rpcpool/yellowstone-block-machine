@@ -80,11 +80,36 @@ They are expected and harmless.
 8. **Do not add orphan nodes to `Forks`.** `pop_oldest_rooted_slot` only reclaims nodes reachable
    from a root. Call `Forks::mark_slot_as_forked` only on a slot that is already a node
    (`Forks::contains`). Otherwise record it in `forks_history` alone so `gc` pass 1 can purge it.
-9. **Optimistic freeze matches the parent bank by content.** It freezes a still-buffering parent
-   bank only if that bank's last entry hash equals the child's `parent_blockhash`. Never freeze
-   "every buffering bank" at the parent slot.
+9. **A bank freezes only from its own BlockMeta.** Never forge a `BlockSummary`, e.g. from a
+   still-buffering parent bank's last entry hash when a child names it. The optimistic-freeze path
+   that did this was removed: it was never seen firing in production, and its forged summaries
+   (zero `parent_blockhash` and `block_time`) made the real BlockMeta be rejected as a duplicate
+   when it arrived late. A bank whose BlockMeta never arrives waits for `gc` pass 2.
 10. **`FrozenBlock::entries` is sorted by `entry_index`.** The buffer is a hash map, so sort
     explicitly.
+11. **The driver decides when a block ends; the state machine never sees footers.** A bank's
+    `BlockSummary` is its end-of-block marker, and `BlocksStateMachineWrapper` (the driver) decides
+    when to feed it. With `BlockMachineConfig::require_block_footer` on (the default), it feeds it
+    only once both the bank's BlockMeta and its Alpenglow block footer arrived, in either order,
+    holding whichever came first. With it off, BlockMeta alone ends the block. There is exactly
+    one footer per bank. The backend always sends it right before the bank's BlockMeta (see
+    invariant 12), so in practice BlockMeta freezes the bank on arrival. Holding a BlockMeta until
+    its footer only matters for other event sources: at the agave plugin interface the footer is
+    unordered relative to BlockMeta, and on leader slots usually lands after it. Agave never
+    drops a footer (the producer blocks on a full channel), so a bank that never gets one means a
+    broken setup: a non-Alpenglow node, a server without footer support, or a subscription that
+    started mid-slot. A duplicate BlockMeta or footer is `UNEXPECTED` and rejected. Don't add
+    footer logic to `BlocksStateMachine` or a footer gate to an accumulator: a frozen bank already
+    has its footer. Turn the flag off for a cluster that has no footers (pre-Alpenglow), or no
+    bank ever freezes.
+12. **Commitment updates come after their bank's frozen block without any extra hold.** Per
+    bank, the backend sends content (`CreatedBank`, entries, transactions, accounts) in any
+    order, then always the footer, then BlockMeta, then Processed/Confirmed/Finalized, in that
+    order. So the accumulator seals at the freeze, and the state machine's own queue (commitment
+    updates wait until the bank is frozen) covers any other source. Don't add a commitment hold
+    to `BlockStream`. The one accepted exception, as before footers existed: a bank already in
+    flight when the subscription started can freeze without sealing, so its commitment updates
+    go out without its block.
 
 ## How state is released
 
@@ -98,8 +123,8 @@ one of them.
 | Loses its slot to a sibling bank | `discard_losing_banks` | `BankDiscarded` + DLQ `Discarded` |
 | Slot dead (`SlotDead` / `dead_error`) | `mark_slot_as_dead` | `DeadSlotDetected { bank_ids }` |
 | Slot skipped by a Confirmed/Finalized descendant | `mark_slot_as_skipped` | `BankDiscarded` + DLQ `Discarded` per bank, and `ForksDetected { bank_ids }` the first time the slot is fork-reported |
-| Optimistic freeze impossible | `execute_optimistic_freeze_for_needed_banks` | DLQ `Incomplete` |
 | Slot forked in the graph | `gc` pass 1, once below the oldest rooted slot | `ForksDetected { bank_ids }`, then the `gc` trace |
+| BlockMeta or footer arrives without its counterpart (`require_block_footer` on) | the wrapper drops the held marker after `MAX_UNRESOLVED_SLOT_AGE` (on its `gc` schedule), or as soon as the bank is discarded; the never-frozen bank's state goes through `gc` pass 2 | the `gc` trace; `banks_awaiting_footer` counts it until then, and dropping a BlockMeta logs a warning |
 | Anything else stuck | `gc` pass 2, after `MAX_UNRESOLVED_SLOT_AGE` (300s) | the `gc` trace |
 
 Every DLQ `Discarded` must have a matching `BankDiscarded` output. `ForksDetected` is

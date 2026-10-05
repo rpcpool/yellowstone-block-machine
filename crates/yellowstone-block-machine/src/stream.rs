@@ -5,7 +5,7 @@ use {
             BankDiscarded, BlockStateMachineOutput, BlockstoreStats, DeadBlockDetected,
             DeadletterEvent, ForkDetected, FrozenBlock, SlotCommitmentStatusUpdate,
         },
-        wrapper::BlocksStateMachineWrapper,
+        wrapper::{BlockMachineConfig, BlocksStateMachineWrapper},
     },
     derive_more::From,
     futures_util::{Stream, TryStream, TryStreamExt},
@@ -202,11 +202,43 @@ impl<Source, Adaptor, Acc> BlockStream<Source, Adaptor, Acc>
 where
     Adaptor: GeyserEventAdapter,
 {
+    ///
+    /// Same as [`BlockStream::new_with_config`] with [`BlockMachineConfig::default`], which
+    /// requires a block footer for every bank.
+    ///
     pub fn new(source: Source, block_acc: Acc, min_commitment_level: CommitmentLevel) -> Self {
+        Self::new_with_config(
+            source,
+            block_acc,
+            min_commitment_level,
+            BlockMachineConfig::default(),
+        )
+    }
+
+    ///
+    /// Creates a stream reconstructing blocks from `source`.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - The raw Geyser event stream.
+    /// * `block_acc` - The accumulator storing each bank's content.
+    /// * `min_commitment_level` - Commitment updates below this level are not emitted.
+    /// * `config` - See [`BlockMachineConfig`].
+    ///
+    /// # Returns
+    ///
+    /// The [`BlockStream`].
+    ///
+    pub fn new_with_config(
+        source: Source,
+        block_acc: Acc,
+        min_commitment_level: CommitmentLevel,
+        config: BlockMachineConfig,
+    ) -> Self {
         Self {
             min_commitment_level,
             source,
-            machine: BlocksStateMachineWrapper::new_with_slot_gc_tracing(),
+            machine: BlocksStateMachineWrapper::new_with_slot_gc_tracing().with_config(config),
             storage: block_acc,
             pending: VecDeque::new(),
             _adapter: PhantomData,
@@ -247,6 +279,18 @@ where
         self.machine.sm.stats()
     }
 
+    ///
+    /// Counts the banks whose BlockMeta arrived but whose block footer did not, so they can't
+    /// freeze yet.
+    ///
+    /// # Returns
+    ///
+    /// See [`BlocksStateMachineWrapper::banks_awaiting_footer`].
+    ///
+    pub fn banks_awaiting_footer(&self) -> usize {
+        self.machine.banks_awaiting_footer()
+    }
+
     fn insert_into_storage(&mut self, event: Adaptor::EventT, ev_info: &GeyserEventInfo) {
         if let Some(bank_id) = ev_info.bank_id() {
             self.storage.add_event(event, bank_id, ev_info);
@@ -257,7 +301,7 @@ where
         // Drain DLQ — clean up banks the state machine gave up on, or discarded as losers.
         while let Some(dlq_event) = self.machine.pop_next_dlq() {
             match dlq_event {
-                DeadletterEvent::Incomplete(bank_id) | DeadletterEvent::Discarded(bank_id) => {
+                DeadletterEvent::Discarded(bank_id) => {
                     self.storage.prune_block(bank_id);
                 }
             }
@@ -593,8 +637,8 @@ impl<E> BlockAccumulator for SimpleBlockAccumulator<E> {
 mod tests {
     use {
         super::{
-            BlockEventStore, BlockMachineOutput, BlockStream, PendingEvent, SimpleBlockAccumulator,
-            SimpleBlockStore,
+            BlockEventStore, BlockMachineConfig, BlockMachineOutput, BlockStream, PendingEvent,
+            SimpleBlockAccumulator, SimpleBlockStore,
         },
         crate::{event::GeyserEventAdapter, state_machine::SlotCommitmentStatusUpdate},
         futures_util::{Stream, stream},
@@ -724,10 +768,14 @@ mod tests {
         SubscribeUpdate,
         SimpleBlockAccumulator<SubscribeUpdate>,
     > {
-        BlockStream::new(
+        // These tests build banks without block footers.
+        BlockStream::new_with_config(
             stream::iter(Vec::<Result<SubscribeUpdate, io::Error>>::new()),
             SimpleBlockAccumulator::default(),
             min_commitment_level,
+            BlockMachineConfig {
+                require_block_footer: false,
+            },
         )
     }
 

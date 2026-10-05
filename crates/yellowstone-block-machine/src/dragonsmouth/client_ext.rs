@@ -1,3 +1,5 @@
+// Re-exported so `client_ext::BlockMachineConfig` imports keep working.
+pub use crate::wrapper::BlockMachineConfig;
 use {
     crate::{
         dragonsmouth::{
@@ -17,7 +19,7 @@ use {
     yellowstone_grpc_client::{GeyserGrpcClient, GeyserGrpcClientError, GeyserStream},
     yellowstone_grpc_proto::geyser::{
         CommitmentLevel as ProtoCommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
-        SubscribeRequestFilterSlots, SubscribeUpdate,
+        SubscribeRequestFilterBlockFooter, SubscribeRequestFilterSlots, SubscribeUpdate,
     },
 };
 
@@ -67,6 +69,31 @@ impl DragonsmouthBlock {
         self.inner.blocktime_unix_ts
     }
 
+    ///
+    /// The bank hash reported by this bank's Alpenglow block footer.
+    ///
+    /// # Returns
+    ///
+    /// `None` only if the stream was built with [`BlockMachineConfig::require_block_footer`] off
+    /// and no footer arrived before the block sealed.
+    ///
+    pub fn bank_hash(&self) -> Option<[u8; solana_hash::HASH_BYTES]> {
+        self.inner.events.bank_hash()
+    }
+
+    ///
+    /// The user agent of the client that produced this block, as reported by its Alpenglow
+    /// block footer. The wire carries raw bytes: invalid UTF-8 sequences are replaced by U+FFFD.
+    ///
+    /// # Returns
+    ///
+    /// `None` only if the stream was built with [`BlockMachineConfig::require_block_footer`] off
+    /// and no footer arrived before the block sealed.
+    ///
+    pub fn block_user_agent(&self) -> Option<String> {
+        self.inner.events.block_user_agent()
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &SubscribeUpdate> {
         self.inner.events.iter()
     }
@@ -105,6 +132,19 @@ pub enum BlockStreamEvent {
     /// block-level -- it says nothing about whether the slot itself was ever considered forked.
     ///
     BankDiscarded(BankDiscarded),
+}
+
+impl DragonsmouthBlockStream {
+    ///
+    /// Counts the banks whose BlockMeta arrived but whose block footer did not.
+    ///
+    /// # Returns
+    ///
+    /// See [`BlocksStateMachineWrapper::banks_awaiting_footer`](crate::wrapper::BlocksStateMachineWrapper::banks_awaiting_footer).
+    ///
+    pub fn banks_awaiting_footer(&self) -> usize {
+        self.inner.banks_awaiting_footer()
+    }
 }
 
 impl Stream for DragonsmouthBlockStream {
@@ -146,9 +186,22 @@ impl Stream for DragonsmouthBlockStream {
 
 #[async_trait]
 pub trait GeyserGrpcExt {
+    ///
+    /// Same as [`GeyserGrpcExt::subscribe_block_with_config`] with
+    /// [`BlockMachineConfig::default`].
+    ///
     async fn subscribe_block(
         &mut self,
         subscribe_request: SubscribeRequest,
+    ) -> Result<DragonsmouthBlockStream, GeyserGrpcClientError> {
+        self.subscribe_block_with_config(subscribe_request, BlockMachineConfig::default())
+            .await
+    }
+
+    async fn subscribe_block_with_config(
+        &mut self,
+        subscribe_request: SubscribeRequest,
+        config: BlockMachineConfig,
     ) -> Result<DragonsmouthBlockStream, GeyserGrpcClientError>;
 }
 
@@ -176,9 +229,10 @@ impl GeyserGrpcExt for GeyserGrpcClient {
     /// The block machine will internally filter and process events based on the minimum commitment level specified in the original `SubscribeRequest`.
     ///
     ///
-    async fn subscribe_block(
+    async fn subscribe_block_with_config(
         &mut self,
         mut subscribe_request: SubscribeRequest,
+        config: BlockMachineConfig,
     ) -> Result<DragonsmouthBlockStream, GeyserGrpcClientError> {
         let proto_commitment_level =
             ProtoCommitmentLevel::try_from(subscribe_request.commitment.unwrap_or(0))
@@ -227,11 +281,27 @@ impl GeyserGrpcExt for GeyserGrpcClient {
             },
         );
 
+        // Metadata only: completeness just needs to know the footer arrived. A caller who wants
+        // the certificates adds their own `block_footer` filter with `include_certificates`.
+        if config.require_block_footer {
+            subscribe_request.block_footer.insert(
+                RESERVED_FILTER_NAME.to_owned(),
+                SubscribeRequestFilterBlockFooter {
+                    include_certificates: Some(false),
+                },
+            );
+        }
+
         subscribe_request.commitment = Some(0); // Processed
 
         let (_sink, source) = self.subscribe_with_request(Some(subscribe_request)).await?;
 
-        let block_stream = BlockStream::new(source, Default::default(), commitment_level);
+        let block_stream = BlockStream::new_with_config(
+            source,
+            DragonsmouthBlockCumulator::default(),
+            commitment_level,
+            config,
+        );
         let dragonsmouth_block_stream = DragonsmouthBlockStream {
             inner: block_stream,
         };

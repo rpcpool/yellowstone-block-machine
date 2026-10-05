@@ -2,8 +2,8 @@ use {
     crate::{
         dragonsmouth::block_accumulator::SYSVAR_PROGRAM_ID,
         event::{
-            BlockMetaEvInfo, EntryEvInfo, GeyserEventAdapter, GeyserEventInfo, SlotStatusKind,
-            SlotUpdateEvInfo,
+            BlockFooterEvInfo, BlockMetaEvInfo, EntryEvInfo, GeyserEventAdapter, GeyserEventInfo,
+            SlotStatusKind, SlotUpdateEvInfo,
         },
     },
     std::str::FromStr,
@@ -109,7 +109,24 @@ impl GeyserEventAdapter for SubscribeUpdate {
             }
             UpdateOneof::Ping(_) => None,
             UpdateOneof::Pong(_) => None,
-            UpdateOneof::BlockFooter(_) => None,
+            UpdateOneof::BlockFooter(footer) => {
+                let Ok(bank_hash) = footer.bank_hash.as_slice().try_into() else {
+                    tracing::error!(
+                        "UNEXPECTED: block footer for bank {} (slot {}) has a {}-byte bank_hash. Dropping.",
+                        footer.bank_id,
+                        footer.slot,
+                        footer.bank_hash.len()
+                    );
+                    return None;
+                };
+                Some(GeyserEventInfo::BlockFooter(BlockFooterEvInfo {
+                    slot: footer.slot,
+                    bank_id: footer.bank_id,
+                    bank_hash,
+                    block_user_agent: String::from_utf8_lossy(&footer.block_user_agent)
+                        .into_owned(),
+                }))
+            }
             UpdateOneof::EntryUpdateParent(_) => None,
         }
     }
