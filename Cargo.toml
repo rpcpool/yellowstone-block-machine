@@ -41,8 +41,8 @@ tokio-util = "0.7.16"
 tonic = "0.14.0"
 tracing = "0.1.0"
 tracing-subscriber = "0.3.0"
-yellowstone-grpc-client = "14.0.1"
-yellowstone-grpc-proto = "13.0.0"
+yellowstone-grpc-client = "15.0.0"
+yellowstone-grpc-proto = "14.0.1"
 yellowstone-block-machine = { path = "crates/yellowstone-block-machine" }
 
 [workspace.lints.clippy]
