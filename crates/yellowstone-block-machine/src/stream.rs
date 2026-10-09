@@ -195,6 +195,8 @@ pub struct BlockStream<Source, Adaptor, Acc> {
     machine: BlocksStateMachineWrapper,
     storage: Acc,
     pending: VecDeque<PendingEvent>,
+    // Some(updates) waits for block data; None means the block was already delivered.
+    block_delivery: FxHashMap<BankId, Option<Vec<SlotCommitmentStatusUpdate>>>,
     _adapter: PhantomData<Adaptor>,
 }
 
@@ -209,6 +211,7 @@ where
             machine: BlocksStateMachineWrapper::new_with_slot_gc_tracing(),
             storage: block_acc,
             pending: VecDeque::new(),
+            block_delivery: FxHashMap::default(),
             _adapter: PhantomData,
         }
     }
@@ -258,14 +261,24 @@ where
         while let Some(dlq_event) = self.machine.pop_next_dlq() {
             match dlq_event {
                 DeadletterEvent::Incomplete(bank_id) | DeadletterEvent::Discarded(bank_id) => {
-                    self.storage.prune_block(bank_id);
+                    self.prune_block(bank_id);
                 }
             }
         }
 
         while let Some(bank_id) = self.machine.pop_bank_gc_trace() {
-            self.storage.prune_block(bank_id);
+            self.prune_block(bank_id);
         }
+    }
+
+    fn prune_block(&mut self, bank_id: BankId) {
+        self.storage.prune_block(bank_id);
+        self.block_delivery.remove(&bank_id);
+        self.pending.retain(|event| match event {
+            PendingEvent::FrozenBlock(id) => *id != bank_id,
+            PendingEvent::SlotCommitmentUpdate(update) => update.bank_id != bank_id,
+            _ => true,
+        });
     }
 
     fn process_state_machine_output(&mut self) {
@@ -298,19 +311,20 @@ where
                 }
                 BlockStateMachineOutput::ForksDetected(fork_detected) => {
                     for bank_id in &fork_detected.bank_ids {
-                        self.storage.prune_block(*bank_id);
+                        self.prune_block(*bank_id);
                     }
                     self.pending
                         .push_back(PendingEvent::ForkDetected(fork_detected));
                 }
                 BlockStateMachineOutput::DeadSlotDetected(dead_block) => {
                     for bank_id in &dead_block.bank_ids {
-                        self.storage.prune_block(*bank_id);
+                        self.prune_block(*bank_id);
                     }
                     self.pending
                         .push_back(PendingEvent::DeadBlockDetect(dead_block));
                 }
                 BlockStateMachineOutput::BankDiscarded(discarded) => {
+                    self.prune_block(discarded.bank_id);
                     self.pending
                         .push_back(PendingEvent::BankDiscarded(discarded));
                 }
@@ -336,13 +350,28 @@ where
             if let Some(pending_ev) = self.pending.pop_front() {
                 let output = match pending_ev {
                     PendingEvent::FrozenBlock(bank_id) => {
+                        if matches!(self.block_delivery.get(&bank_id), Some(None)) {
+                            continue;
+                        }
                         if let Some(block) = self.storage.finish_block(bank_id) {
+                            self.block_delivery.insert(bank_id, None);
                             BlockMachineOutput::FrozenBlock(block)
                         } else {
+                            self.block_delivery
+                                .entry(bank_id)
+                                .or_insert_with(|| Some(Vec::new()));
                             continue;
                         }
                     }
                     PendingEvent::SlotCommitmentUpdate(update) => {
+                        if let Some(Some(updates)) = self.block_delivery.get_mut(&update.bank_id) {
+                            updates.push(update);
+                            continue;
+                        }
+                        // Finalized banks leave the state machine without a later GC trace.
+                        if update.commitment == CommitmentLevel::Finalized {
+                            self.block_delivery.remove(&update.bank_id);
+                        }
                         BlockMachineOutput::SlotCommitmentUpdate(update)
                     }
                     PendingEvent::ForkDetected(fork) => BlockMachineOutput::ForkDetected(fork),
@@ -383,13 +412,18 @@ where
                 }
             }
             self.process_state_machine_output();
-            // Some accumulator implementations stage sealing behind a readiness condition of
-            // their own (see `BlockAccumulator::pop_newly_sealed`) -- a bank_id popped here
-            // just became ready for `finish_block`, independent of (and possibly later than)
-            // whatever `PendingEvent::FrozenBlock` the state machine's own commitment delivery
-            // already queued (and which may have found the accumulator not ready yet).
+            // Issue #15: data readiness alone must not bypass the minimum commitment.
+            // Retry only banks whose commitment delivery is waiting for block data.
             while let Some(bank_id) = self.storage.pop_newly_sealed() {
-                self.pending.push_back(PendingEvent::FrozenBlock(bank_id));
+                if let Some(Some(updates)) = self.block_delivery.get_mut(&bank_id) {
+                    let updates = std::mem::take(updates);
+                    // Deferred updates precede any newer status queued by this event.
+                    for update in updates.into_iter().rev() {
+                        self.pending
+                            .push_front(PendingEvent::SlotCommitmentUpdate(update));
+                    }
+                    self.pending.push_front(PendingEvent::FrozenBlock(bank_id));
+                }
             }
         }
     }
@@ -876,12 +910,15 @@ mod tests {
         assert_eq!(store.blockhash(), [42; HASH_BYTES]);
     }
 
+    /// Issue #15: a bank waiting for data cannot emit its commitment alone.
+    /// ```text
+    /// slot 76 -> slot 77: bank 77 (missing data)
+    /// ```
     #[test]
-    fn skips_missing_frozen_block_and_emits_following_commitment_update() {
+    fn missing_frozen_block_holds_following_commitment_update() {
         let mut bs = empty_source_stream(CommitmentLevel::Processed);
 
-        // Simulate a pending FrozenBlock for a bank_id that no longer exists in storage,
-        // followed by a valid commitment update for the same bank.
+        // Simulate a commitment whose bank is not ready in storage yet.
         bs.pending.push_back(PendingEvent::FrozenBlock(77));
         bs.pending.push_back(PendingEvent::SlotCommitmentUpdate(
             SlotCommitmentStatusUpdate {
@@ -896,12 +933,67 @@ mod tests {
         let mut cx = Context::from_waker(&waker);
 
         let first = Pin::new(&mut bs).poll_next(&mut cx);
-        assert!(matches!(
-            first,
-            Poll::Ready(Some(Ok(BlockMachineOutput::SlotCommitmentUpdate(_))))
-        ));
+        assert!(matches!(first, Poll::Ready(None)));
+        assert_eq!(
+            bs.block_delivery.get(&77).unwrap().as_ref().unwrap().len(),
+            1
+        );
 
         let second = Pin::new(&mut bs).poll_next(&mut cx);
         assert!(matches!(second, Poll::Ready(None)));
+    }
+
+    /// Issue #15: pruning a bank clears deferred delivery and queued updates.
+    /// ```text
+    /// slot 76 -> slot 77: bank 77 (pruned), bank 78 (retained)
+    /// ```
+    #[test]
+    fn pruning_clears_block_delivery_state() {
+        let mut bs = empty_source_stream(CommitmentLevel::Processed);
+        bs.block_delivery.insert(77, Some(Vec::new()));
+        bs.block_delivery.insert(78, None);
+        bs.pending.push_back(PendingEvent::FrozenBlock(77));
+        bs.pending.push_back(PendingEvent::SlotCommitmentUpdate(
+            SlotCommitmentStatusUpdate {
+                parent_slot: Some(76),
+                slot: 77,
+                commitment: CommitmentLevel::Processed,
+                bank_id: 77,
+            },
+        ));
+        bs.pending.push_back(PendingEvent::FrozenBlock(78));
+        bs.prune_block(77);
+        assert!(!bs.block_delivery.contains_key(&77));
+        assert!(bs.block_delivery.contains_key(&78));
+        assert_eq!(bs.pending.len(), 1);
+        assert!(matches!(
+            bs.pending.front(),
+            Some(PendingEvent::FrozenBlock(78))
+        ));
+    }
+
+    /// Issue #15: final delivery must release bookkeeping even without a GC trace.
+    /// ```text
+    /// slot 76 -> slot 77: bank 77 (Finalized)
+    /// ```
+    #[test]
+    fn finalized_update_clears_block_delivery_state() {
+        let mut bs = empty_source_stream(CommitmentLevel::Processed);
+        bs.block_delivery.insert(77, None);
+        bs.pending.push_back(PendingEvent::SlotCommitmentUpdate(
+            SlotCommitmentStatusUpdate {
+                parent_slot: Some(76),
+                slot: 77,
+                commitment: CommitmentLevel::Finalized,
+                bank_id: 77,
+            },
+        ));
+        let waker = futures_util::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(matches!(
+            Pin::new(&mut bs).poll_next(&mut cx),
+            Poll::Ready(Some(Ok(BlockMachineOutput::SlotCommitmentUpdate(_))))
+        ));
+        assert!(bs.block_delivery.is_empty());
     }
 }

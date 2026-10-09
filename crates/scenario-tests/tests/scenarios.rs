@@ -37,8 +37,8 @@ async fn collect(mut stream: Stream) -> Vec<BlockMachineOutput<<DragonsmouthBloc
 }
 
 ///
-/// The bank_id a commitment update named as resolved -- unlike `FrozenBlock`, which any
-/// data-complete candidate can produce independently of whether it ever wins its slot.
+/// The bank_id named by a commitment update. At Processed, several competing banks can
+/// produce blocks and updates independently of whether they ever win their slot.
 ///
 const fn resolved_bank_id(
     output: &BlockMachineOutput<impl yellowstone_block_machine::stream::BlockEventStore>,
@@ -274,6 +274,13 @@ async fn interleaved_forks_still_resolve_the_confirmed_winner() {
     );
 
     let outputs = collect(block_stream).await;
+    assert_eq!(
+        outputs
+            .iter()
+            .filter_map(frozen_bank_id)
+            .collect::<Vec<_>>(),
+        vec![winner.bank_id]
+    );
     let resolved: HashMap<BankId, CommitmentLevel> = outputs
         .into_iter()
         .filter_map(|output| match output {
@@ -388,13 +395,11 @@ async fn competing_banks_for_the_same_slot_can_have_different_parents() {
         "C lost the fork at slot 12 to D and must never reach any commitment level"
     );
 
-    // Freezing is purely data-driven (see `seven_competing_banks_only_the_finalized_one_survives`
-    // above) -- C is just as data-complete as its siblings, so it freezes too, same as any
-    // losing candidate would. What actually marks it as having lost the fork is that it never
-    // reaches a commitment level, asserted above.
+    // Data completeness alone does not deliver a block: C never reaches Processed.
     assert!(frozen_bank_ids.contains(&a.bank_id));
     assert!(frozen_bank_ids.contains(&b.bank_id));
-    assert!(frozen_bank_ids.contains(&c.bank_id));
+    // C never reached the requested minimum commitment before it was discarded.
+    assert!(!frozen_bank_ids.contains(&c.bank_id));
     assert!(frozen_bank_ids.contains(&d.bank_id));
 
     // C's loss is also reported directly, block-level, via `BankDiscarded` -- exactly once. B is

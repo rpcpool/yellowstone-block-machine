@@ -85,6 +85,10 @@ They are expected and harmless.
    "every buffering bank" at the parent slot.
 10. **`FrozenBlock::entries` is sorted by `entry_index`.** The buffer is a hash map, so sort
     explicitly.
+11. **Block data readiness does not imply commitment.** `BlockStream` retries newly sealed
+    banks only after a commitment at or above the requested minimum asked for delivery.
+    Hold that bank's commitment updates until its block is emitted, and clear this delivery
+    state with the accumulator's prune signals (issue #15).
 
 ## How state is released
 
