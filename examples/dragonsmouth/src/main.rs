@@ -284,7 +284,7 @@ async fn main() {
         block_footer: hash_map! {
             "test".to_string() => Default::default(),
         },
-        commitment: Some(CommitmentLevel::Processed as i32),
+        commitment: Some(CommitmentLevel::Confirmed as i32),
         ..Default::default()
     };
 

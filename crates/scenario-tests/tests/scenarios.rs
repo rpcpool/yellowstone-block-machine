@@ -37,8 +37,8 @@ async fn collect(mut stream: Stream) -> Vec<BlockMachineOutput<<DragonsmouthBloc
 }
 
 ///
-/// The bank_id a commitment update named as resolved -- unlike `FrozenBlock`, which any
-/// data-complete candidate can produce independently of whether it ever wins its slot.
+/// The bank_id a commitment update named as resolved. At Processed, several competing banks of
+/// one slot can each reach it, so this does not by itself name the slot's winner.
 ///
 const fn resolved_bank_id(
     output: &BlockMachineOutput<impl yellowstone_block_machine::stream::BlockEventStore>,
@@ -388,13 +388,14 @@ async fn competing_banks_for_the_same_slot_can_have_different_parents() {
         "C lost the fork at slot 12 to D and must never reach any commitment level"
     );
 
-    // Freezing is purely data-driven (see `seven_competing_banks_only_the_finalized_one_survives`
-    // above) -- C is just as data-complete as its siblings, so it freezes too, same as any
-    // losing candidate would. What actually marks it as having lost the fork is that it never
-    // reaches a commitment level, asserted above.
+    // C is just as data-complete as its siblings, but a block is only emitted once its bank
+    // reaches the stream's minimum commitment (issue #15), and C never reaches any.
     assert!(frozen_bank_ids.contains(&a.bank_id));
     assert!(frozen_bank_ids.contains(&b.bank_id));
-    assert!(frozen_bank_ids.contains(&c.bank_id));
+    assert!(
+        !frozen_bank_ids.contains(&c.bank_id),
+        "C never reached Processed, so its block must not be emitted"
+    );
     assert!(frozen_bank_ids.contains(&d.bank_id));
 
     // C's loss is also reported directly, block-level, via `BankDiscarded` -- exactly once. B is
@@ -604,4 +605,165 @@ async fn block_is_delivered_only_once_its_footer_arrives() {
         unreachable!()
     };
     assert_eq!(block.events.bank_hash(), Some(bank_hash.to_bytes()));
+}
+
+///
+/// The block and commitment outputs in emission order, as `(bank_id, None)` for a `FrozenBlock`
+/// and `(bank_id, Some(level))` for a commitment update. Every other output is dropped.
+///
+fn delivery_trace(
+    outputs: &[BlockMachineOutput<impl yellowstone_block_machine::stream::BlockEventStore>],
+) -> Vec<(BankId, Option<CommitmentLevel>)> {
+    outputs
+        .iter()
+        .filter_map(|output| match output {
+            BlockMachineOutput::FrozenBlock(block) => Some((block.bank_id, None)),
+            BlockMachineOutput::SlotCommitmentUpdate(update) => {
+                Some((update.bank_id, Some(update.commitment)))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+///
+/// Issue #15: a block is only emitted once its bank reaches the stream's minimum commitment.
+/// Two data-complete banks compete for slot 10 and both reach Processed only, so a stream asking
+/// for Confirmed must emit neither block.
+///
+/// ```text
+/// slot 10: bank 1 (Processed)
+///          bank 2 (Processed)
+/// ```
+///
+#[tokio::test]
+async fn data_complete_banks_below_the_minimum_commitment_emit_no_block() {
+    let stream = SimulationBuilder::new()
+        .bank(&SimulatedBank::new(10, 1))
+        .processed(10, 1)
+        .bank(&SimulatedBank::new(10, 2))
+        .processed(10, 2)
+        .build();
+
+    let block_stream = BlockStream::<_, SubscribeUpdate, _>::new(
+        stream,
+        DragonsmouthBlockCumulator::default(),
+        CommitmentLevel::Confirmed,
+    );
+
+    let outputs = collect(block_stream).await;
+    assert_eq!(delivery_trace(&outputs), vec![]);
+}
+
+///
+/// AGENTS.md invariant 13: a bank already in flight when the subscription started missed part
+/// of its content, so it never freezes and nothing is emitted for it, neither its block nor its
+/// commitment updates. Its child, which started after the subscription, is unaffected.
+///
+/// ```text
+/// slot 11: bank 3 (CreatedBank before the subscription, Confirmed, Finalized)
+///   |
+/// slot 12: bank 4 (Confirmed, Finalized)
+/// ```
+///
+#[tokio::test]
+async fn bank_in_flight_at_subscription_start_emits_nothing() {
+    let mut in_flight = SimulationBuilder::new()
+        .bank(&SimulatedBank::new(11, 3))
+        .into_events();
+    in_flight.remove(0); // CreatedBank happened before the subscription started.
+    let child = SimulatedBank::new(12, 4).with_parent(11, Default::default());
+
+    let stream = SimulationBuilder::new()
+        .extend(in_flight)
+        .confirmed(11, 3)
+        .finalized(11, 3)
+        .bank(&child)
+        .confirmed(12, 4)
+        .finalized(12, 4)
+        .build();
+
+    let block_stream = BlockStream::<_, SubscribeUpdate, _>::new(
+        stream,
+        DragonsmouthBlockCumulator::default(),
+        CommitmentLevel::Confirmed,
+    );
+
+    let outputs = collect(block_stream).await;
+    assert_eq!(
+        delivery_trace(&outputs),
+        vec![
+            (4, None),
+            (4, Some(CommitmentLevel::Confirmed)),
+            (4, Some(CommitmentLevel::Finalized)),
+        ]
+    );
+}
+
+///
+/// AGENTS.md invariant 3: a Confirmed update discards the slot's other banks even when it names
+/// the bank the slot was already provisionally resolved to. Bank 1 freezes while it is slot 10's
+/// only bank, so the slot is resolved to it before bank 2 arrives. On a Processed stream both
+/// blocks go out, so the consumer must be told bank 2 lost once bank 1 is Confirmed.
+///
+/// ```text
+/// slot 10: bank 1 (frozen first, Processed, Confirmed, Finalized)
+///          bank 2 (frozen second, Processed) -> BankDiscarded
+/// ```
+///
+#[tokio::test]
+async fn confirming_the_first_bank_discards_its_later_sibling() {
+    let stream = SimulationBuilder::new()
+        .bank(&SimulatedBank::new(10, 1))
+        .processed(10, 1)
+        .bank(&SimulatedBank::new(10, 2))
+        .processed(10, 2)
+        .confirmed(10, 1)
+        .finalized(10, 1)
+        .build();
+
+    let block_stream = BlockStream::<_, SubscribeUpdate, _>::new(
+        stream,
+        DragonsmouthBlockCumulator::default(),
+        CommitmentLevel::Processed,
+    );
+
+    let outputs = collect(block_stream).await;
+    assert_eq!(
+        delivery_trace(&outputs),
+        vec![
+            (1, None),
+            (1, Some(CommitmentLevel::Processed)),
+            (2, None),
+            (2, Some(CommitmentLevel::Processed)),
+            (1, Some(CommitmentLevel::Confirmed)),
+            (1, Some(CommitmentLevel::Finalized)),
+        ]
+    );
+    assert_eq!(
+        outputs
+            .iter()
+            .filter_map(discarded_bank_id)
+            .collect::<Vec<_>>(),
+        vec![2],
+        "bank 2 lost slot 10 and must be reported exactly once"
+    );
+    let discarded_at = outputs
+        .iter()
+        .position(|output| discarded_bank_id(output) == Some(2))
+        .expect("bank 2 is discarded");
+    let confirmed_at = outputs
+        .iter()
+        .position(|output| {
+            matches!(
+                output,
+                BlockMachineOutput::SlotCommitmentUpdate(update)
+                    if update.bank_id == 1 && update.commitment == CommitmentLevel::Confirmed
+            )
+        })
+        .expect("bank 1 is confirmed");
+    assert!(
+        discarded_at < confirmed_at,
+        "the loser is reported no later than the winner's Confirmed update"
+    );
 }

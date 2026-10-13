@@ -111,9 +111,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 For a given slot:
 
-1. `FrozenBlock` is emitted before any commitment update for that slot.
-2. Commitment updates below the configured minimum are skipped.
-3. Fork/dead-slot outputs prune buffered data for the affected slot.
+1. `FrozenBlock` is emitted only for a bank that reached the configured minimum commitment.
+2. `FrozenBlock` is emitted before any commitment update for that bank.
+3. Commitment updates below the configured minimum are skipped.
+4. Fork/dead-slot outputs prune buffered data for the affected slot.
+5. A bank already in flight when the subscription started is ignored: neither its block nor
+   its commitment updates are emitted.
 
 ## Further reading
 

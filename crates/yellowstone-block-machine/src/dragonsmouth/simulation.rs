@@ -51,7 +51,9 @@
 ///
 pub use rand::rngs::StdRng;
 use {
-    crate::dragonsmouth::block_accumulator::{MUST_HAVE_SYSVAR_ACCOUNTS, SYSVAR_PROGRAM_ID},
+    crate::{
+        dragonsmouth::block_accumulator::SYSVAR_PROGRAM_ID, wrapper::MUST_HAVE_SYSVAR_ACCOUNTS,
+    },
     futures_util::Stream,
     rand::{Rng, RngCore, SeedableRng, seq::SliceRandom},
     solana_clock::{BankId, Slot},

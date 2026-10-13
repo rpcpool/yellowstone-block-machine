@@ -115,23 +115,6 @@ pub trait BlockAccumulator {
     /// sibling that resolved to a slot's canonical bank, or when a fork has been detected.
     ///
     fn prune_block(&mut self, bank_id: BankId);
-
-    ///
-    /// Pops a bank_id that just became ready for [`BlockAccumulator::finish_block`], if the
-    /// implementation stages sealing behind some readiness condition of its own (e.g. requiring
-    /// specific accounts to have been observed) rather than sealing unconditionally on
-    /// [`BlockAccumulator::freeze_block`].
-    ///
-    /// [`BlockStream`] calls [`BlockAccumulator::finish_block`] once, in response to the state
-    /// machine's own commitment delivery; if that call returns `None` because this
-    /// implementation wasn't ready yet, this is how it later tells [`BlockStream`] to retry once
-    /// it becomes ready on its own. Implementations that always seal immediately in
-    /// `freeze_block` (the common case) can leave this at its default, always-`None`
-    /// implementation.
-    ///
-    fn pop_newly_sealed(&mut self) -> Option<BankId> {
-        None
-    }
 }
 
 enum PendingEvent {
@@ -148,13 +131,17 @@ enum PendingEvent {
 #[derive(Debug, From)]
 pub enum BlockMachineOutput<EventStore> {
     ///
-    /// A fully reconstructed block, ready for processing.
+    /// A fully reconstructed block, ready for processing. Only sent once its bank reaches the
+    /// minimum commitment level set during initialization, so a bank that loses its slot to a
+    /// sibling below that level is never sent. A bank already in flight when the subscription
+    /// started never has all its content, so neither its block nor its commitment updates are
+    /// ever sent.
     ///
     FrozenBlock(Block<EventStore>),
     ///
     /// An update on the commitment status of a slot.
     /// Note: This is sent when the slot reaches or exceeds the minimum commitment level set during initialization.
-    /// It is guaranteed that the block for this slot has been sent before this update.
+    /// It is guaranteed that the block for this bank has been sent before this update.
     ///
     SlotCommitmentUpdate(SlotCommitmentStatusUpdate),
     ///
@@ -289,6 +276,18 @@ where
     ///
     pub fn banks_awaiting_footer(&self) -> usize {
         self.machine.banks_awaiting_footer()
+    }
+
+    ///
+    /// Counts the banks whose end-of-block markers all arrived but whose content is still
+    /// incomplete, so they can't freeze yet.
+    ///
+    /// # Returns
+    ///
+    /// See [`BlocksStateMachineWrapper::banks_awaiting_content`].
+    ///
+    pub fn banks_awaiting_content(&self) -> usize {
+        self.machine.banks_awaiting_content()
     }
 
     fn insert_into_storage(&mut self, event: Adaptor::EventT, ev_info: &GeyserEventInfo) {
@@ -427,14 +426,6 @@ where
                 }
             }
             self.process_state_machine_output();
-            // Some accumulator implementations stage sealing behind a readiness condition of
-            // their own (see `BlockAccumulator::pop_newly_sealed`) -- a bank_id popped here
-            // just became ready for `finish_block`, independent of (and possibly later than)
-            // whatever `PendingEvent::FrozenBlock` the state machine's own commitment delivery
-            // already queued (and which may have found the accumulator not ready yet).
-            while let Some(bank_id) = self.storage.pop_newly_sealed() {
-                self.pending.push_back(PendingEvent::FrozenBlock(bank_id));
-            }
         }
     }
 }
@@ -640,7 +631,10 @@ mod tests {
             BlockEventStore, BlockMachineConfig, BlockMachineOutput, BlockStream, PendingEvent,
             SimpleBlockAccumulator, SimpleBlockStore,
         },
-        crate::{event::GeyserEventAdapter, state_machine::SlotCommitmentStatusUpdate},
+        crate::{
+            dragonsmouth::block_accumulator::SYSVAR_PROGRAM_ID, event::GeyserEventAdapter,
+            state_machine::SlotCommitmentStatusUpdate, wrapper::MUST_HAVE_SYSVAR_ACCOUNTS,
+        },
         futures_util::{Stream, stream},
         solana_commitment_config::CommitmentLevel,
         solana_hash::{HASH_BYTES, Hash},
@@ -650,9 +644,9 @@ mod tests {
             task::{Context, Poll},
         },
         yellowstone_grpc_proto::geyser::{
-            SlotStatus, SubscribeUpdate, SubscribeUpdateAccount, SubscribeUpdateBlockMeta,
-            SubscribeUpdateEntry, SubscribeUpdateSlot, SubscribeUpdateTransaction,
-            subscribe_update::UpdateOneof,
+            SlotStatus, SubscribeUpdate, SubscribeUpdateAccount, SubscribeUpdateAccountInfo,
+            SubscribeUpdateBlockMeta, SubscribeUpdateEntry, SubscribeUpdateSlot,
+            SubscribeUpdateTransaction, subscribe_update::UpdateOneof,
         },
     };
 
@@ -740,6 +734,51 @@ mod tests {
         )
     }
 
+    fn sysvar_update(slot: u64, bank_id: u64, pubkey: [u8; 32]) -> SubscribeUpdate {
+        update(
+            UpdateOneof::Account(SubscribeUpdateAccount {
+                account: Some(SubscribeUpdateAccountInfo {
+                    pubkey: pubkey.to_vec(),
+                    owner: SYSVAR_PROGRAM_ID.to_bytes().to_vec(),
+                    ..Default::default()
+                }),
+                slot,
+                is_startup: false,
+                bank_id: Some(bank_id),
+            }),
+            vec!["test".to_string()],
+        )
+    }
+
+    ///
+    /// Feeds what every bank sends before its entries: `CreatedBank` and the must-have sysvars,
+    /// without which the driver never freezes it (AGENTS.md invariant 13).
+    ///
+    #[allow(clippy::type_complexity)]
+    fn start_bank(
+        stream: &mut BlockStream<
+            stream::Iter<std::vec::IntoIter<Result<SubscribeUpdate, io::Error>>>,
+            SubscribeUpdate,
+            SimpleBlockAccumulator<SubscribeUpdate>,
+        >,
+        slot: u64,
+        parent: u64,
+        bank_id: u64,
+    ) {
+        feed(
+            stream,
+            slot_update(
+                slot,
+                Some(parent),
+                SlotStatus::SlotCreatedBank,
+                Some(bank_id),
+            ),
+        );
+        for pubkey in MUST_HAVE_SYSVAR_ACCOUNTS {
+            feed(stream, sysvar_update(slot, bank_id, pubkey.to_bytes()));
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     fn feed(
         stream: &mut BlockStream<
@@ -792,6 +831,7 @@ mod tests {
             &mut bs,
             slot_update(10, Some(9), SlotStatus::SlotCompleted, None),
         );
+        start_bank(&mut bs, 10, 9, bank_id);
         feed(&mut bs, entry_update(10, 0, bank_id));
         feed(&mut bs, tx_update(10, bank_id));
         feed(&mut bs, account_update(10, Some(bank_id)));
@@ -812,7 +852,8 @@ mod tests {
         };
         assert_eq!(block.slot, 10);
         assert_eq!(block.bank_id, bank_id);
-        assert_eq!(block.events.events.len(), 3);
+        // 4 sysvars, the entry, the transaction and the account.
+        assert_eq!(block.events.events.len(), 7);
 
         let Poll::Ready(Some(Ok(BlockMachineOutput::SlotCommitmentUpdate(update)))) = second else {
             panic!("expected SlotCommitmentUpdate second");
@@ -835,6 +876,7 @@ mod tests {
             &mut bs,
             slot_update(42, Some(41), SlotStatus::SlotCompleted, None),
         );
+        start_bank(&mut bs, 42, 41, bank_id);
         feed(&mut bs, entry_update(42, 0, bank_id));
         feed(&mut bs, block_meta_update(42, 41, 1, bank_id));
 

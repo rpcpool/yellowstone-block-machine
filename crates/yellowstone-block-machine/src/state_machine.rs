@@ -593,6 +593,26 @@ impl BlocksStateMachine {
     }
 
     ///
+    /// Whether `bank_id`'s buffered content includes its `CreatedBank` and at least
+    /// `entry_count` distinct entries. The driver uses it to hold a bank's freeze until its
+    /// content is complete (AGENTS.md invariant 13).
+    ///
+    /// # Arguments
+    ///
+    /// * `bank_id` - The bank to check.
+    /// * `entry_count` - The entry count its BlockMeta reports.
+    ///
+    /// # Returns
+    ///
+    /// `false` if the bank has no buffer, e.g. because it already froze.
+    ///
+    pub fn has_created_bank_and_entries(&self, bank_id: BankId, entry_count: u64) -> bool {
+        self.block_buffer_map.get(&bank_id).is_some_and(|block| {
+            block.created_bank_seen && block.entries.len() as u64 >= entry_count
+        })
+    }
+
+    ///
     /// Infers a slot's resolved bank_id when it hasn't been named by a direct
     /// Confirmed/Finalized status update yet but there's exactly one known candidate for it —
     /// geyser doesn't guarantee a direct commitment status update arrives for every slot. With
@@ -765,7 +785,10 @@ impl BlocksStateMachine {
             self.try_infer_sole_candidate_winner(slot);
         } else {
             match self.resolved_bank_per_slot.get(&slot).copied() {
-                Some(existing) if existing == bank_id => {}
+                // The slot may only point at this bank from `try_infer_sole_candidate_winner`,
+                // guessed while it was the slot's only bank. A sibling registered since then was
+                // never discarded, so this authoritative update must discard it now.
+                Some(existing) if existing == bank_id => self.discard_losing_banks(slot, bank_id),
                 Some(existing) => {
                     let existing_floor = self.slot_min_commitment.get(&slot).copied();
                     if matches!(
@@ -3031,6 +3054,35 @@ mod tests {
             .collect();
         v.sort_unstable();
         v
+    }
+
+    ///
+    /// A Confirmed update for the bank its slot was already provisionally resolved to must still
+    /// discard that slot's other banks. Bank 1 freezes while it is slot 10's only bank, so
+    /// `try_infer_sole_candidate_winner` resolves the slot to it. Bank 2 arrives afterwards. When
+    /// bank 1 is then Confirmed, the resolution doesn't change, but bank 2 lost and must get its
+    /// `BankDiscarded` and DLQ `Discarded`, as it would had bank 2 been the one confirmed.
+    ///
+    /// ```text
+    /// slot 9 ── slot 10: bank 1 (frozen first, Confirmed)
+    ///                    bank 2 (frozen second) -> discarded
+    /// ```
+    ///
+    #[test]
+    fn confirming_the_provisionally_resolved_bank_discards_its_later_siblings() {
+        let mut sm = BlocksStateMachine::default();
+        seal(&mut sm, 10, Some(9), 1);
+        seal(&mut sm, 10, Some(9), 2);
+        sm.process_consensus_event(commitment(10, Some(9), CommitmentLevel::Processed, 1).into());
+        sm.process_consensus_event(commitment(10, Some(9), CommitmentLevel::Processed, 2).into());
+        assert_eq!(sorted_bank_discards(&drain(&mut sm)), vec![]);
+
+        sm.process_consensus_event(commitment(10, Some(9), CommitmentLevel::Confirmed, 1).into());
+
+        assert_eq!(sorted_bank_discards(&drain(&mut sm)), vec![(10, 2)]);
+        assert_eq!(dlq_discarded(&mut sm), vec![2]);
+        assert!(!sm.is_bank_trackable(2));
+        assert!(sm.is_bank_trackable(1));
     }
 
     ///
