@@ -71,6 +71,27 @@ pub struct EntryEvInfo {
 }
 
 ///
+/// A borrowed view over an Alpenglow block footer update.
+///
+/// Exactly one footer exists per bank. The Yellowstone backend sends it after all of the bank's
+/// content and right before its `BlockMeta`, followed by its commitment statuses. At the agave
+/// plugin interface it is less ordered: it follows all of the bank's entries, but is unordered
+/// relative to `BlockMeta` and commitment statuses (on leader slots it is only queued once the
+/// bank is frozen).
+///
+#[derive(Debug, Clone)]
+pub struct BlockFooterEvInfo {
+    pub slot: Slot,
+    pub bank_id: BankId,
+    pub bank_hash: [u8; HASH_BYTES],
+    ///
+    /// The user agent of the client that produced the block, decoded as UTF-8 with invalid
+    /// sequences replaced by U+FFFD (the wire carries raw bytes).
+    ///
+    pub block_user_agent: String,
+}
+
+///
 /// A borrowed, wire-format-agnostic view over a single Geyser event, produced by a
 /// [`GeyserEventAdapter`].
 ///
@@ -83,6 +104,7 @@ pub enum GeyserEventInfo {
     Slot(SlotUpdateEvInfo),
     BlockMeta(BlockMetaEvInfo),
     Entry(EntryEvInfo),
+    BlockFooter(BlockFooterEvInfo),
     SysvarAccount {
         slot: Slot,
         ///
@@ -104,6 +126,7 @@ impl GeyserEventInfo {
             GeyserEventInfo::Slot(ev) => ev.slot,
             GeyserEventInfo::BlockMeta(ev) => ev.slot,
             GeyserEventInfo::Entry(ev) => ev.slot,
+            GeyserEventInfo::BlockFooter(ev) => ev.slot,
             GeyserEventInfo::BankData { slot, .. } => *slot,
             GeyserEventInfo::SysvarAccount { slot, .. } => *slot,
         }
@@ -119,6 +142,7 @@ impl GeyserEventInfo {
             GeyserEventInfo::Slot(ev) => ev.bank_id,
             GeyserEventInfo::BlockMeta(ev) => Some(ev.bank_id),
             GeyserEventInfo::Entry(ev) => Some(ev.bank_id),
+            GeyserEventInfo::BlockFooter(ev) => Some(ev.bank_id),
             GeyserEventInfo::BankData { bank_id, .. } => Some(*bank_id),
             GeyserEventInfo::SysvarAccount { bank_id, .. } => Some(*bank_id),
         }

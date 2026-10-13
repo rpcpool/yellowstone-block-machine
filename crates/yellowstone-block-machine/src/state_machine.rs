@@ -54,9 +54,7 @@ pub struct BlockSummary {
     pub blockhash: Hash,
     pub parent_blockhash: Hash,
     ///
-    /// Unix timestamp the block was produced at. `0` if the wire didn't report one (this is
-    /// also what the optimistic-freeze path forges, since it has no wire `BlockMeta` to draw
-    /// this from).
+    /// Unix timestamp the block was produced at. `0` if the wire didn't report one.
     ///
     pub block_time: u64,
     pub bank_id: BankId,
@@ -95,7 +93,6 @@ pub struct Block {
     pub slot: Slot,
     pub bank_id: BankId,
     entries: FxHashMap<u64, EntryInfo>,
-    entry_cnt: u64,
     tick_entry_cnt: u64,
     created_at: std::time::Instant,
     created_bank_seen: bool,
@@ -157,7 +154,6 @@ impl Block {
             bank_id,
             entries: Default::default(),
             created_at: clock,
-            entry_cnt: 0,
             tick_entry_cnt: 0,
             created_bank_seen: false,
         }
@@ -165,12 +161,6 @@ impl Block {
 
     pub fn new(slot: Slot, bank_id: BankId) -> Self {
         Self::new_with_clock(slot, bank_id, Instant::now())
-    }
-
-    fn last_entry_hash(&self) -> Option<Hash> {
-        self.entries
-            .get(&(self.entry_cnt - 1))
-            .map(|entry| entry.entry_hash)
     }
 
     fn freeze(self, summary: &BlockSummary) -> FrozenBlock {
@@ -194,38 +184,11 @@ impl Block {
         }
     }
 
-    fn can_be_optimistic_frozen(&self) -> bool {
-        if self.entry_cnt == 0 {
-            return false;
-        }
-
-        (0..self.entry_cnt).all(|idx| self.entries.contains_key(&idx))
-    }
-
-    fn forge_optimistic_block_summary(&self, parent_slot: Slot) -> BlockSummary {
-        BlockSummary {
-            slot: self.slot,
-            bank_id: self.bank_id,
-            parent_slot,
-            entry_count: self.entry_cnt,
-            executed_transaction_count: self.entries.values().map(|e| e.executed_txn_count).sum(),
-            blockhash: self.last_entry_hash().expect("last entry hash"),
-            // Genuinely unknown in a forged summary -- the real BlockMeta never arrived, which
-            // is exactly why this recovery path exists.
-            parent_blockhash: Hash::default(),
-            block_time: 0,
-        }
-    }
-
     fn insert_entry(&mut self, block_entry: EntryInfo) {
         let entry_idx = block_entry.entry_index;
         let tx_count = block_entry.executed_txn_count;
-        if self.entries.insert(entry_idx, block_entry).is_none() {
-            self.entry_cnt += 1;
-
-            if tx_count == 0 {
-                self.tick_entry_cnt += 1;
-            }
+        if self.entries.insert(entry_idx, block_entry).is_none() && tx_count == 0 {
+            self.tick_entry_cnt += 1;
         }
     }
 }
@@ -234,12 +197,6 @@ type Revision = usize;
 
 #[derive(Debug)]
 pub enum DeadletterEvent {
-    ///
-    /// A bank instance the state machine gave up trying to freeze -- optimistic freeze found no
-    /// entries, or no known parent, to forge a summary from. Never resolved, never had valid
-    /// content. See [`BlocksStateMachine::execute_optimistic_freeze_for_needed_banks`].
-    ///
-    Incomplete(BankId),
     ///
     /// A bank instance that was fully valid -- it may have already frozen and delivered a real
     /// block -- but lost the slot's resolution to a sibling once `Confirmed`/`Finalized` named a
@@ -524,12 +481,6 @@ pub struct BlocksStateMachine {
     retroactively_rooted_slots: FxHashSet<Slot>,
 
     ///
-    /// Keep track of bank instances that need optimistic freeze because a descendant slot was
-    /// frozen before them.
-    ///
-    need_optimistic_freeze: FxHashSet<BankId>,
-
-    ///
     /// Bank ids snapshotted for a slot marked dead this same tick, taken *before*
     /// [`Self::remove_slot_references_in_state`] wipes its `slot_to_banks` entry. Only populated
     /// when the slot is confirmed to be newly forked (about to be flushed by
@@ -573,7 +524,6 @@ impl BlocksStateMachine {
             dead_blocks_queue: Default::default(),
             retroactively_rooted_slots: Default::default(),
             forks_detected_in_current_tick: Default::default(),
-            need_optimistic_freeze: Default::default(),
             dead_slot_bank_ids_snapshot: Default::default(),
             skipped_slot_bank_ids_snapshot: Default::default(),
         }
@@ -625,6 +575,21 @@ impl BlocksStateMachine {
     ///
     pub fn is_bank_trackable(&self, bank_id: BankId) -> bool {
         !self.discarded_bank_ids.contains_key(&bank_id)
+    }
+
+    ///
+    /// Whether `bank_id` already froze, i.e. its `BlockSummary` was already processed.
+    ///
+    /// # Arguments
+    ///
+    /// * `bank_id` - The bank to check.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the bank froze and hasn't been torn down since.
+    ///
+    pub fn is_bank_frozen(&self, bank_id: BankId) -> bool {
+        self.frozen_commitment_index.contains_key(&bank_id)
     }
 
     ///
@@ -680,9 +645,7 @@ impl BlocksStateMachine {
     /// content (if any) is dropped from this state machine's own bookkeeping via
     /// [`Self::remove_bank_references`], but a downstream payload accumulator (keyed by bank_id,
     /// not `Slot`) has no way to learn that on its own -- it is never told a loser existed unless
-    /// this pushes a [`DeadletterEvent::Discarded`] for it, the same channel
-    /// [`Self::execute_optimistic_freeze_for_needed_banks`] already uses to report a bank this
-    /// crate gave up on. A [`BlockStateMachineOutput::BankDiscarded`] is also emitted for each
+    /// this pushes a [`DeadletterEvent::Discarded`] for it. A [`BlockStateMachineOutput::BankDiscarded`] is also emitted for each
     /// loser -- the outward-facing counterpart, for a consumer that wants to know a specific
     /// bank_id lost its slot (as opposed to [`BlockStateMachineOutput::ForksDetected`], which is
     /// about the *slot* diverging from the canonical chain, not about bank-level competition).
@@ -718,7 +681,6 @@ impl BlocksStateMachine {
         self.frozen_commitment_index.remove(&bank_id);
         self.pending_slot_status_update.remove(&bank_id);
         self.bank_parent_slot.remove(&bank_id);
-        self.need_optimistic_freeze.remove(&bank_id);
     }
 }
 
@@ -1264,37 +1226,6 @@ impl BlocksStateMachine {
             self.mark_skipped_slots_below(slot);
         }
 
-        // This should never happen, but in case it does we will try to optimistically freeze
-        // whichever bank at the parent slot this child's own BlockMeta names as its parent --
-        // identified by content, not by consensus resolution: a still-buffering candidate's
-        // would-be blockhash (`last_entry_hash`, the same value `forge_optimistic_block_summary`
-        // would freeze it with) must match `block_summary.parent_blockhash` byte-for-byte. Under
-        // bank_id keying the parent slot can legitimately have more than one bank instance, and
-        // only the one this child's hash cryptographically names is ever the real parent; any
-        // other still-buffering bank there is a competing instance awaiting discard, not a late
-        // winner, and matching by hash (rather than by resolution, which may not have happened
-        // yet, or by "every buffering bank", which fabricates blocks for losers) is both more
-        // precise and available earlier. `Hash::default()` is the sentinel this crate's own
-        // forged summaries use for "unknown" (see `forge_optimistic_block_summary`), so a child
-        // reporting it can never be matched against here -- there is nothing to safely identify.
-        if block_summary.parent_blockhash != Hash::default() {
-            if let Some(parent_ids) = self.slot_to_banks.get(&block_summary.parent_slot).cloned() {
-                for parent_bank_id in parent_ids {
-                    if let Some(block) = self.block_buffer_map.get(&parent_bank_id) {
-                        if block.can_be_optimistic_frozen()
-                            && block.last_entry_hash() == Some(block_summary.parent_blockhash)
-                        {
-                            tracing::warn!(
-                                "Freezing bank {bank_id} (slot {slot}) whose parent slot {} still has bank {parent_bank_id} in the buffer, identified as the parent by matching blockhash",
-                                block_summary.parent_slot
-                            );
-                            self.need_optimistic_freeze.insert(parent_bank_id);
-                        }
-                    }
-                }
-            }
-        }
-
         tracing::debug!("Block frozen for bank {bank_id} (slot {slot})");
         self.push_new_update(BlockStateMachineOutput::FrozenBlock(frozen_block));
 
@@ -1354,42 +1285,7 @@ impl BlocksStateMachine {
 
         self.process_retroactively_rooted_slots();
         self.flush_forks_detected_in_current_tick();
-        self.execute_optimistic_freeze_for_needed_banks();
         Ok(())
-    }
-
-    fn execute_optimistic_freeze_for_needed_banks(&mut self) {
-        if self.need_optimistic_freeze.is_empty() {
-            return;
-        }
-        let bank_ids = std::mem::take(&mut self.need_optimistic_freeze);
-        for bank_id in bank_ids {
-            // Check if we can freeze the block: we must have some entry to compute the block
-            // hash, and a known parent slot to attribute it to.
-            if let Some(block) = self.block_buffer_map.get(&bank_id) {
-                let slot = block.slot;
-                let parent_slot = self.bank_parent_slot.get(&bank_id).copied();
-
-                match (block.can_be_optimistic_frozen(), parent_slot) {
-                    (true, Some(parent_slot)) => {
-                        let forged_block_summary =
-                            block.forge_optimistic_block_summary(parent_slot);
-                        tracing::warn!(
-                            "Recovered block summary for bank {bank_id} (slot {slot}): {forged_block_summary:?}"
-                        );
-                        self.handle_block_summary(forged_block_summary)
-                            .expect("untracked");
-                    }
-                    _ => {
-                        tracing::error!(
-                            "Cannot optimistically freeze bank {bank_id} (slot {slot}) because it has no entries or no known parent"
-                        );
-                        self.remove_bank_references(bank_id);
-                        self.push_to_dlq(DeadletterEvent::Incomplete(bank_id));
-                    }
-                }
-            }
-        }
     }
 
     pub fn process_consensus_event(&mut self, event: ConsensusUpdate) {
@@ -2122,11 +2018,13 @@ mod tests {
     }
 
     ///
-    /// AUDIT.md finding 1: optimistic freeze fabricates blocks for sibling banks.
+    /// AGENTS.md invariant 9 (originally AUDIT.md finding 1): a bank at the parent slot that
+    /// never received a `BlockMeta` must not be frozen just because a child froze.
     ///
-    /// A bank at the parent slot that never received a `BlockMeta` is not a late winner, it is a
-    /// competing instance awaiting discard. Freezing it forges a blockhash from the last entry
-    /// hash and invents a zero `parent_blockhash` and a zero `block_time`.
+    /// ```text
+    /// slot 9 ── slot 10 ┬─ bank 1000 (BlockMeta) ── slot 11, bank 1100 (BlockMeta)
+    ///                   └─ bank 1001 (entries only, never frozen)
+    /// ```
     ///
     #[test]
     fn audit_1_no_fabricated_block_for_parent_slot_sibling() {
@@ -2156,21 +2054,23 @@ mod tests {
     }
 
     ///
-    /// AUDIT.md finding 1, positive case: legitimate optimistic-freeze recovery still works, and
-    /// now identifies the true parent by content -- its own would-be blockhash matching the
-    /// child's declared `parent_blockhash` -- rather than by consensus resolution. That means it
-    /// recovers even *before* the parent slot has resolved, which a resolution-gated fix could
-    /// not do.
+    /// AGENTS.md invariant 9: a bank freezes only from its own `BlockMeta`. Even when a child's
+    /// `BlockMeta` names the parent bank's last entry hash as its `parent_blockhash`, the parent
+    /// is not frozen from a forged summary; it waits for its own `BlockMeta`.
+    ///
+    /// ```text
+    /// slot 19 ── slot 20, bank 2000 (entries only) ── slot 21, bank 2100 (BlockMeta,
+    ///                                                 parent_blockhash = bank 2000's last entry)
+    /// ```
     ///
     #[test]
-    fn audit_1b_optimistic_freeze_still_recovers_the_real_parent_by_hash() {
+    fn parent_without_block_meta_is_never_frozen_from_a_forged_summary() {
         let mut sm = BlocksStateMachine::default();
         let parent_bank = 2000;
         let last_hash = Hash::new_unique();
 
         // Parent slot 20 has a single bank that received all its entries but never got a
-        // BlockMeta -- the classic recovery scenario -- and slot 20 is NOT yet resolved (no
-        // commitment update at all was ever seen for it).
+        // BlockMeta, and slot 20 is not resolved (no commitment update was ever seen for it).
         sm.process_replay_event(created_bank(20, Some(19), parent_bank).into())
             .unwrap();
         for i in 0..3u64 {
@@ -2229,10 +2129,16 @@ mod tests {
         .unwrap();
 
         let ids = frozen_bank_ids(&drain(&mut sm));
-        assert!(
-            ids.contains(&parent_bank),
-            "the parent bank's own last entry hash matches the child's declared              parent_blockhash, so it must be recovered by optimistic freeze even though slot 20              never resolved, got frozen banks {ids:?}"
+        assert_eq!(
+            ids,
+            vec![2100],
+            "only the child received a BlockMeta, got frozen banks {ids:?}"
         );
+        assert!(
+            sm.block_buffer_map.contains_key(&parent_bank),
+            "the parent keeps buffering until its own BlockMeta arrives"
+        );
+        assert!(sm.pop_next_dlq().is_none());
     }
 
     ///
@@ -2585,8 +2491,7 @@ mod tests {
         }
         let mut dlq = Vec::new();
         while let Some(event) = sm.pop_next_dlq() {
-            let (DeadletterEvent::Incomplete(bank_id) | DeadletterEvent::Discarded(bank_id)) =
-                event;
+            let DeadletterEvent::Discarded(bank_id) = event;
             dlq.push(bank_id);
         }
 
@@ -2808,9 +2713,8 @@ mod tests {
     fn dlq_discarded(sm: &mut BlocksStateMachine) -> Vec<BankId> {
         let mut v = Vec::new();
         while let Some(event) = sm.pop_next_dlq() {
-            if let DeadletterEvent::Discarded(bank_id) = event {
-                v.push(bank_id);
-            }
+            let DeadletterEvent::Discarded(bank_id) = event;
+            v.push(bank_id);
         }
         v.sort_unstable();
         v
