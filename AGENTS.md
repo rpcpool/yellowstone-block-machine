@@ -123,6 +123,11 @@ They are expected and harmless.
     queued in the state machine: nothing is ever emitted for it. The driver drops its tracking
     after `MAX_UNRESOLVED_SLOT_AGE`, and `gc` pass 2 reclaims the rest.
 
+14. **Reject malformed stream input before changing state.** Invalid block and entry hashes
+    are dropped by the adapter. A BlockSummary for a different slot than its buffered bank
+    returns Err(UntrackedSlot) before consuming the buffer or registering the claimed slot
+    (issue #19). The original bank must remain available for a valid summary.
+
 ## How state is released
 
 Downstream consumers hold per-bank data and cannot tell on their own that a bank is finished.

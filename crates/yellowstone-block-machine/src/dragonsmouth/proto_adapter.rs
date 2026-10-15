@@ -44,7 +44,13 @@ impl GeyserEventAdapter for SubscribeUpdate {
                     entries_count: block_meta.entries_count,
                     executed_transaction_count: block_meta.executed_transaction_count,
                     blockhash: solana_hash::Hash::from_str(&block_meta.blockhash)
-                        .expect("blockhash format")
+                        .inspect_err(|error| {
+                            tracing::error!(
+                                "UNEXPECTED: invalid blockhash for slot {}: {error}. Dropping.",
+                                block_meta.slot
+                            )
+                        })
+                        .ok()?
                         .to_bytes(),
                     // Lenient, unlike `blockhash` above -- genesis's parent_blockhash is empty,
                     // not a valid base58 hash.
@@ -62,7 +68,17 @@ impl GeyserEventAdapter for SubscribeUpdate {
                 index: entry.index,
                 starting_transaction_index: entry.starting_transaction_index,
                 executed_transaction_count: entry.executed_transaction_count,
-                hash: entry.hash.as_slice().try_into().expect("entry hash length"),
+                hash: entry
+                    .hash
+                    .as_slice()
+                    .try_into()
+                    .inspect_err(|error| {
+                        tracing::error!(
+                            "UNEXPECTED: invalid entry hash for slot {}: {error}. Dropping.",
+                            entry.slot
+                        )
+                    })
+                    .ok()?,
                 bank_id: entry.bank_id,
                 // filters: event.filters.as_slice(),
             })),
@@ -129,5 +145,74 @@ impl GeyserEventAdapter for SubscribeUpdate {
             }
             UpdateOneof::EntryUpdateParent(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yellowstone_grpc_proto::geyser::{SubscribeUpdateBlockMeta, SubscribeUpdateEntry};
+
+    /// Issue #19: reject malformed hashes while retaining valid wire values.
+    #[test]
+    fn malformed_blockhashes_are_dropped() {
+        for blockhash in ["", "invalid", "111"] {
+            let event = SubscribeUpdate {
+                update_oneof: Some(UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
+                    blockhash: blockhash.to_string(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            assert!(SubscribeUpdate::extract_geyser_ev_info(&event).is_none());
+        }
+    }
+
+    /// Issue #19: reject entries whose hash is not exactly 32 bytes.
+    #[test]
+    fn malformed_entry_hashes_are_dropped() {
+        for len in [0, 31, 33] {
+            let event = SubscribeUpdate {
+                update_oneof: Some(UpdateOneof::Entry(SubscribeUpdateEntry {
+                    hash: vec![1; len],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            assert!(SubscribeUpdate::extract_geyser_ev_info(&event).is_none());
+        }
+    }
+
+    /// Issue #19: an empty genesis parent hash remains accepted.
+    #[test]
+    fn valid_hashes_are_preserved() {
+        let hash = solana_hash::Hash::new_unique();
+        let event = SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::BlockMeta(SubscribeUpdateBlockMeta {
+                blockhash: hash.to_string(),
+                parent_blockhash: String::new(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let Some(GeyserEventInfo::BlockMeta(meta)) =
+            SubscribeUpdate::extract_geyser_ev_info(&event)
+        else {
+            panic!("valid block metadata must be accepted");
+        };
+        assert_eq!(meta.blockhash, hash.to_bytes());
+        assert_eq!(meta.parent_blockhash, [0; 32]);
+        let event = SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Entry(SubscribeUpdateEntry {
+                hash: hash.to_bytes().to_vec(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let Some(GeyserEventInfo::Entry(entry)) = SubscribeUpdate::extract_geyser_ev_info(&event)
+        else {
+            panic!("valid entry must be accepted");
+        };
+        assert_eq!(entry.hash, hash.to_bytes());
     }
 }

@@ -1217,6 +1217,16 @@ impl BlocksStateMachine {
             return Err(UntrackedSlot);
         }
 
+        // Issue #19: reject conflicting metadata before consuming or registering the bank.
+        if let Some(block) = self.block_buffer_map.get(&bank_id)
+            && block.slot != slot
+        {
+            tracing::error!(
+                "UNEXPECTED: block summary for bank {bank_id} has slot {slot}, but the buffered bank has slot {}. Dropping.",
+                block.slot
+            );
+            return Err(UntrackedSlot);
+        }
         self.register_bank_for_slot(slot, bank_id);
         self.bank_parent_slot
             .entry(bank_id)
@@ -1527,6 +1537,47 @@ mod tests {
         solana_hash::Hash,
     };
 
+    ///
+    /// Issue #19: a summary for another slot must not consume the buffered bank.
+    /// ```text
+    /// 99 -- 100 [bank 1000]
+    ///       101 [BlockMeta claims bank 1000: reject]
+    /// ```
+    ///
+    #[test]
+    fn mismatched_summary_preserves_buffered_bank() {
+        let mut sm = BlocksStateMachine::default();
+        buffer(&mut sm, 100, Some(99), 1000, 1);
+        drain(&mut sm);
+        let mut summary = BlockSummary {
+            slot: 101,
+            bank_id: 1000,
+            parent_slot: 99,
+            entry_count: 1,
+            executed_transaction_count: 10,
+            blockhash: Hash::new_unique(),
+            parent_blockhash: Hash::default(),
+            block_time: 0,
+        };
+        assert!(sm.process_replay_event(summary.clone().into()).is_err());
+        assert_eq!(sm.block_buffer_map.get(&1000).unwrap().slot, 100);
+        assert!(!sm.slot_to_banks.contains_key(&101));
+        assert!(!sm.frozen_commitment_index.contains_key(&1000));
+        assert!(drain(&mut sm).is_empty());
+        summary.slot = 100;
+        sm.process_replay_event(summary.into()).unwrap();
+        let outputs = drain(&mut sm);
+        assert_eq!(frozen_bank_ids(&outputs), vec![1000]);
+        let frozen = outputs
+            .iter()
+            .find_map(|output| match output {
+                BlockStateMachineOutput::FrozenBlock(block) => Some(block),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(frozen.slot, 100);
+        assert_eq!(frozen.entries.len(), 1);
+    }
     fn generate_entries(
         slot: Slot,
         bank_id: BankId,
