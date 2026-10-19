@@ -527,6 +527,24 @@ where
         forks_detected.extend(self.mark_children_as_forks(slot))
     }
 
+    ///
+    /// Issue #21: a confirmed repair proves its slot and ancestors are canonical, even if an
+    /// earlier bank died. Clear only that lineage, without rooting it or reviving siblings.
+    /// Stop at the first unmarked node: fork markers propagate from parents to children.
+    ///
+    pub(crate) fn clear_forked_ancestry(&mut self, mut slot: T) -> Vec<T> {
+        let mut restored = Vec::new();
+        while self.forked_slots.remove(&slot) {
+            let parent = self.reverse_parent_children_map.get(&slot).cloned();
+            restored.push(slot);
+            let Some(parent) = parent else {
+                break;
+            };
+            slot = parent;
+        }
+        restored
+    }
+
     pub fn make_slot_rooted<TTracer>(&mut self, slot: T, newly_forked_slot_out: &mut TTracer)
     where
         TTracer: ForksMutationTracer<T>,

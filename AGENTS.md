@@ -123,6 +123,11 @@ They are expected and harmless.
     queued in the state machine: nothing is ever emitted for it. The driver drops its tracking
     after `MAX_UNRESOLVED_SLOT_AGE`, and `gc` pass 2 reclaims the rest.
 
+14. **A confirmed repair restores only its canonical ancestry.** Dead banks stay discarded,
+    but their slot-level fork markers must not poison a later confirmed bank and its children
+    (issue #21). Clear markers on the confirmed lineage, including when its parent is learned
+    late; never clear siblings or treat Confirmed as Finalized. Processed alone cannot restore it.
+
 ## How state is released
 
 Downstream consumers hold per-bank data and cannot tell on their own that a bank is finished.

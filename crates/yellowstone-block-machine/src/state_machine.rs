@@ -658,6 +658,20 @@ impl BlocksStateMachine {
             &mut multiset,
             &mut self.retroactively_rooted_slots,
         );
+        // A confirmed bank may learn its parent only when BlockMeta arrives (issue #21).
+        if matches!(
+            self.slot_min_commitment.get(&slot),
+            Some(CommitmentLevel::Confirmed) | Some(CommitmentLevel::Finalized)
+        ) {
+            self.restore_confirmed_ancestry(slot);
+        }
+    }
+
+    fn restore_confirmed_ancestry(&mut self, slot: Slot) {
+        // Keep forks_history until gc so discarded bank tombstones can still be reclaimed.
+        for restored in self.forks.clear_forked_ancestry(slot) {
+            self.forks_detected_in_current_tick.remove(&restored);
+        }
     }
 
     ///
@@ -814,6 +828,9 @@ impl BlocksStateMachine {
             if commitment_rank(commitment) > commitment_rank(*floor) {
                 *floor = commitment;
             }
+            // Confirmation can supersede a dead bank's slot-level fork marker (issue #21).
+            // Processed alone must not revive that lineage; discarded bank IDs stay discarded.
+            self.restore_confirmed_ancestry(slot);
             self.mark_skipped_slots_below(slot);
         }
 
@@ -2764,6 +2781,121 @@ mod tests {
     ) {
         seal(sm, slot, Some(parent), bank_id);
         sm.process_consensus_event(commitment(slot, Some(parent), level, bank_id).into());
+    }
+
+    ///
+    /// Issue #21: a confirmed repair must not fork-report its canonical descendants.
+    /// The old bank may have entered the fork graph before it died.
+    /// ```text
+    /// 41(C) -- 42[10, dead]
+    ///       \-- 42[11, C] -- 43(C) -- ... -- 110(C)
+    /// ```
+    ///
+    #[test]
+    fn confirmed_repair_stops_fork_reports_for_later_slots() {
+        for old_bank_resolved in [false, true] {
+            let mut sm = BlocksStateMachine {
+                forks: crate::forks::Forks::with_max_capacity(2),
+                ..Default::default()
+            };
+            seal_at(&mut sm, 41, 40, 410, CommitmentLevel::Confirmed);
+            if old_bank_resolved {
+                seal_at(&mut sm, 42, 41, 10, CommitmentLevel::Processed);
+            } else {
+                buffer(&mut sm, 42, Some(41), 10, 2);
+            }
+            sm.process_replay_event(dead(42).into()).unwrap();
+            seal_at(&mut sm, 42, 41, 11, CommitmentLevel::Confirmed);
+            assert!(!sm.forks.is_rooted_slot(&42), "Confirmed is not Finalized");
+            assert!(!sm.is_bank_trackable(10), "the dead bank stays discarded");
+            drain(&mut sm);
+
+            let mut forked = Vec::new();
+            for slot in 43..=110 {
+                seal_at(
+                    &mut sm,
+                    slot,
+                    slot - 1,
+                    slot * 10,
+                    CommitmentLevel::Confirmed,
+                );
+                if slot >= 74 {
+                    let finalized = slot - 32;
+                    let bank = if finalized == 42 { 11 } else { finalized * 10 };
+                    sm.process_consensus_event(
+                        commitment(
+                            finalized,
+                            Some(finalized - 1),
+                            CommitmentLevel::Finalized,
+                            bank,
+                        )
+                        .into(),
+                    );
+                }
+                forked.extend(sorted_fork_reports(&drain(&mut sm)));
+                sm.gc(None);
+            }
+            assert!(forked.is_empty(), "false fork reports: {forked:?}");
+            assert!(
+                !sm.discarded_bank_ids.contains_key(&10),
+                "gc reclaims the dead bank tombstone"
+            );
+        }
+    }
+
+    ///
+    /// Issue #21: only a confirmed lineage can retract a dead slot's fork markers.
+    /// Siblings outside that lineage remain forked.
+    /// ```text
+    /// 41 -- 42[10, dead]
+    ///   \-- 42[11, P] -- 43(P -> C) -- 46(P)
+    ///                 \-- 44(P) -- 45(P)
+    /// ```
+    ///
+    #[test]
+    fn confirmed_descendant_restores_only_its_ancestry() {
+        let mut sm = BlocksStateMachine::default();
+        seal_at(&mut sm, 41, 40, 410, CommitmentLevel::Confirmed);
+        buffer(&mut sm, 42, Some(41), 10, 2);
+        sm.process_replay_event(dead(42).into()).unwrap();
+        seal_at(&mut sm, 42, 41, 11, CommitmentLevel::Processed);
+        drain(&mut sm);
+        seal_at(&mut sm, 43, 42, 430, CommitmentLevel::Processed);
+        assert_eq!(sorted_fork_reports(&drain(&mut sm)), vec![(43, vec![430])]);
+        seal_at(&mut sm, 44, 42, 440, CommitmentLevel::Processed);
+        drain(&mut sm);
+
+        sm.process_consensus_event(
+            commitment(43, Some(42), CommitmentLevel::Confirmed, 430).into(),
+        );
+        assert!(!sm.forks.is_rooted_slot(&42));
+        assert!(!sm.forks.is_rooted_slot(&43));
+        drain(&mut sm);
+        seal_at(&mut sm, 46, 43, 460, CommitmentLevel::Processed);
+        assert!(fork_reports(&drain(&mut sm)).is_empty());
+        seal_at(&mut sm, 45, 44, 450, CommitmentLevel::Processed);
+        assert_eq!(sorted_fork_reports(&drain(&mut sm)), vec![(45, vec![450])]);
+        assert!(!sm.is_bank_trackable(10));
+    }
+
+    ///
+    /// Issue #21: a confirmed child's parent can become known only at BlockMeta.
+    /// ```text
+    /// 41 -- 42[dead, then repaired P] -- 43(C, parent learned late) -- 44(P)
+    /// ```
+    ///
+    #[test]
+    fn confirmed_child_with_late_parent_restores_repaired_ancestry() {
+        let mut sm = BlocksStateMachine::default();
+        seal_at(&mut sm, 41, 40, 410, CommitmentLevel::Confirmed);
+        buffer(&mut sm, 42, Some(41), 10, 2);
+        sm.process_replay_event(dead(42).into()).unwrap();
+        seal_at(&mut sm, 42, 41, 11, CommitmentLevel::Processed);
+        sm.process_consensus_event(commitment(43, None, CommitmentLevel::Confirmed, 430).into());
+        seal(&mut sm, 43, Some(42), 430);
+        drain(&mut sm);
+        seal_at(&mut sm, 44, 43, 440, CommitmentLevel::Processed);
+        assert!(fork_reports(&drain(&mut sm)).is_empty());
     }
 
     ///
